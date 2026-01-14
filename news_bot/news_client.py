@@ -4,6 +4,8 @@ News API client for fetching financial/economic articles.
 Supports multiple free news APIs with normalization to a common schema.
 """
 
+import logging
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
@@ -12,6 +14,16 @@ from urllib.parse import urljoin
 import requests
 
 from .config import Config
+
+
+logger = logging.getLogger(__name__)
+
+
+def _sanitize_error(error: Exception) -> str:
+    """Remove API keys from error messages to prevent logging secrets."""
+    error_str = str(error)
+    error_str = re.sub(r'(apikey|api_key|api_token|token|key)=[^&\s]+', r'\1=***', error_str, flags=re.IGNORECASE)
+    return error_str
 
 
 @dataclass
@@ -124,7 +136,6 @@ def _fetch_marketaux(config: Config, limit: int) -> list[ArticleMeta]:
     params = {
         "api_token": config.news_api_key,
         "limit": limit,
-        "filter_entities": "true",
         "language": "en",
     }
     
@@ -132,9 +143,19 @@ def _fetch_marketaux(config: Config, limit: int) -> list[ArticleMeta]:
         response = requests.get(url, params=params, timeout=30)
         response.raise_for_status()
     except requests.RequestException as e:
-        raise NewsClientError(f"Failed to fetch from MarketAux: {e}")
+        raise NewsClientError(f"Failed to fetch from MarketAux: {_sanitize_error(e)}")
     
     data = response.json()
+    
+    # Log API metadata
+    meta = data.get("meta", {})
+    returned = meta.get("returned", 0)
+    found = meta.get("found", 0)
+    logger.info(f"MarketAux API: returned {returned} of {found} articles")
+    
+    if returned < limit and found > returned:
+        logger.warning(f"⚠️  Free tier limited to {returned} articles per request")
+    
     raw_articles = data.get("data", [])
     
     articles = []
@@ -159,7 +180,7 @@ def _fetch_fmp(config: Config, limit: int) -> list[ArticleMeta]:
         response = requests.get(url, params=params, timeout=30)
         response.raise_for_status()
     except requests.RequestException as e:
-        raise NewsClientError(f"Failed to fetch from FMP: {e}")
+        raise NewsClientError(f"Failed to fetch from FMP: {_sanitize_error(e)}")
     
     raw_articles = response.json()
     
