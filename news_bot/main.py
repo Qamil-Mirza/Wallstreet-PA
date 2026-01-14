@@ -50,9 +50,9 @@ def run_daily() -> None:
         logger.error(f"Configuration error: {e}")
         sys.exit(1)
     
-    # Step 2: Fetch articles
+    # Step 2: Fetch articles (fetch more to increase category coverage)
     try:
-        articles = fetch_recent_articles(config, limit=30)
+        articles = fetch_recent_articles(config, limit=50)
         logger.info(f"Fetched {len(articles)} articles")
     except NewsClientError as e:
         logger.error(f"Failed to fetch news: {e}")
@@ -68,10 +68,24 @@ def run_daily() -> None:
     
     # Step 4: Classify and bucket
     buckets = bucket_articles(articles_with_content)
+    
+    # Log category distribution with warnings for empty buckets
+    macro_count = len(buckets['macro'])
+    deal_count = len(buckets['deal'])
+    feature_count = len(buckets['feature'])
+    
     logger.info(
-        f"Classification: {len(buckets['macro'])} macro, "
-        f"{len(buckets['deal'])} deal, {len(buckets['feature'])} feature"
+        f"Classification: {macro_count} macro, "
+        f"{deal_count} deal, {feature_count} feature"
     )
+    
+    # Warn about missing categories
+    if macro_count == 0:
+        logger.warning("⚠️  No Macro & Economics articles found!")
+    if deal_count == 0:
+        logger.warning("⚠️  No Deals & Corporate articles found!")
+    if feature_count == 0:
+        logger.warning("⚠️  No Feature & Trends articles found!")
     
     # Step 5: Select top 3
     selected = select_three_articles(buckets)
@@ -81,8 +95,11 @@ def run_daily() -> None:
         logger.error("No articles selected - nothing to send")
         sys.exit(1)
     
+    # Log selected articles with their categories
+    from .selection import get_article_category_label
     for i, article in enumerate(selected, 1):
-        logger.info(f"  {i}. {article.title[:60]}...")
+        category = get_article_category_label(article, buckets)
+        logger.info(f"  {i}. [{category}] {article.title[:50]}...")
     
     # Step 6: Summarize
     logger.info("Generating summaries with Ollama...")
@@ -91,7 +108,7 @@ def run_daily() -> None:
     
     # Step 7: Build and send email
     today = date.today()
-    subject = f"Your 3 Things – Markets & Economy – {today.strftime('%b %d, %Y')}"
+    subject = f"The Daily Briefing – {today.strftime('%b %d, %Y')}"
     
     html = build_email_html(today, selected, summaries, buckets)
     logger.info("Email HTML generated")

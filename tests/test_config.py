@@ -1,5 +1,7 @@
 """Tests for configuration management."""
 
+from unittest.mock import patch
+
 import pytest
 
 from news_bot.config import Config, ConfigError, load_config
@@ -54,27 +56,41 @@ class TestLoadConfig:
 
     def test_load_config_missing_news_api_key(self, monkeypatch):
         """Test that missing NEWS_API_KEY raises ConfigError."""
-        monkeypatch.delenv("NEWS_API_KEY", raising=False)
+        # Clear all potentially conflicting env vars first
+        for key in ["NEWS_API_KEY", "NEWS_API_BASE_URL", "SMTP_HOST", "SMTP_PORT",
+                    "SMTP_USER", "SMTP_PASSWORD", "RECIPIENT_EMAIL",
+                    "OLLAMA_BASE_URL", "OLLAMA_MODEL"]:
+            monkeypatch.delenv(key, raising=False)
+        
         monkeypatch.setenv("SMTP_HOST", "smtp.test.com")
         monkeypatch.setenv("SMTP_USER", "user@test.com")
         monkeypatch.setenv("SMTP_PASSWORD", "secret123")
         monkeypatch.setenv("RECIPIENT_EMAIL", "recipient@test.com")
 
-        with pytest.raises(ConfigError) as exc_info:
-            load_config()
+        # Patch load_dotenv to prevent loading from .env file
+        with patch("news_bot.config.load_dotenv"):
+            with pytest.raises(ConfigError) as exc_info:
+                load_config()
 
         assert "NEWS_API_KEY" in str(exc_info.value)
 
     def test_load_config_missing_smtp_host(self, monkeypatch):
         """Test that missing SMTP_HOST raises ConfigError."""
+        # Clear all potentially conflicting env vars first
+        for key in ["NEWS_API_KEY", "NEWS_API_BASE_URL", "SMTP_HOST", "SMTP_PORT",
+                    "SMTP_USER", "SMTP_PASSWORD", "RECIPIENT_EMAIL",
+                    "OLLAMA_BASE_URL", "OLLAMA_MODEL"]:
+            monkeypatch.delenv(key, raising=False)
+        
         monkeypatch.setenv("NEWS_API_KEY", "test_key")
-        monkeypatch.delenv("SMTP_HOST", raising=False)
         monkeypatch.setenv("SMTP_USER", "user@test.com")
         monkeypatch.setenv("SMTP_PASSWORD", "secret123")
         monkeypatch.setenv("RECIPIENT_EMAIL", "recipient@test.com")
 
-        with pytest.raises(ConfigError) as exc_info:
-            load_config()
+        # Patch load_dotenv to prevent loading from .env file
+        with patch("news_bot.config.load_dotenv"):
+            with pytest.raises(ConfigError) as exc_info:
+                load_config()
 
         assert "SMTP_HOST" in str(exc_info.value)
 

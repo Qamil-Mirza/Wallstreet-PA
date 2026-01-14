@@ -179,7 +179,7 @@ class TestBuildEmailHtml:
         assert "</html>" in result
         assert "<head>" in result
         assert "<body>" in result
-        assert "Your 3 Things" in result
+        assert "The Daily Briefing" in result
 
     def test_build_email_html_empty_articles(self):
         """Test building HTML with no articles."""
@@ -187,7 +187,7 @@ class TestBuildEmailHtml:
 
         # Should still produce valid HTML
         assert "<!DOCTYPE html>" in result
-        assert "Your 3 Things" in result
+        assert "The Daily Briefing" in result
 
 
 class TestSendEmail:

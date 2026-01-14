@@ -25,7 +25,7 @@ EMAIL_TEMPLATE = """<!DOCTYPE html>
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Your 3 Things</title>
+    <title>The Daily Briefing</title>
     <style>
         body {{
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
@@ -131,14 +131,14 @@ EMAIL_TEMPLATE = """<!DOCTYPE html>
 <body>
     <div class="container">
         <div class="header">
-            <h1>📊 Your 3 Things</h1>
-            <div class="date">Markets & Economy — {formatted_date}</div>
+            <h1>📊 The Daily Briefing</h1>
+            <div class="date">The Journey — {formatted_date}</div>
         </div>
         
         {articles_html}
         
         <div class="footer">
-            Curated by your AI analyst • Powered by local LLM
+            Curated by The Journey • Powered by Ollama
         </div>
     </div>
 </body>

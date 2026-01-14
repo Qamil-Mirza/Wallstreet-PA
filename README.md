@@ -1,4 +1,4 @@
-# 📊 3 Things Newsletter Bot
+# 📊 The Daily Brief By The Journey
 
 A fully automated daily finance/economics email bot that:
 
