@@ -1,7 +1,7 @@
 """
 Article summarization using Ollama (local LLM).
 
-Generates analyst-style bullet summaries of articles.
+Generates analyst-style narrative summaries of articles.
 """
 
 import logging
@@ -16,27 +16,59 @@ from .news_client import ArticleMeta
 logger = logging.getLogger(__name__)
 
 
-PROMPT_TEMPLATE = """You are a senior Wall Street research analyst writing a morning briefing. 
-Summarize the following news article in 4-6 concise bullet points.
+PROMPT_TEMPLATE = """You are a senior Wall Street research analyst briefing a client over the phone. Summarize this news in 2-3 flowing sentences as if you're speaking directly to them.
 
-Guidelines:
-- Be direct and factual, like a Bloomberg terminal headline
-- Lead with the key news, then supporting details
-- Include specific numbers (percentages, dollar amounts) when available
-- Note market implications if relevant
-- Skip generic filler; every bullet should add value
+Rules:
+- Start immediately with the key news. No preamble like "Here's a summary" or "This article discusses"
+- Write in a conversational but professional tone, like you're explaining to a smart colleague
+- Include specific numbers (percentages, dollar amounts, dates) when available
+- End with the "so what" - why this matters for markets or investors
+- Keep it tight: 2-3 sentences max, no fluff
 
-Article Title: {title}
+Article: {title}
 
-Article Content:
 {content}
 
-Provide your summary as bullet points (use • for bullets):"""
+Your briefing (start directly with the news):"""
 
 
 class SummarizerError(Exception):
     """Raised when summarization fails."""
     pass
+
+
+def _clean_summary(text: str) -> str:
+    """Remove common LLM preambles and clean up the summary."""
+    # Common preambles to strip
+    preambles = [
+        "here is a concise summary",
+        "here's a concise summary", 
+        "here is the summary",
+        "here's the summary",
+        "here is a summary",
+        "here's a summary",
+        "here is my summary",
+        "here's my summary",
+        "summary:",
+        "here are the key points",
+        "here's what you need to know",
+    ]
+    
+    lines = text.strip().split('\n')
+    cleaned_lines = []
+    
+    for line in lines:
+        line_lower = line.lower().strip()
+        # Skip lines that are just preambles
+        skip = False
+        for preamble in preambles:
+            if line_lower.startswith(preamble) or line_lower == preamble.rstrip(':'):
+                skip = True
+                break
+        if not skip and line.strip():
+            cleaned_lines.append(line.strip())
+    
+    return ' '.join(cleaned_lines)
 
 
 def summarize_article(
@@ -57,7 +89,7 @@ def summarize_article(
         timeout: Request timeout in seconds.
     
     Returns:
-        Bullet-point summary text.
+        Narrative summary text.
     
     Raises:
         SummarizerError: If the Ollama request fails.
@@ -71,8 +103,8 @@ def summarize_article(
         "prompt": prompt,
         "stream": False,
         "options": {
-            "temperature": 0.3,  # Lower temp for more focused output
-            "num_predict": 500,  # Limit response length
+            "temperature": 0.4,  # Slightly higher for natural flow
+            "num_predict": 300,  # Shorter for concise narrative
         }
     }
     
@@ -92,7 +124,8 @@ def summarize_article(
     if not summary:
         raise SummarizerError("Ollama returned empty response")
     
-    return summary.strip()
+    # Clean up any preambles the LLM might have added
+    return _clean_summary(summary)
 
 
 def summarize_articles(
@@ -126,9 +159,10 @@ def summarize_articles(
             
         except SummarizerError as e:
             logger.error(f"Failed to summarize '{article.title}': {e}")
-            # Provide fallback summary
-            summaries[article.id] = f"• {article.title}"
+            # Provide fallback summary as narrative
+            fallback = article.title
             if article.summary:
-                summaries[article.id] += f"\n• {article.summary[:200]}"
+                fallback += f" {article.summary[:200]}"
+            summaries[article.id] = fallback
     
     return summaries

@@ -156,25 +156,16 @@ ARTICLE_TEMPLATE = """
 
 
 def _format_summary_html(summary: str) -> str:
-    """Convert bullet summary to HTML list."""
-    lines = summary.strip().split("\n")
-    items = []
+    """Format narrative summary as HTML paragraph."""
+    # Clean up the text - join multiple lines into flowing text
+    text = " ".join(line.strip() for line in summary.strip().split("\n") if line.strip())
     
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
-        # Remove bullet characters
-        for prefix in ["•", "-", "*", "·"]:
-            if line.startswith(prefix):
-                line = line[1:].strip()
-                break
-        if line:
-            items.append(f"<li>{line}</li>")
+    # Remove any stray bullet characters that might have slipped through
+    for prefix in ["•", "-", "*", "·"]:
+        if text.startswith(prefix):
+            text = text[1:].strip()
     
-    if items:
-        return "<ul>" + "\n".join(items) + "</ul>"
-    return f"<p>{summary}</p>"
+    return f"<p>{text}</p>"
 
 
 def _get_category_class(

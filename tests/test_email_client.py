@@ -52,52 +52,53 @@ def make_article(
 class TestFormatSummaryHtml:
     """Tests for _format_summary_html function."""
 
-    def test_format_bullet_points(self):
-        """Test formatting bullet points to HTML list."""
-        summary = "• Point one\n• Point two\n• Point three"
+    def test_format_narrative_text(self):
+        """Test formatting narrative text to HTML paragraph."""
+        summary = "The Fed raised rates by 25 basis points. Markets reacted positively to the news."
 
         result = _format_summary_html(summary)
 
-        assert "<ul>" in result
-        assert "<li>Point one</li>" in result
-        assert "<li>Point two</li>" in result
-        assert "<li>Point three</li>" in result
-        assert "</ul>" in result
+        assert "<p>" in result
+        assert "Fed raised rates" in result
+        assert "Markets reacted" in result
+        assert "</p>" in result
 
-    def test_format_dash_bullets(self):
-        """Test formatting dash-style bullets."""
-        summary = "- First item\n- Second item"
-
-        result = _format_summary_html(summary)
-
-        assert "<li>First item</li>" in result
-        assert "<li>Second item</li>" in result
-
-    def test_format_asterisk_bullets(self):
-        """Test formatting asterisk-style bullets."""
-        summary = "* Item A\n* Item B"
+    def test_format_multiline_to_single_paragraph(self):
+        """Test that multiline text is joined into flowing paragraph."""
+        summary = "First sentence here.\nSecond sentence continues.\nThird wraps it up."
 
         result = _format_summary_html(summary)
 
-        assert "<li>Item A</li>" in result
-        assert "<li>Item B</li>" in result
+        assert "<p>" in result
+        # Should be joined with spaces
+        assert "First sentence here. Second sentence continues. Third wraps it up." in result
+
+    def test_format_strips_stray_bullets(self):
+        """Test that stray bullet characters are removed."""
+        summary = "• This starts with a bullet but shouldn't"
+
+        result = _format_summary_html(summary)
+
+        assert "<p>" in result
+        assert "•" not in result
+        assert "This starts with" in result
 
     def test_format_handles_empty_lines(self):
-        """Test that empty lines are skipped."""
-        summary = "• Point one\n\n• Point two\n\n"
+        """Test that empty lines are handled gracefully."""
+        summary = "First part.\n\nSecond part.\n\n"
 
         result = _format_summary_html(summary)
 
-        assert result.count("<li>") == 2
+        assert "<p>" in result
+        assert "First part. Second part." in result
 
-    def test_format_non_bullet_text(self):
-        """Test formatting text without bullets."""
-        summary = "Just regular text without bullets"
+    def test_format_plain_text(self):
+        """Test formatting plain text."""
+        summary = "Just regular text without any formatting"
 
         result = _format_summary_html(summary)
 
-        # Should wrap in paragraph if no bullets detected
-        assert "Just regular text" in result
+        assert "<p>Just regular text without any formatting</p>" in result
 
 
 class TestBuildEmailHtml:
