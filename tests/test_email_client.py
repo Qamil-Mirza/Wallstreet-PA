@@ -9,8 +9,10 @@ from news_bot.classifier import ArticleCategory
 from news_bot.config import Config
 from news_bot.email_client import (
     EmailError,
+    SECTION_CONFIG,
     _format_summary_html,
     build_email_html,
+    build_sectioned_email_html,
     send_email,
 )
 from news_bot.news_client import ArticleMeta
@@ -259,3 +261,125 @@ class TestSendEmail:
 
             with pytest.raises(EmailError):
                 send_email(mock_config, "Subject", "<html></html>")
+
+
+class TestBuildSectionedEmailHtml:
+    """Tests for sectioned email HTML builder."""
+
+    def test_build_sectioned_email_contains_all_sections(self):
+        """Test that sectioned email contains all 5 section headers."""
+        sections = {
+            "World News": [make_article("world-1", "World Article")],
+            "US Tech": [make_article("us-tech-1", "US Tech Article")],
+            "US Industry": [make_article("us-ind-1", "US Industry Article")],
+            "Malaysia Tech": [make_article("my-tech-1", "Malaysia Tech Article")],
+            "Malaysia Industry": [make_article("my-ind-1", "Malaysia Industry Article")],
+        }
+        summaries = {
+            "world-1": "World summary",
+            "us-tech-1": "US Tech summary",
+            "us-ind-1": "US Industry summary",
+            "my-tech-1": "Malaysia Tech summary",
+            "my-ind-1": "Malaysia Industry summary",
+        }
+
+        html = build_sectioned_email_html(date(2024, 1, 15), sections, summaries)
+
+        # Check all section names appear
+        assert "World News" in html
+        assert "US Tech" in html
+        assert "US Industry" in html
+        assert "Malaysia Tech" in html
+        assert "Malaysia Industry" in html
+
+    def test_build_sectioned_email_contains_articles(self):
+        """Test that articles appear in their sections."""
+        sections = {
+            "World News": [make_article("world-1", "Global Market Update")],
+            "US Tech": [make_article("us-tech-1", "Apple Announcement")],
+            "US Industry": [],
+            "Malaysia Tech": [make_article("my-tech-1", "Malaysian Startup")],
+            "Malaysia Industry": [],
+        }
+        summaries = {
+            "world-1": "Markets are moving.",
+            "us-tech-1": "Apple news here.",
+            "my-tech-1": "Startup raises funds.",
+        }
+
+        html = build_sectioned_email_html(date(2024, 1, 15), sections, summaries)
+
+        # Check article titles appear
+        assert "Global Market Update" in html
+        assert "Apple Announcement" in html
+        assert "Malaysian Startup" in html
+
+        # Check summaries appear
+        assert "Markets are moving." in html
+        assert "Apple news here." in html
+
+    def test_build_sectioned_email_handles_empty_sections(self):
+        """Test that empty sections show appropriate message."""
+        sections = {
+            "World News": [make_article("world-1", "World Article")],
+            "US Tech": [],  # Empty
+            "US Industry": [],  # Empty
+            "Malaysia Tech": [],  # Empty
+            "Malaysia Industry": [],  # Empty
+        }
+        summaries = {"world-1": "Summary"}
+
+        html = build_sectioned_email_html(date(2024, 1, 15), sections, summaries)
+
+        # Should have "No articles available" for empty sections
+        assert "No articles available" in html
+        # World News should have its article
+        assert "World Article" in html
+
+    def test_build_sectioned_email_includes_section_emojis(self):
+        """Test that section emojis are included."""
+        sections = {
+            "World News": [make_article("world-1", "Article")],
+            "US Tech": [],
+            "US Industry": [],
+            "Malaysia Tech": [],
+            "Malaysia Industry": [],
+        }
+        summaries = {"world-1": "Summary"}
+
+        html = build_sectioned_email_html(date(2024, 1, 15), sections, summaries)
+
+        # Check emojis from SECTION_CONFIG
+        assert SECTION_CONFIG["World News"]["emoji"] in html
+
+    def test_build_sectioned_email_has_date(self):
+        """Test that email includes formatted date."""
+        sections = {"World News": [], "US Tech": [], "US Industry": [], 
+                    "Malaysia Tech": [], "Malaysia Industry": []}
+        summaries = {}
+
+        html = build_sectioned_email_html(date(2024, 1, 15), sections, summaries)
+
+        assert "January 15, 2024" in html
+
+    def test_build_sectioned_email_preserves_section_order(self):
+        """Test that sections appear in correct order."""
+        sections = {
+            "Malaysia Industry": [make_article("mi-1", "MI Article")],
+            "World News": [make_article("wn-1", "WN Article")],
+            "US Tech": [make_article("ut-1", "UT Article")],
+            "Malaysia Tech": [make_article("mt-1", "MT Article")],
+            "US Industry": [make_article("ui-1", "UI Article")],
+        }
+        summaries = {k: "Summary" for k in ["mi-1", "wn-1", "ut-1", "mt-1", "ui-1"]}
+
+        html = build_sectioned_email_html(date(2024, 1, 15), sections, summaries)
+
+        # Check order by finding positions
+        world_pos = html.find("World News")
+        us_tech_pos = html.find("US Tech")
+        us_ind_pos = html.find("US Industry")
+        my_tech_pos = html.find("Malaysia Tech")
+        my_ind_pos = html.find("Malaysia Industry")
+
+        assert world_pos < us_tech_pos < us_ind_pos < my_tech_pos < my_ind_pos

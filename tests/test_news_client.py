@@ -1,7 +1,7 @@
 """Tests for news client module."""
 
 from datetime import datetime
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, patch, call
 
 import pytest
 
@@ -9,9 +9,12 @@ from news_bot.config import Config
 from news_bot.news_client import (
     ArticleMeta,
     NewsClientError,
+    NewsFeedConfig,
+    DEFAULT_FEEDS,
     _normalize_marketaux_article,
     _normalize_fmp_article,
     _parse_datetime,
+    _fetch_marketaux_single,
     fetch_recent_articles,
 )
 
@@ -144,26 +147,20 @@ class TestNormalizeFmpArticle:
         assert "Apple Inc" in result.content
 
 
-class TestFetchRecentArticles:
-    """Tests for fetching articles from APIs."""
+class TestFetchMarketauxSingle:
+    """Tests for single MarketAux feed fetching."""
 
-    def test_fetch_recent_articles_marketaux_normalization(self, mock_config):
-        """Test that MarketAux response is normalized correctly."""
+    def test_fetch_single_with_filters(self, mock_config):
+        """Test that filters are passed correctly to API."""
         mock_response = {
+            "meta": {"returned": 2, "found": 10},
             "data": [
                 {
                     "uuid": "article-1",
-                    "title": "First Article",
-                    "url": "https://example.com/1",
-                    "description": "Description 1",
+                    "title": "Tech Article",
+                    "url": "https://example.com/tech1",
+                    "description": "Tech news",
                     "published_at": "2024-01-15T10:00:00Z",
-                },
-                {
-                    "uuid": "article-2",
-                    "title": "Second Article",
-                    "url": "https://example.com/2",
-                    "description": "Description 2",
-                    "published_at": "2024-01-15T11:00:00Z",
                 },
             ]
         }
@@ -172,16 +169,124 @@ class TestFetchRecentArticles:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.raise_for_status = MagicMock()
 
-            result = fetch_recent_articles(mock_config, limit=10)
+            result = _fetch_marketaux_single(
+                mock_config,
+                limit=10,
+                countries="us",
+                industries="Technology",
+                feed_name="US Tech",
+            )
 
-        assert len(result) == 2
-        assert result[0].id == "article-1"
-        assert result[0].title == "First Article"
-        assert result[1].id == "article-2"
+            # Verify the API was called with correct params
+            call_args = mock_get.call_args
+            params = call_args[1]["params"]
+            assert params["countries"] == "us"
+            assert params["industries"] == "Technology"
+            assert params["language"] == "en"
+
+        assert len(result) == 1
+        assert result[0].title == "Tech Article"
+
+    def test_fetch_single_no_filters(self, mock_config):
+        """Test fetch without country/industry filters."""
+        mock_response = {
+            "meta": {"returned": 1, "found": 100},
+            "data": [
+                {
+                    "uuid": "world-1",
+                    "title": "World News",
+                    "url": "https://example.com/world",
+                    "published_at": "2024-01-15T10:00:00Z",
+                },
+            ]
+        }
+
+        with patch("news_bot.news_client.requests.get") as mock_get:
+            mock_get.return_value.json.return_value = mock_response
+            mock_get.return_value.raise_for_status = MagicMock()
+
+            result = _fetch_marketaux_single(mock_config, limit=10)
+
+            # Verify no country/industry params when not specified
+            call_args = mock_get.call_args
+            params = call_args[1]["params"]
+            assert "countries" not in params
+            assert "industries" not in params
+
+        assert len(result) == 1
+
+
+class TestFetchRecentArticles:
+    """Tests for fetching articles from APIs."""
+
+    def test_fetch_recent_articles_multi_feed(self, mock_config):
+        """Test that multiple feeds are fetched and deduplicated."""
+        # Create different responses for each feed
+        def create_response(feed_index):
+            return {
+                "meta": {"returned": 2, "found": 10},
+                "data": [
+                    {
+                        "uuid": f"article-{feed_index}-1",
+                        "title": f"Article from feed {feed_index}",
+                        "url": f"https://example.com/feed{feed_index}/1",
+                        "description": "Description",
+                        "published_at": "2024-01-15T10:00:00Z",
+                    },
+                    {
+                        "uuid": f"article-{feed_index}-2",
+                        "title": f"Second article from feed {feed_index}",
+                        "url": f"https://example.com/feed{feed_index}/2",
+                        "description": "Description 2",
+                        "published_at": "2024-01-15T11:00:00Z",
+                    },
+                ]
+            }
+
+        with patch("news_bot.news_client.requests.get") as mock_get:
+            # Return different response for each call (5 feeds)
+            mock_get.return_value.raise_for_status = MagicMock()
+            mock_get.return_value.json.side_effect = [
+                create_response(i) for i in range(len(DEFAULT_FEEDS))
+            ]
+
+            result = fetch_recent_articles(mock_config, limit=30)
+
+        # Should have called API once per feed (5 times)
+        assert mock_get.call_count == len(DEFAULT_FEEDS)
+        
+        # Should have 2 articles per feed * 5 feeds = 10 unique articles
+        assert len(result) == 10
+
+    def test_fetch_recent_articles_deduplicates_by_url(self, mock_config):
+        """Test that duplicate URLs across feeds are removed."""
+        # All feeds return the same article (same URL)
+        mock_response = {
+            "meta": {"returned": 1, "found": 10},
+            "data": [
+                {
+                    "uuid": "duplicate-article",
+                    "title": "Same Article",
+                    "url": "https://example.com/same-url",
+                    "description": "Description",
+                    "published_at": "2024-01-15T10:00:00Z",
+                },
+            ]
+        }
+
+        with patch("news_bot.news_client.requests.get") as mock_get:
+            mock_get.return_value.json.return_value = mock_response
+            mock_get.return_value.raise_for_status = MagicMock()
+
+            result = fetch_recent_articles(mock_config, limit=30)
+
+        # Should only have 1 article despite 5 feeds returning the same URL
+        assert len(result) == 1
+        assert result[0].url == "https://example.com/same-url"
 
     def test_fetch_recent_articles_handles_empty(self, mock_config):
-        """Test handling of empty API response."""
-        mock_response = {"data": []}
+        """Test handling of empty API responses from all feeds."""
+        mock_response = {"meta": {"returned": 0, "found": 0}, "data": []}
 
         with patch("news_bot.news_client.requests.get") as mock_get:
             mock_get.return_value.json.return_value = mock_response
@@ -194,6 +299,7 @@ class TestFetchRecentArticles:
     def test_fetch_recent_articles_skips_invalid(self, mock_config):
         """Test that invalid articles are skipped."""
         mock_response = {
+            "meta": {"returned": 3, "found": 3},
             "data": [
                 {
                     "uuid": "valid",
@@ -220,11 +326,46 @@ class TestFetchRecentArticles:
 
             result = fetch_recent_articles(mock_config, limit=10)
 
+        # Only 1 valid article per feed, but same URL so deduplicated to 1
         assert len(result) == 1
         assert result[0].id == "valid"
 
-    def test_fetch_recent_articles_api_error(self, mock_config):
-        """Test that API errors raise NewsClientError."""
+    def test_fetch_recent_articles_partial_failure(self, mock_config):
+        """Test that partial feed failures still return results from successful feeds."""
+        import requests as req
+
+        call_count = [0]
+        
+        def mock_get_side_effect(*args, **kwargs):
+            call_count[0] += 1
+            mock_response = MagicMock()
+            if call_count[0] <= 2:
+                # First 2 feeds fail
+                raise req.RequestException("Connection failed")
+            else:
+                # Remaining feeds succeed
+                mock_response.json.return_value = {
+                    "meta": {"returned": 1, "found": 1},
+                    "data": [
+                        {
+                            "uuid": f"article-{call_count[0]}",
+                            "title": f"Article {call_count[0]}",
+                            "url": f"https://example.com/{call_count[0]}",
+                            "published_at": "2024-01-15T10:00:00Z",
+                        },
+                    ]
+                }
+                mock_response.raise_for_status = MagicMock()
+                return mock_response
+
+        with patch("news_bot.news_client.requests.get", side_effect=mock_get_side_effect):
+            result = fetch_recent_articles(mock_config, limit=30)
+
+        # Should have results from the 3 successful feeds
+        assert len(result) == 3
+
+    def test_fetch_recent_articles_all_feeds_fail(self, mock_config):
+        """Test that all feeds failing raises NewsClientError."""
         import requests as req
 
         with patch("news_bot.news_client.requests.get") as mock_get:
@@ -233,10 +374,10 @@ class TestFetchRecentArticles:
             with pytest.raises(NewsClientError) as exc_info:
                 fetch_recent_articles(mock_config)
 
-            assert "Connection failed" in str(exc_info.value)
+            assert "All feeds failed" in str(exc_info.value)
 
     def test_fetch_fmp_articles(self):
-        """Test fetching from FMP API."""
+        """Test fetching from FMP API (uses single endpoint, not multi-feed)."""
         config = Config(
             news_api_key="test_key",
             news_api_base_url="https://financialmodelingprep.com",
@@ -267,3 +408,138 @@ class TestFetchRecentArticles:
 
         assert len(result) == 1
         assert result[0].title == "FMP Article"
+
+
+class TestNewsFeedConfig:
+    """Tests for NewsFeedConfig dataclass."""
+
+    def test_default_feeds_configured(self):
+        """Test that default feeds are properly configured."""
+        assert len(DEFAULT_FEEDS) == 5
+        
+        feed_names = [f.name for f in DEFAULT_FEEDS]
+        assert "World News" in feed_names
+        assert "US Tech" in feed_names
+        assert "US Industry" in feed_names
+        assert "Malaysia Tech" in feed_names
+        assert "Malaysia Industry" in feed_names
+
+    def test_us_feeds_have_country_filter(self):
+        """Test that US feeds have correct country filter."""
+        us_feeds = [f for f in DEFAULT_FEEDS if "US" in f.name]
+        assert len(us_feeds) == 2
+        for feed in us_feeds:
+            assert feed.countries == "us"
+
+    def test_malaysia_feeds_have_country_filter(self):
+        """Test that Malaysia feeds have correct country filter."""
+        my_feeds = [f for f in DEFAULT_FEEDS if "Malaysia" in f.name]
+        assert len(my_feeds) == 2
+        for feed in my_feeds:
+            assert feed.countries == "my"
+
+    def test_world_news_has_no_filters(self):
+        """Test that World News feed has no country/industry filters."""
+        world_feed = next(f for f in DEFAULT_FEEDS if f.name == "World News")
+        assert world_feed.countries is None
+        assert world_feed.industries is None
+
+
+class TestFetchArticlesBySection:
+    """Tests for sectioned article fetching."""
+
+    def test_fetch_articles_by_section_returns_dict(self, mock_config):
+        """Test that fetch_articles_by_section returns a dictionary."""
+        from news_bot.news_client import fetch_articles_by_section
+        
+        mock_response = {
+            "meta": {"returned": 2, "found": 10},
+            "data": [
+                {
+                    "uuid": "article-1",
+                    "title": "Test Article",
+                    "url": "https://example.com/1",
+                    "published_at": "2024-01-15T10:00:00Z",
+                },
+            ]
+        }
+
+        with patch("news_bot.news_client.requests.get") as mock_get:
+            mock_get.return_value.json.return_value = mock_response
+            mock_get.return_value.raise_for_status = MagicMock()
+
+            result = fetch_articles_by_section(mock_config, per_section_limit=5)
+
+        assert isinstance(result, dict)
+        assert "World News" in result
+        assert "US Tech" in result
+        assert "US Industry" in result
+        assert "Malaysia Tech" in result
+        assert "Malaysia Industry" in result
+
+    def test_fetch_articles_by_section_deduplicates_across_sections(self, mock_config):
+        """Test that same URL appearing in multiple feeds is only in first section."""
+        from news_bot.news_client import fetch_articles_by_section
+        
+        # All feeds return same article
+        mock_response = {
+            "meta": {"returned": 1, "found": 10},
+            "data": [
+                {
+                    "uuid": "same-article",
+                    "title": "Same Article",
+                    "url": "https://example.com/same",
+                    "published_at": "2024-01-15T10:00:00Z",
+                },
+            ]
+        }
+
+        with patch("news_bot.news_client.requests.get") as mock_get:
+            mock_get.return_value.json.return_value = mock_response
+            mock_get.return_value.raise_for_status = MagicMock()
+
+            result = fetch_articles_by_section(mock_config, per_section_limit=5)
+
+        # Count total articles across all sections
+        total = sum(len(arts) for arts in result.values())
+        # Should only be 1 article total (deduplicated)
+        assert total == 1
+        # First section (World News) should have it
+        assert len(result["World News"]) == 1
+
+    def test_fetch_articles_by_section_handles_partial_failure(self, mock_config):
+        """Test that partial feed failures still return sections."""
+        from news_bot.news_client import fetch_articles_by_section
+        import requests as req
+
+        call_count = [0]
+        
+        def mock_get_side_effect(*args, **kwargs):
+            call_count[0] += 1
+            mock_response = MagicMock()
+            if call_count[0] == 2:  # Second feed fails
+                raise req.RequestException("Connection failed")
+            else:
+                mock_response.json.return_value = {
+                    "meta": {"returned": 1, "found": 1},
+                    "data": [
+                        {
+                            "uuid": f"article-{call_count[0]}",
+                            "title": f"Article {call_count[0]}",
+                            "url": f"https://example.com/{call_count[0]}",
+                            "published_at": "2024-01-15T10:00:00Z",
+                        },
+                    ]
+                }
+                mock_response.raise_for_status = MagicMock()
+                return mock_response
+
+        with patch("news_bot.news_client.requests.get", side_effect=mock_get_side_effect):
+            result = fetch_articles_by_section(mock_config, per_section_limit=5)
+
+        # Should have all 5 sections, but one is empty
+        assert len(result) == 5
+        # US Tech (second feed) should be empty
+        assert len(result["US Tech"]) == 0
+        # Others should have content
+        assert len(result["World News"]) == 1

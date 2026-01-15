@@ -103,34 +103,167 @@ def _normalize_fmp_article(raw: dict) -> Optional[ArticleMeta]:
     )
 
 
+@dataclass
+class NewsFeedConfig:
+    """Configuration for a specific news feed query."""
+    
+    name: str
+    countries: Optional[str] = None  # Comma-separated country codes (e.g., "us", "my")
+    industries: Optional[str] = None  # Comma-separated industries (e.g., "Technology", "Industrials")
+    limit: int = 10
+
+
+# Default feed configurations for multi-region news fetching
+DEFAULT_FEEDS = [
+    NewsFeedConfig(name="World News", limit=10),
+    NewsFeedConfig(name="US Tech", countries="us", industries="Technology", limit=10),
+    NewsFeedConfig(name="US Industry", countries="us", industries="Industrials", limit=10),
+    NewsFeedConfig(name="Malaysia Tech", countries="my", industries="Technology", limit=10),
+    NewsFeedConfig(name="Malaysia Industry", countries="my", industries="Industrials", limit=10),
+]
+
+
 def fetch_recent_articles(config: Config, limit: int = 30) -> list[ArticleMeta]:
     """
-    Fetch recent financial news articles from the configured API.
+    Fetch recent financial news articles from multiple feeds.
+    
+    Makes multiple API calls to get diverse news coverage:
+    - Broad world news
+    - US Tech and Industry news
+    - Malaysia Tech and Industry news
     
     Args:
         config: Application configuration with API credentials.
-        limit: Maximum number of articles to fetch.
+        limit: Maximum total articles to return (articles per feed = limit // num_feeds).
     
     Returns:
-        List of normalized ArticleMeta objects.
+        List of normalized ArticleMeta objects, deduplicated by URL.
     
     Raises:
-        NewsClientError: If the API request fails.
+        NewsClientError: If all API requests fail.
     """
     base_url = config.news_api_base_url.rstrip("/")
     
     # Detect API type based on base URL
     if "marketaux" in base_url:
-        return _fetch_marketaux(config, limit)
+        return _fetch_marketaux_multi(config, limit)
     elif "financialmodelingprep" in base_url:
         return _fetch_fmp(config, limit)
     else:
         # Default to MarketAux-style API
-        return _fetch_marketaux(config, limit)
+        return _fetch_marketaux_multi(config, limit)
 
 
-def _fetch_marketaux(config: Config, limit: int) -> list[ArticleMeta]:
-    """Fetch articles from MarketAux API."""
+def _fetch_marketaux_multi(config: Config, total_limit: int) -> list[ArticleMeta]:
+    """Fetch articles from MarketAux API using multiple feed configurations."""
+    all_articles: list[ArticleMeta] = []
+    seen_urls: set[str] = set()
+    errors: list[str] = []
+    
+    # Calculate per-feed limit (distribute evenly, minimum 3 per feed)
+    per_feed_limit = max(3, total_limit // len(DEFAULT_FEEDS))
+    
+    for feed in DEFAULT_FEEDS:
+        try:
+            articles = _fetch_marketaux_single(
+                config=config,
+                limit=per_feed_limit,
+                countries=feed.countries,
+                industries=feed.industries,
+                feed_name=feed.name,
+            )
+            
+            # Deduplicate by URL
+            for article in articles:
+                if article.url not in seen_urls:
+                    seen_urls.add(article.url)
+                    all_articles.append(article)
+                    
+        except NewsClientError as e:
+            errors.append(f"{feed.name}: {e}")
+            logger.warning(f"Failed to fetch {feed.name}: {e}")
+            continue
+    
+    if not all_articles and errors:
+        raise NewsClientError(f"All feeds failed: {'; '.join(errors)}")
+    
+    logger.info(f"Total unique articles fetched: {len(all_articles)} from {len(DEFAULT_FEEDS)} feeds")
+    return all_articles
+
+
+def fetch_articles_by_section(config: Config, per_section_limit: int = 5) -> dict[str, list[ArticleMeta]]:
+    """
+    Fetch articles organized by feed section.
+    
+    Makes multiple API calls to get diverse news coverage, returning articles
+    grouped by their feed section for sectioned email rendering.
+    
+    Args:
+        config: Application configuration with API credentials.
+        per_section_limit: Maximum articles per section.
+    
+    Returns:
+        Dictionary mapping section names to lists of ArticleMeta objects.
+        Sections: "World News", "US Tech", "US Industry", "Malaysia Tech", "Malaysia Industry"
+    
+    Raises:
+        NewsClientError: If all API requests fail.
+    """
+    base_url = config.news_api_base_url.rstrip("/")
+    
+    # Only MarketAux supports sectioned fetching
+    if "marketaux" not in base_url:
+        # Fallback: put all articles in "World News" section
+        articles = fetch_recent_articles(config, limit=per_section_limit * 5)
+        return {"World News": articles}
+    
+    sections: dict[str, list[ArticleMeta]] = {}
+    seen_urls: set[str] = set()
+    errors: list[str] = []
+    
+    for feed in DEFAULT_FEEDS:
+        try:
+            articles = _fetch_marketaux_single(
+                config=config,
+                limit=per_section_limit,
+                countries=feed.countries,
+                industries=feed.industries,
+                feed_name=feed.name,
+            )
+            
+            # Deduplicate by URL within and across sections
+            unique_articles = []
+            for article in articles:
+                if article.url not in seen_urls:
+                    seen_urls.add(article.url)
+                    unique_articles.append(article)
+            
+            sections[feed.name] = unique_articles
+            logger.info(f"Section '{feed.name}': {len(unique_articles)} articles")
+                    
+        except NewsClientError as e:
+            errors.append(f"{feed.name}: {e}")
+            logger.warning(f"Failed to fetch {feed.name}: {e}")
+            sections[feed.name] = []  # Empty section on failure
+            continue
+    
+    # Check if we got any articles at all
+    total_articles = sum(len(arts) for arts in sections.values())
+    if total_articles == 0 and errors:
+        raise NewsClientError(f"All feeds failed: {'; '.join(errors)}")
+    
+    logger.info(f"Total articles fetched: {total_articles} across {len(sections)} sections")
+    return sections
+
+
+def _fetch_marketaux_single(
+    config: Config,
+    limit: int,
+    countries: Optional[str] = None,
+    industries: Optional[str] = None,
+    feed_name: str = "default",
+) -> list[ArticleMeta]:
+    """Fetch articles from MarketAux API with specific filters."""
     url = f"{config.news_api_base_url.rstrip('/')}/news/all"
     
     params = {
@@ -139,22 +272,33 @@ def _fetch_marketaux(config: Config, limit: int) -> list[ArticleMeta]:
         "language": "en",
     }
     
+    # Add optional filters
+    if countries:
+        params["countries"] = countries
+    if industries:
+        params["industries"] = industries
+    
     try:
         response = requests.get(url, params=params, timeout=30)
         response.raise_for_status()
     except requests.RequestException as e:
-        raise NewsClientError(f"Failed to fetch from MarketAux: {_sanitize_error(e)}")
+        raise NewsClientError(f"Failed to fetch from MarketAux ({feed_name}): {_sanitize_error(e)}")
     
     data = response.json()
+    
+    # Check for API errors
+    if "error" in data:
+        error_msg = data["error"].get("message", "Unknown error")
+        raise NewsClientError(f"MarketAux API error ({feed_name}): {error_msg}")
     
     # Log API metadata
     meta = data.get("meta", {})
     returned = meta.get("returned", 0)
     found = meta.get("found", 0)
-    logger.info(f"MarketAux API: returned {returned} of {found} articles")
+    logger.info(f"MarketAux [{feed_name}]: returned {returned} of {found} articles")
     
     if returned < limit and found > returned:
-        logger.warning(f"⚠️  Free tier limited to {returned} articles per request")
+        logger.warning(f"⚠️  {feed_name}: Free tier limited to {returned} articles per request")
     
     raw_articles = data.get("data", [])
     
@@ -165,6 +309,11 @@ def _fetch_marketaux(config: Config, limit: int) -> list[ArticleMeta]:
             articles.append(article)
     
     return articles
+
+
+def _fetch_marketaux(config: Config, limit: int) -> list[ArticleMeta]:
+    """Fetch articles from MarketAux API (single call, for backwards compatibility)."""
+    return _fetch_marketaux_single(config, limit, feed_name="default")
 
 
 def _fetch_fmp(config: Config, limit: int) -> list[ArticleMeta]:

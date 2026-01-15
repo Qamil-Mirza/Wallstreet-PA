@@ -20,6 +20,16 @@ from .selection import get_article_category_label
 logger = logging.getLogger(__name__)
 
 
+# Section display configuration with emoji icons
+SECTION_CONFIG = {
+    "World News": {"emoji": "🌍", "color": "#6366f1"},
+    "US Tech": {"emoji": "🇺🇸💻", "color": "#0ea5e9"},
+    "US Industry": {"emoji": "🇺🇸🏭", "color": "#14b8a6"},
+    "Malaysia Tech": {"emoji": "🇲🇾💻", "color": "#f59e0b"},
+    "Malaysia Industry": {"emoji": "🇲🇾🏭", "color": "#ef4444"},
+}
+
+
 EMAIL_TEMPLATE = """<!DOCTYPE html>
 <html>
 <head>
@@ -58,9 +68,36 @@ EMAIL_TEMPLATE = """<!DOCTYPE html>
             font-size: 14px;
             margin-top: 5px;
         }}
-        .article {{
+        .section {{
             margin-bottom: 30px;
-            padding-bottom: 25px;
+        }}
+        .section-header {{
+            display: flex;
+            align-items: center;
+            padding: 12px 15px;
+            margin-bottom: 20px;
+            border-radius: 6px;
+            background-color: #f8f9fa;
+            border-left: 4px solid;
+        }}
+        .section-header h2 {{
+            margin: 0;
+            font-size: 16px;
+            font-weight: 600;
+        }}
+        .section-header .emoji {{
+            margin-right: 10px;
+            font-size: 18px;
+        }}
+        .section-empty {{
+            color: #888;
+            font-style: italic;
+            font-size: 14px;
+            padding: 10px 0;
+        }}
+        .article {{
+            margin-bottom: 25px;
+            padding-bottom: 20px;
             border-bottom: 1px solid #eee;
         }}
         .article:last-child {{
@@ -135,7 +172,7 @@ EMAIL_TEMPLATE = """<!DOCTYPE html>
             <div class="date">The Journey — {formatted_date}</div>
         </div>
         
-        {articles_html}
+        {sections_html}
         
         <div class="footer">
             Curated by The Journey • Powered by Ollama
@@ -143,6 +180,16 @@ EMAIL_TEMPLATE = """<!DOCTYPE html>
     </div>
 </body>
 </html>
+"""
+
+SECTION_TEMPLATE = """
+<div class="section">
+    <div class="section-header" style="border-color: {color};">
+        <span class="emoji">{emoji}</span>
+        <h2>{section_name}</h2>
+    </div>
+    {articles_html}
+</div>
 """
 
 ARTICLE_TEMPLATE = """
@@ -186,7 +233,7 @@ def build_email_html(
     buckets: Optional[dict[ArticleCategory, list[ArticleMeta]]] = None
 ) -> str:
     """
-    Build HTML email content.
+    Build HTML email content (legacy flat list format).
     
     Args:
         email_date: Date for the email header.
@@ -230,7 +277,80 @@ def build_email_html(
     
     return EMAIL_TEMPLATE.format(
         formatted_date=formatted_date,
-        articles_html=articles_html,
+        sections_html=articles_html,
+    )
+
+
+def build_sectioned_email_html(
+    email_date: date,
+    sections: dict[str, list[ArticleMeta]],
+    summaries: dict[str, str],
+) -> str:
+    """
+    Build HTML email content organized by sections.
+    
+    Args:
+        email_date: Date for the email header.
+        sections: Dictionary mapping section names to lists of articles.
+        summaries: Dictionary mapping article IDs to summaries.
+    
+    Returns:
+        Complete HTML email string with sectioned layout.
+    """
+    formatted_date = email_date.strftime("%A, %B %d, %Y")
+    
+    # Define section order
+    section_order = [
+        "World News",
+        "US Tech",
+        "US Industry",
+        "Malaysia Tech",
+        "Malaysia Industry",
+    ]
+    
+    sections_html_parts = []
+    
+    for section_name in section_order:
+        articles = sections.get(section_name, [])
+        config = SECTION_CONFIG.get(section_name, {"emoji": "📰", "color": "#666"})
+        
+        if articles:
+            # Build articles HTML for this section
+            articles_html_parts = []
+            for article in articles:
+                summary = summaries.get(article.id, "")
+                summary_html = _format_summary_html(summary) if summary else "<p><em>Summary not available</em></p>"
+                
+                source = article.source or "Unknown"
+                published_time = article.published_at.strftime("%I:%M %p")
+                
+                # Use a simplified article format without category tags for sectioned view
+                article_html = f"""
+<div class="article">
+    <h2 class="headline"><a href="{article.url}">{article.title}</a></h2>
+    <div class="meta">{source} • {published_time}</div>
+    <div class="summary">{summary_html}</div>
+</div>
+"""
+                articles_html_parts.append(article_html)
+            
+            articles_html = "\n".join(articles_html_parts)
+        else:
+            articles_html = '<p class="section-empty">No articles available in this section.</p>'
+        
+        section_html = SECTION_TEMPLATE.format(
+            color=config["color"],
+            emoji=config["emoji"],
+            section_name=section_name,
+            articles_html=articles_html,
+        )
+        sections_html_parts.append(section_html)
+    
+    sections_html = "\n".join(sections_html_parts)
+    
+    return EMAIL_TEMPLATE.format(
+        formatted_date=formatted_date,
+        sections_html=sections_html,
     )
 
 
