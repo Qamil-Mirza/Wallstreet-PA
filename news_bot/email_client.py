@@ -203,16 +203,28 @@ ARTICLE_TEMPLATE = """
 
 
 def _format_summary_html(summary: str) -> str:
-    """Format narrative summary as HTML paragraph."""
-    # Clean up the text - join multiple lines into flowing text
-    text = " ".join(line.strip() for line in summary.strip().split("\n") if line.strip())
+    """Format analyst-style summary as HTML with proper structure."""
+    # Split on double newlines to separate main content from "So what?" section
+    parts = summary.strip().split("\n\n")
     
-    # Remove any stray bullet characters that might have slipped through
-    for prefix in ["•", "-", "*", "·"]:
-        if text.startswith(prefix):
-            text = text[1:].strip()
+    html_parts = []
+    for part in parts:
+        # Clean up each part
+        text = " ".join(line.strip() for line in part.strip().split("\n") if line.strip())
+        
+        # Remove any stray bullet characters
+        for prefix in ["•", "-", "*", "·"]:
+            if text.startswith(prefix):
+                text = text[1:].strip()
+        
+        if text:
+            # Style "So what?" differently for emphasis
+            if text.lower().startswith("so what?"):
+                html_parts.append(f'<p style="margin-top: 8px; color: #374151;"><strong>{text[:8]}</strong>{text[8:]}</p>')
+            else:
+                html_parts.append(f"<p>{text}</p>")
     
-    return f"<p>{text}</p>"
+    return "".join(html_parts) if html_parts else "<p></p>"
 
 
 def _get_category_class(

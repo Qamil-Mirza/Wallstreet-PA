@@ -16,20 +16,41 @@ from .news_client import ArticleMeta
 logger = logging.getLogger(__name__)
 
 
-PROMPT_TEMPLATE = """You are a senior Wall Street research analyst briefing a client over the phone. Summarize this news in 2-3 flowing sentences as if you're speaking directly to them.
+PROMPT_TEMPLATE = """<role>
+You are a Senior Equity Research Analyst for a top-tier investment bank. Your task is to write a high-conviction news brief for institutional clients based on the provided article.
+</role>
 
-Rules:
-- Start immediately with the key news. No preamble like "Here's a summary" or "This article discusses"
-- Write in a conversational but professional tone, like you're explaining to a smart colleague
-- Include specific numbers (percentages, dollar amounts, dates) when available
-- End with the "so what" - why this matters for markets or investors
-- Keep it tight: 2-3 sentences max, no fluff
+<instructions>
+You must output a SINGLE paragraph containing EXACTLY three sentences. Follow this structure strictly:
 
-Article: {title}
+1.  **Sentence 1 (The Event):** State clearly who did what, where, and when. Focus on the core transactional or operational update.
+2.  **Sentence 2 (The Numbers):** Extract specific metrics (CAPEX, revenue, margins, bps, dates). Do not generalize; use the exact figures from the text.
+3.  **Sentence 3 (The Implication):** You MUST start this sentence with "So what?". Connect the metrics to the P&L or stock valuation. Mention one upside driver and one specific risk. End with a theme tag in parentheses.
+</instructions>
 
+<constraints>
+* **Length:** EXACTLY 3 sentences. No more, no less.
+* **Formatting:** Single paragraph. No line breaks between sentences.
+* **Tone:** Clinical, skeptical, and professional.
+* **Banned Words:** "Exciting," "game-changer," "massive," "whopping," "revolution," "skyrocket," "transformative."
+* **Requirement:** Do not output introductory filler (e.g., "Here is the brief"). Start directly with the first sentence.
+</constraints>
+
+<example>
+Input Article Snippet: Nvidia reported Q4 earnings today. Revenue hit $22.1B, up 265% year-over-year, driven by H100 chip demand. Data Center revenue was $18.4B. However, supply chain constraints remain a bottleneck for H2 delivery.
+
+Output:
+Nvidia reported Q4 earnings significantly above consensus, driven by unprecedented demand for H100 accelerators in the data center segment. Revenue surged 265% YoY to $22.1B, with Data Center contributing $18.4B of the total top line. So what? While this confirms the AI infrastructure supercycle supports continued margin expansion, persistent supply chain bottlenecks in H2 could cap near-term volume upside (theme: AI Hardware, Semi-Cap).
+</example>
+
+<article>
 {content}
+</article>
 
-Your briefing (start directly with the news):"""
+Based on the article above, write the 3-sentence brief.
+Remember: Start directly with the news. Ensure the third sentence starts with "So what?".
+
+Brief:"""
 
 
 class SummarizerError(Exception):
@@ -52,6 +73,10 @@ def _clean_summary(text: str) -> str:
         "summary:",
         "here are the key points",
         "here's what you need to know",
+        "here is the 3-sentence brief",
+        "here's the 3-sentence brief",
+        "here is my 3-sentence brief",
+        "3-sentence brief:",
     ]
     
     lines = text.strip().split('\n')
@@ -68,7 +93,13 @@ def _clean_summary(text: str) -> str:
         if not skip and line.strip():
             cleaned_lines.append(line.strip())
     
-    return ' '.join(cleaned_lines)
+    # Join with space, preserving "So what?" as a natural break
+    result = ' '.join(cleaned_lines)
+    
+    # Ensure "So what?" starts on visual break if present
+    result = result.replace('. So what?', '.\n\nSo what?')
+    
+    return result
 
 
 def summarize_article(
@@ -103,8 +134,8 @@ def summarize_article(
         "prompt": prompt,
         "stream": False,
         "options": {
-            "temperature": 0.4,  # Slightly higher for natural flow
-            "num_predict": 300,  # Shorter for concise narrative
+            "temperature": 0.3,  # Lower for consistent, factual output
+            "num_predict": 400,  # Allow room for structured 3-sentence format
         }
     }
     

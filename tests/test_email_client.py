@@ -86,13 +86,24 @@ class TestFormatSummaryHtml:
         assert "This starts with" in result
 
     def test_format_handles_empty_lines(self):
-        """Test that empty lines are handled gracefully."""
+        """Test that double newlines create separate paragraphs."""
         summary = "First part.\n\nSecond part.\n\n"
 
         result = _format_summary_html(summary)
 
-        assert "<p>" in result
-        assert "First part. Second part." in result
+        # Double newlines should create separate paragraphs
+        assert "<p>First part.</p>" in result
+        assert "<p>Second part.</p>" in result
+
+    def test_format_so_what_styling(self):
+        """Test that 'So what?' gets special styling."""
+        summary = "Company announced X.\n\nSo what? This matters because Y."
+
+        result = _format_summary_html(summary)
+
+        # "So what?" should be bolded
+        assert "<strong>So what?</strong>" in result
+        assert "This matters because Y." in result
 
     def test_format_plain_text(self):
         """Test formatting plain text."""
