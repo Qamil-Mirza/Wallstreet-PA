@@ -329,22 +329,26 @@ class TestBuildSectionedEmailHtml:
         assert "Markets are moving." in html
         assert "Apple news here." in html
 
-    def test_build_sectioned_email_handles_empty_sections(self):
-        """Test that empty sections show appropriate message."""
+    def test_build_sectioned_email_skips_empty_sections(self):
+        """Test that empty sections are skipped entirely."""
         sections = {
             "World News": [make_article("world-1", "World Article")],
-            "US Tech": [],  # Empty
-            "US Industry": [],  # Empty
-            "Malaysia Tech": [],  # Empty
-            "Malaysia Industry": [],  # Empty
+            "US Tech": [],  # Empty - should be skipped
+            "US Industry": [],  # Empty - should be skipped
+            "Malaysia Tech": [],  # Empty - should be skipped
+            "Malaysia Industry": [],  # Empty - should be skipped
         }
         summaries = {"world-1": "Summary"}
 
         html = build_sectioned_email_html(date(2024, 1, 15), sections, summaries)
 
-        # Should have "No articles available" for empty sections
-        assert "No articles available" in html
+        # Empty sections should be skipped entirely (not shown)
+        assert "US Tech" not in html
+        assert "US Industry" not in html
+        assert "Malaysia Tech" not in html
+        assert "Malaysia Industry" not in html
         # World News should have its article
+        assert "World News" in html
         assert "World Article" in html
 
     def test_build_sectioned_email_includes_section_emojis(self):

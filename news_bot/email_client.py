@@ -301,9 +301,13 @@ def build_sectioned_email_html(
     """
     Build HTML email content organized by sections.
     
+    Only includes sections that are present in the sections dict.
+    Sections with no articles are skipped entirely.
+    
     Args:
         email_date: Date for the email header.
         sections: Dictionary mapping section names to lists of articles.
+                  Only sections in this dict will be rendered.
         summaries: Dictionary mapping article IDs to summaries.
     
     Returns:
@@ -311,7 +315,7 @@ def build_sectioned_email_html(
     """
     formatted_date = email_date.strftime("%A, %B %d, %Y")
     
-    # Define section order
+    # Define section order (for consistent ordering when multiple sections enabled)
     section_order = [
         "World News",
         "US Tech",
@@ -323,32 +327,36 @@ def build_sectioned_email_html(
     sections_html_parts = []
     
     for section_name in section_order:
-        articles = sections.get(section_name, [])
+        # Only render sections that exist in the dict AND have articles
+        if section_name not in sections:
+            continue
+        
+        articles = sections[section_name]
+        if not articles:
+            continue  # Skip empty sections entirely
+        
         config = SECTION_CONFIG.get(section_name, {"emoji": "📰", "color": "#666"})
         
-        if articles:
-            # Build articles HTML for this section
-            articles_html_parts = []
-            for article in articles:
-                summary = summaries.get(article.id, "")
-                summary_html = _format_summary_html(summary) if summary else "<p><em>Summary not available</em></p>"
-                
-                source = article.source or "Unknown"
-                published_time = article.published_at.strftime("%I:%M %p")
-                
-                # Use a simplified article format without category tags for sectioned view
-                article_html = f"""
+        # Build articles HTML for this section
+        articles_html_parts = []
+        for article in articles:
+            summary = summaries.get(article.id, "")
+            summary_html = _format_summary_html(summary) if summary else "<p><em>Summary not available</em></p>"
+            
+            source = article.source or "Unknown"
+            published_time = article.published_at.strftime("%I:%M %p")
+            
+            # Use a simplified article format without category tags for sectioned view
+            article_html = f"""
 <div class="article">
     <h2 class="headline"><a href="{article.url}">{article.title}</a></h2>
     <div class="meta">{source} • {published_time}</div>
     <div class="summary">{summary_html}</div>
 </div>
 """
-                articles_html_parts.append(article_html)
-            
-            articles_html = "\n".join(articles_html_parts)
-        else:
-            articles_html = '<p class="section-empty">No articles available in this section.</p>'
+            articles_html_parts.append(article_html)
+        
+        articles_html = "\n".join(articles_html_parts)
         
         section_html = SECTION_TEMPLATE.format(
             color=config["color"],
