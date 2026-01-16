@@ -36,6 +36,13 @@ class Config:
     # Ollama settings
     ollama_base_url: str
     ollama_model: str
+    
+    # Section feature flags (all enabled by default)
+    section_world_enabled: bool = True
+    section_us_tech_enabled: bool = True
+    section_us_industry_enabled: bool = True
+    section_malaysia_tech_enabled: bool = True
+    section_malaysia_industry_enabled: bool = True
 
 
 def _get_required_env(key: str) -> str:
@@ -49,6 +56,14 @@ def _get_required_env(key: str) -> str:
 def _get_optional_env(key: str, default: str) -> str:
     """Get an optional environment variable with a default."""
     return os.environ.get(key, default)
+
+
+def _get_bool_env(key: str, default: bool = True) -> bool:
+    """Get a boolean environment variable. Accepts true/false/1/0/yes/no."""
+    value = os.environ.get(key)
+    if value is None:
+        return default
+    return value.lower() in ("true", "1", "yes", "on")
 
 
 def load_config(env_path: Optional[Path] = None) -> Config:
@@ -91,4 +106,10 @@ def load_config(env_path: Optional[Path] = None) -> Config:
         recipient_email=_get_required_env("RECIPIENT_EMAIL"),
         ollama_base_url=_get_optional_env("OLLAMA_BASE_URL", "http://localhost:11434"),
         ollama_model=_get_optional_env("OLLAMA_MODEL", "llama3"),
+        # Section feature flags
+        section_world_enabled=_get_bool_env("SECTION_WORLD_ENABLED", True),
+        section_us_tech_enabled=_get_bool_env("SECTION_US_TECH_ENABLED", True),
+        section_us_industry_enabled=_get_bool_env("SECTION_US_INDUSTRY_ENABLED", True),
+        section_malaysia_tech_enabled=_get_bool_env("SECTION_MALAYSIA_TECH_ENABLED", True),
+        section_malaysia_industry_enabled=_get_bool_env("SECTION_MALAYSIA_INDUSTRY_ENABLED", True),
     )

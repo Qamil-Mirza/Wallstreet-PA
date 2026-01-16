@@ -129,3 +129,72 @@ class TestConfig:
 
         assert config.news_api_key == "key"
         assert config.smtp_port == 587
+
+    def test_config_section_flags_default_to_true(self):
+        """Test that section flags default to True."""
+        config = Config(
+            news_api_key="key",
+            news_api_base_url="https://api.test.com",
+            smtp_host="smtp.test.com",
+            smtp_port=587,
+            smtp_user="user@test.com",
+            smtp_password="secret",
+            recipient_email="recipient@test.com",
+            ollama_base_url="http://localhost:11434",
+            ollama_model="llama3",
+        )
+
+        assert config.section_world_enabled is True
+        assert config.section_us_tech_enabled is True
+        assert config.section_us_industry_enabled is True
+        assert config.section_malaysia_tech_enabled is True
+        assert config.section_malaysia_industry_enabled is True
+
+
+class TestSectionFeatureFlags:
+    """Tests for section feature flag loading."""
+
+    def test_load_config_section_flags_from_env(self, monkeypatch):
+        """Test that section flags are loaded from environment."""
+        monkeypatch.setenv("NEWS_API_KEY", "test_key")
+        monkeypatch.setenv("SMTP_HOST", "smtp.test.com")
+        monkeypatch.setenv("SMTP_USER", "user@test.com")
+        monkeypatch.setenv("SMTP_PASSWORD", "secret123")
+        monkeypatch.setenv("RECIPIENT_EMAIL", "recipient@test.com")
+        
+        # Set section flags
+        monkeypatch.setenv("SECTION_WORLD_ENABLED", "true")
+        monkeypatch.setenv("SECTION_US_TECH_ENABLED", "false")
+        monkeypatch.setenv("SECTION_US_INDUSTRY_ENABLED", "1")
+        monkeypatch.setenv("SECTION_MALAYSIA_TECH_ENABLED", "0")
+        monkeypatch.setenv("SECTION_MALAYSIA_INDUSTRY_ENABLED", "yes")
+
+        config = load_config()
+
+        assert config.section_world_enabled is True
+        assert config.section_us_tech_enabled is False
+        assert config.section_us_industry_enabled is True
+        assert config.section_malaysia_tech_enabled is False
+        assert config.section_malaysia_industry_enabled is True
+
+    def test_load_config_section_flags_default_true(self, monkeypatch):
+        """Test that section flags default to True when not set."""
+        monkeypatch.setenv("NEWS_API_KEY", "test_key")
+        monkeypatch.setenv("SMTP_HOST", "smtp.test.com")
+        monkeypatch.setenv("SMTP_USER", "user@test.com")
+        monkeypatch.setenv("SMTP_PASSWORD", "secret123")
+        monkeypatch.setenv("RECIPIENT_EMAIL", "recipient@test.com")
+        
+        # Clear section flags
+        for key in ["SECTION_WORLD_ENABLED", "SECTION_US_TECH_ENABLED",
+                    "SECTION_US_INDUSTRY_ENABLED", "SECTION_MALAYSIA_TECH_ENABLED",
+                    "SECTION_MALAYSIA_INDUSTRY_ENABLED"]:
+            monkeypatch.delenv(key, raising=False)
+
+        config = load_config()
+
+        assert config.section_world_enabled is True
+        assert config.section_us_tech_enabled is True
+        assert config.section_us_industry_enabled is True
+        assert config.section_malaysia_tech_enabled is True
+        assert config.section_malaysia_industry_enabled is True

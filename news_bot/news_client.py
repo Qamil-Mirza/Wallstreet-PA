@@ -108,19 +108,40 @@ class NewsFeedConfig:
     """Configuration for a specific news feed query."""
     
     name: str
+    config_key: str  # Maps to Config.section_{key}_enabled
     countries: Optional[str] = None  # Comma-separated country codes (e.g., "us", "my")
     industries: Optional[str] = None  # Comma-separated industries (e.g., "Technology", "Industrials")
     limit: int = 10
 
 
 # Default feed configurations for multi-region news fetching
-DEFAULT_FEEDS = [
-    NewsFeedConfig(name="World News", limit=10),
-    NewsFeedConfig(name="US Tech", countries="us", industries="Technology", limit=10),
-    NewsFeedConfig(name="US Industry", countries="us", industries="Industrials", limit=10),
-    NewsFeedConfig(name="Malaysia Tech", countries="my", industries="Technology", limit=10),
-    NewsFeedConfig(name="Malaysia Industry", countries="my", industries="Industrials", limit=10),
+ALL_FEEDS = [
+    NewsFeedConfig(name="World News", config_key="world", limit=10),
+    NewsFeedConfig(name="US Tech", config_key="us_tech", countries="us", industries="Technology", limit=10),
+    NewsFeedConfig(name="US Industry", config_key="us_industry", countries="us", industries="Industrials", limit=10),
+    NewsFeedConfig(name="Malaysia Tech", config_key="malaysia_tech", countries="my", industries="Technology", limit=10),
+    NewsFeedConfig(name="Malaysia Industry", config_key="malaysia_industry", countries="my", industries="Industrials", limit=10),
 ]
+
+
+def _get_enabled_feeds(config: Config) -> list[NewsFeedConfig]:
+    """Filter feeds based on feature flags in config."""
+    feed_flags = {
+        "world": config.section_world_enabled,
+        "us_tech": config.section_us_tech_enabled,
+        "us_industry": config.section_us_industry_enabled,
+        "malaysia_tech": config.section_malaysia_tech_enabled,
+        "malaysia_industry": config.section_malaysia_industry_enabled,
+    }
+    
+    enabled = [feed for feed in ALL_FEEDS if feed_flags.get(feed.config_key, True)]
+    
+    if not enabled:
+        logger.warning("No sections enabled! Falling back to World News.")
+        return [ALL_FEEDS[0]]  # Fallback to World News
+    
+    logger.info(f"Enabled sections: {[f.name for f in enabled]}")
+    return enabled
 
 
 def fetch_recent_articles(config: Config, limit: int = 30) -> list[ArticleMeta]:
@@ -160,10 +181,12 @@ def _fetch_marketaux_multi(config: Config, total_limit: int) -> list[ArticleMeta
     seen_urls: set[str] = set()
     errors: list[str] = []
     
-    # Calculate per-feed limit (distribute evenly, minimum 3 per feed)
-    per_feed_limit = max(3, total_limit // len(DEFAULT_FEEDS))
+    enabled_feeds = _get_enabled_feeds(config)
     
-    for feed in DEFAULT_FEEDS:
+    # Calculate per-feed limit (distribute evenly, minimum 3 per feed)
+    per_feed_limit = max(3, total_limit // len(enabled_feeds))
+    
+    for feed in enabled_feeds:
         try:
             articles = _fetch_marketaux_single(
                 config=config,
@@ -187,7 +210,7 @@ def _fetch_marketaux_multi(config: Config, total_limit: int) -> list[ArticleMeta
     if not all_articles and errors:
         raise NewsClientError(f"All feeds failed: {'; '.join(errors)}")
     
-    logger.info(f"Total unique articles fetched: {len(all_articles)} from {len(DEFAULT_FEEDS)} feeds")
+    logger.info(f"Total unique articles fetched: {len(all_articles)} from {len(enabled_feeds)} feeds")
     return all_articles
 
 
@@ -221,7 +244,9 @@ def fetch_articles_by_section(config: Config, per_section_limit: int = 5) -> dic
     seen_urls: set[str] = set()
     errors: list[str] = []
     
-    for feed in DEFAULT_FEEDS:
+    enabled_feeds = _get_enabled_feeds(config)
+    
+    for feed in enabled_feeds:
         try:
             articles = _fetch_marketaux_single(
                 config=config,

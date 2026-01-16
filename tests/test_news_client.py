@@ -10,7 +10,8 @@ from news_bot.news_client import (
     ArticleMeta,
     NewsClientError,
     NewsFeedConfig,
-    DEFAULT_FEEDS,
+    ALL_FEEDS,
+    _get_enabled_feeds,
     _normalize_marketaux_article,
     _normalize_fmp_article,
     _parse_datetime,
@@ -32,6 +33,11 @@ def mock_config():
         recipient_email="recipient@test.com",
         ollama_base_url="http://localhost:11434",
         ollama_model="llama3",
+        section_world_enabled=True,
+        section_us_tech_enabled=True,
+        section_us_industry_enabled=True,
+        section_malaysia_tech_enabled=True,
+        section_malaysia_industry_enabled=True,
     )
 
 
@@ -247,13 +253,13 @@ class TestFetchRecentArticles:
             # Return different response for each call (5 feeds)
             mock_get.return_value.raise_for_status = MagicMock()
             mock_get.return_value.json.side_effect = [
-                create_response(i) for i in range(len(DEFAULT_FEEDS))
+                create_response(i) for i in range(len(ALL_FEEDS))
             ]
 
             result = fetch_recent_articles(mock_config, limit=30)
 
         # Should have called API once per feed (5 times)
-        assert mock_get.call_count == len(DEFAULT_FEEDS)
+        assert mock_get.call_count == len(ALL_FEEDS)
         
         # Should have 2 articles per feed * 5 feeds = 10 unique articles
         assert len(result) == 10
@@ -388,6 +394,11 @@ class TestFetchRecentArticles:
             recipient_email="recipient@test.com",
             ollama_base_url="http://localhost:11434",
             ollama_model="llama3",
+            section_world_enabled=True,
+            section_us_tech_enabled=True,
+            section_us_industry_enabled=True,
+            section_malaysia_tech_enabled=True,
+            section_malaysia_industry_enabled=True,
         )
 
         mock_response = [
@@ -413,34 +424,90 @@ class TestFetchRecentArticles:
 class TestNewsFeedConfig:
     """Tests for NewsFeedConfig dataclass."""
 
-    def test_default_feeds_configured(self):
-        """Test that default feeds are properly configured."""
-        assert len(DEFAULT_FEEDS) == 5
+    def test_all_feeds_configured(self):
+        """Test that all feeds are properly configured."""
+        assert len(ALL_FEEDS) == 5
         
-        feed_names = [f.name for f in DEFAULT_FEEDS]
+        feed_names = [f.name for f in ALL_FEEDS]
         assert "World News" in feed_names
         assert "US Tech" in feed_names
         assert "US Industry" in feed_names
         assert "Malaysia Tech" in feed_names
         assert "Malaysia Industry" in feed_names
 
+    def test_feeds_have_config_keys(self):
+        """Test that all feeds have config keys for feature flags."""
+        expected_keys = {"world", "us_tech", "us_industry", "malaysia_tech", "malaysia_industry"}
+        actual_keys = {f.config_key for f in ALL_FEEDS}
+        assert actual_keys == expected_keys
+
+
+class TestFeatureFlags:
+    """Tests for section feature flags."""
+
+    def test_all_sections_enabled_returns_all_feeds(self, mock_config):
+        """Test that all feeds are returned when all sections enabled."""
+        enabled = _get_enabled_feeds(mock_config)
+        assert len(enabled) == 5
+
+    def test_disable_malaysia_sections(self, mock_config):
+        """Test that disabling Malaysia sections filters them out."""
+        mock_config.section_malaysia_tech_enabled = False
+        mock_config.section_malaysia_industry_enabled = False
+        
+        enabled = _get_enabled_feeds(mock_config)
+        
+        assert len(enabled) == 3
+        feed_names = [f.name for f in enabled]
+        assert "World News" in feed_names
+        assert "US Tech" in feed_names
+        assert "US Industry" in feed_names
+        assert "Malaysia Tech" not in feed_names
+        assert "Malaysia Industry" not in feed_names
+
+    def test_only_world_enabled(self, mock_config):
+        """Test enabling only World News section."""
+        mock_config.section_us_tech_enabled = False
+        mock_config.section_us_industry_enabled = False
+        mock_config.section_malaysia_tech_enabled = False
+        mock_config.section_malaysia_industry_enabled = False
+        
+        enabled = _get_enabled_feeds(mock_config)
+        
+        assert len(enabled) == 1
+        assert enabled[0].name == "World News"
+
+    def test_no_sections_enabled_falls_back_to_world(self, mock_config):
+        """Test that disabling all sections falls back to World News."""
+        mock_config.section_world_enabled = False
+        mock_config.section_us_tech_enabled = False
+        mock_config.section_us_industry_enabled = False
+        mock_config.section_malaysia_tech_enabled = False
+        mock_config.section_malaysia_industry_enabled = False
+        
+        enabled = _get_enabled_feeds(mock_config)
+        
+        # Should fallback to World News
+        assert len(enabled) == 1
+        assert enabled[0].name == "World News"
+
     def test_us_feeds_have_country_filter(self):
         """Test that US feeds have correct country filter."""
-        us_feeds = [f for f in DEFAULT_FEEDS if "US" in f.name]
+        us_feeds = [f for f in ALL_FEEDS if "US" in f.name]
         assert len(us_feeds) == 2
         for feed in us_feeds:
             assert feed.countries == "us"
 
     def test_malaysia_feeds_have_country_filter(self):
         """Test that Malaysia feeds have correct country filter."""
-        my_feeds = [f for f in DEFAULT_FEEDS if "Malaysia" in f.name]
+        my_feeds = [f for f in ALL_FEEDS if "Malaysia" in f.name]
         assert len(my_feeds) == 2
         for feed in my_feeds:
             assert feed.countries == "my"
 
     def test_world_news_has_no_filters(self):
         """Test that World News feed has no country/industry filters."""
-        world_feed = next(f for f in DEFAULT_FEEDS if f.name == "World News")
+        world_feed = next(f for f in ALL_FEEDS if f.name == "World News")
         assert world_feed.countries is None
         assert world_feed.industries is None
 
