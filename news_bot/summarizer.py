@@ -5,6 +5,9 @@ Generates analyst-style narrative summaries of articles.
 """
 
 import logging
+import os
+from datetime import datetime
+from pathlib import Path
 from typing import Optional
 
 import requests
@@ -14,6 +17,83 @@ from .news_client import ArticleMeta
 
 
 logger = logging.getLogger(__name__)
+
+# Trace logger for detailed LLM I/O logging
+_trace_logger: Optional[logging.Logger] = None
+
+
+def _get_trace_logger(model_name: str) -> logging.Logger:
+    """
+    Get or create a trace logger that writes to a timestamped file.
+    
+    Creates a file: logs/{model_name}_trace_{date}_{time}.log
+    """
+    global _trace_logger
+    
+    if _trace_logger is not None:
+        return _trace_logger
+    
+    # Create logs directory if it doesn't exist
+    logs_dir = Path("logs")
+    logs_dir.mkdir(exist_ok=True)
+    
+    # Generate timestamped filename
+    now = datetime.now()
+    timestamp = now.strftime("%Y%m%d_%H%M%S")
+    # Sanitize model name for filename (replace special chars)
+    safe_model_name = model_name.replace("/", "_").replace(":", "_")
+    log_filename = f"{safe_model_name}_trace_{timestamp}.log"
+    log_path = logs_dir / log_filename
+    
+    # Create dedicated trace logger
+    _trace_logger = logging.getLogger(f"llm_trace.{safe_model_name}")
+    _trace_logger.setLevel(logging.DEBUG)
+    _trace_logger.propagate = False  # Don't propagate to root logger
+    
+    # File handler with detailed format
+    file_handler = logging.FileHandler(log_path, encoding="utf-8")
+    file_handler.setLevel(logging.DEBUG)
+    formatter = logging.Formatter(
+        "%(asctime)s [%(levelname)s]\n%(message)s\n",
+        datefmt="%Y-%m-%d %H:%M:%S"
+    )
+    file_handler.setFormatter(formatter)
+    _trace_logger.addHandler(file_handler)
+    
+    logger.info(f"LLM trace logging to: {log_path}")
+    
+    return _trace_logger
+
+
+def _log_llm_call(
+    trace_logger: logging.Logger,
+    article_title: str,
+    prompt: str,
+    response: str,
+    model: str,
+    duration_ms: float,
+    tokens_eval: Optional[int] = None,
+) -> None:
+    """Log a complete LLM call with input and output."""
+    separator = "=" * 80
+    
+    log_message = f"""
+{separator}
+ARTICLE: {article_title}
+MODEL: {model}
+DURATION: {duration_ms:.0f}ms
+{f"TOKENS: {tokens_eval}" if tokens_eval else ""}
+{separator}
+
+>>> INPUT PROMPT >>>
+{prompt}
+
+<<< OUTPUT RESPONSE <<<
+{response}
+
+{separator}
+"""
+    trace_logger.debug(log_message)
 
 
 PROMPT_TEMPLATE = """<role>
@@ -125,6 +205,9 @@ def summarize_article(
     Raises:
         SummarizerError: If the Ollama request fails.
     """
+    # Get trace logger for this model
+    trace_logger = _get_trace_logger(model)
+    
     prompt = PROMPT_TEMPLATE.format(title=title, content=content[:4000])
     
     url = f"{base_url.rstrip('/')}/api/generate"
@@ -139,6 +222,8 @@ def summarize_article(
         }
     }
     
+    start_time = datetime.now()
+    
     try:
         response = requests.post(url, json=payload, timeout=timeout)
         response.raise_for_status()
@@ -147,16 +232,33 @@ def summarize_article(
     except requests.RequestException as e:
         raise SummarizerError(f"Failed to connect to Ollama: {e}")
     
+    end_time = datetime.now()
+    duration_ms = (end_time - start_time).total_seconds() * 1000
+    
     data = response.json()
     
     # Ollama returns response in "response" field
-    summary = data.get("response", "")
+    raw_response = data.get("response", "")
     
-    if not summary:
+    # Get token count if available
+    tokens_eval = data.get("eval_count")
+    
+    # Log the complete LLM call trace
+    _log_llm_call(
+        trace_logger=trace_logger,
+        article_title=title,
+        prompt=prompt,
+        response=raw_response,
+        model=model,
+        duration_ms=duration_ms,
+        tokens_eval=tokens_eval,
+    )
+    
+    if not raw_response:
         raise SummarizerError("Ollama returned empty response")
     
     # Clean up any preambles the LLM might have added
-    return _clean_summary(summary)
+    return _clean_summary(raw_response)
 
 
 def summarize_articles(

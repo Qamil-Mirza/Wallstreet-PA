@@ -4,5 +4,7 @@ venv/
 .vscode/
 .idea/
 .pytest_cache/
-.pytest_cache/
 __pycache__/
+
+# LLM trace logs
+logs/
