@@ -6,10 +6,12 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from news_bot.article_extractor import (
+    BLOCKED_CONTENT_MARKER,
     _extract_text_from_html,
     _fetch_and_extract,
     ensure_article_content,
     ensure_batch_content,
+    is_blocked_content,
 )
 from news_bot.news_client import ArticleMeta
 
@@ -146,10 +148,11 @@ class TestFetchAndExtract:
             mock_response.raise_for_status = MagicMock()
             mock_get.return_value = mock_response
 
-            result = _fetch_and_extract("https://example.com/article")
+            content, is_blocked = _fetch_and_extract("https://example.com/article")
 
-        assert result is not None
-        assert "article content" in result
+        assert content is not None
+        assert "article content" in content
+        assert is_blocked is False
 
     def test_fetch_and_extract_non_html(self):
         """Test handling of non-HTML content types."""
@@ -159,9 +162,10 @@ class TestFetchAndExtract:
             mock_response.raise_for_status = MagicMock()
             mock_get.return_value = mock_response
 
-            result = _fetch_and_extract("https://example.com/api")
+            content, is_blocked = _fetch_and_extract("https://example.com/api")
 
-        assert result is None
+        assert content is None
+        assert is_blocked is False
 
     def test_fetch_and_extract_request_error(self):
         """Test handling of request errors."""
@@ -170,9 +174,10 @@ class TestFetchAndExtract:
         with patch("news_bot.article_extractor.requests.get") as mock_get:
             mock_get.side_effect = req.RequestException("Connection failed")
 
-            result = _fetch_and_extract("https://example.com/article")
+            content, is_blocked = _fetch_and_extract("https://example.com/article")
 
-        assert result is None
+        assert content is None
+        assert is_blocked is False
 
 
 class TestEnsureArticleContent:
@@ -326,3 +331,117 @@ class TestEnsureBatchContent:
         """Test handling of empty list."""
         result = ensure_batch_content([])
         assert result == []
+
+
+class TestBlockDetection:
+    """Tests for blocked/paywalled content detection."""
+
+    def test_is_blocked_content_javascript_required(self):
+        """Test detection of JavaScript requirement message."""
+        text = "Please enable Javascript and cookies to continue. If you have an ad-blocker enabled you may be blocked from proceeding."
+        
+        assert is_blocked_content(text) is True
+
+    def test_is_blocked_content_ad_blocker(self):
+        """Test detection of ad-blocker message."""
+        text = "We've detected that you have an ad-blocker enabled. Please disable your ad blocker to access this content."
+        
+        assert is_blocked_content(text) is True
+
+    def test_is_blocked_content_paywall(self):
+        """Test detection of paywall message."""
+        text = "Subscribe to continue reading. This is premium content available to subscribers only."
+        
+        assert is_blocked_content(text) is True
+
+    def test_is_blocked_content_captcha(self):
+        """Test detection of CAPTCHA/bot check."""
+        text = "Please verify you are human by completing the CAPTCHA below."
+        
+        assert is_blocked_content(text) is True
+
+    def test_is_blocked_content_access_denied(self):
+        """Test detection of access denied message."""
+        text = "Access to this page has been denied. Please contact support if you believe this is an error."
+        
+        assert is_blocked_content(text) is True
+
+    def test_is_blocked_content_legitimate_article(self):
+        """Test that legitimate article content is not flagged as blocked."""
+        text = """
+        Apple Inc. reported quarterly earnings that beat analyst expectations.
+        Revenue reached $89.5 billion, up 8% from the same quarter last year.
+        The company's services segment continued to show strong growth, with
+        revenue reaching an all-time high. CEO Tim Cook said the company is
+        optimistic about the upcoming product cycle. Analysts expect continued
+        growth in the wearables and services segments.
+        """
+        
+        assert is_blocked_content(text) is False
+
+    def test_is_blocked_content_empty(self):
+        """Test that empty content is not flagged as blocked."""
+        assert is_blocked_content("") is False
+        assert is_blocked_content(None) is False
+
+    def test_is_blocked_content_short_with_indicators(self):
+        """Test detection of short content with multiple block indicators."""
+        text = "Please sign in or subscribe to continue"
+        
+        assert is_blocked_content(text) is True
+
+    def test_fetch_and_extract_returns_blocked_flag(self):
+        """Test that _fetch_and_extract returns blocked flag for block pages."""
+        block_html = """
+        <html><body>
+            <p>Please enable Javascript and cookies to continue browsing.</p>
+            <p>If you have an ad-blocker enabled you may be blocked from proceeding.</p>
+        </body></html>
+        """
+
+        with patch("news_bot.article_extractor.requests.get") as mock_get:
+            mock_response = MagicMock()
+            mock_response.text = block_html
+            mock_response.headers = {"Content-Type": "text/html"}
+            mock_response.raise_for_status = MagicMock()
+            mock_get.return_value = mock_response
+
+            content, is_blocked = _fetch_and_extract("https://example.com/article")
+
+        assert is_blocked is True
+        assert content is None
+
+    def test_ensure_article_content_marks_blocked(self):
+        """Test that blocked content is marked with BLOCKED_CONTENT_MARKER."""
+        article = make_article(content=None)
+
+        block_html = """
+        <html><body>
+            <p>Please enable Javascript to view this page. Cookies are required.</p>
+        </body></html>
+        """
+
+        with patch("news_bot.article_extractor.requests.get") as mock_get:
+            mock_response = MagicMock()
+            mock_response.text = block_html
+            mock_response.headers = {"Content-Type": "text/html"}
+            mock_response.raise_for_status = MagicMock()
+            mock_get.return_value = mock_response
+
+            result = ensure_article_content(article)
+
+        assert result.content == BLOCKED_CONTENT_MARKER
+
+    def test_ensure_article_content_checks_existing_content(self):
+        """Test that existing blocked content is detected and marked."""
+        # Content must be > 100 chars to be checked without fetching
+        blocked_content = (
+            "Please subscribe to continue reading this premium content. "
+            "This article is available to subscribers only. Sign in to access "
+            "the full story and exclusive member benefits."
+        )
+        article = make_article(content=blocked_content)
+
+        result = ensure_article_content(article)
+
+        assert result.content == BLOCKED_CONTENT_MARKER
