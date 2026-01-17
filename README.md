@@ -1,19 +1,22 @@
 # 📊 The Daily Brief By The Journey
 
-A fully automated daily finance/economics email bot that:
+A fully automated daily finance/economics email bot that runs locally and:
 
-- **Pulls** recent financial news from free APIs (MarketAux or FMP)
-- **Classifies** articles into Macro, Deal/Corporate, and Feature/Trend categories
-- **Summarizes** each story using a local Ollama LLM in analyst-style voice
-- **Sends** a beautifully formatted HTML email every morning
+- **Pulls** recent financial news from MarketAux (multi-feed, sectioned)
+- **Extracts** full article text using `trafilatura` (with BeautifulSoup fallback)
+- **Summarizes** each story using a local Ollama LLM in an analyst-style voice (3-sentence brief)
+- **Sends** a beautifully formatted HTML email every morning, organized by enabled sections
 
 All components run locally on modest hardware using only free services.
 
 ## Features
 
-- 🆓 **Free tier APIs**: MarketAux or Financial Modeling Prep
+- 🆓 **Free tier news**: MarketAux (recommended)
 - 🤖 **Local LLM**: Ollama (llama3, llama3.1, etc.)
 - 📧 **SMTP email**: Works with Gmail, Outlook, or any SMTP provider
+- 🧩 **Section feature flags**: Toggle which sections appear in the final email
+- 🧾 **LLM trace logs**: Full prompt + raw model output saved to `logs/`
+- 🧱 **Block-page detection**: Detects paywalls/adblock/captcha pages and skips LLM calls
 - 🧪 **Fully tested**: pytest test suite with mocks
 - 📦 **Modular design**: Each component in its own module
 
@@ -42,6 +45,9 @@ Edit `.env` with your credentials:
 # Get a free API key from https://www.marketaux.com/
 NEWS_API_KEY=your_marketaux_api_key
 
+# MarketAux base URL (default)
+NEWS_API_BASE_URL=https://api.marketaux.com/v1
+
 # Gmail with App Password (recommended)
 SMTP_HOST=smtp.gmail.com
 SMTP_PORT=587
@@ -52,6 +58,13 @@ RECIPIENT_EMAIL=recipient@example.com
 # Ollama settings (make sure Ollama is running)
 OLLAMA_BASE_URL=http://localhost:11434
 OLLAMA_MODEL=llama3
+
+# Section Feature Flags (true/false)
+SECTION_WORLD_ENABLED=true
+SECTION_US_TECH_ENABLED=true
+SECTION_US_INDUSTRY_ENABLED=true
+SECTION_MALAYSIA_TECH_ENABLED=true
+SECTION_MALAYSIA_INDUSTRY_ENABLED=true
 ```
 
 ### 3. Start Ollama
@@ -103,10 +116,10 @@ newsletter/
 │   ├── __init__.py
 │   ├── config.py           # Configuration management
 │   ├── news_client.py      # News API client
-│   ├── article_extractor.py # Content scraping
-│   ├── classifier.py       # Article categorization
-│   ├── selection.py        # Top 3 selection logic
-│   ├── summarizer.py       # Ollama LLM integration
+│   ├── article_extractor.py # Content extraction (trafilatura + fallback + block detection)
+│   ├── classifier.py       # Keyword-based categorization helpers
+│   ├── selection.py        # Category labels (legacy)
+│   ├── summarizer.py       # Ollama LLM integration (smart chunking + trace logs)
 │   ├── email_client.py     # HTML email rendering & SMTP
 │   └── main.py             # Orchestration & entry point
 ├── tests/
@@ -148,21 +161,34 @@ pytest --cov=news_bot --cov-report=term-missing
 | `RECIPIENT_EMAIL` | Yes | - | Email recipient |
 | `OLLAMA_BASE_URL` | No | `http://localhost:11434` | Ollama API URL |
 | `OLLAMA_MODEL` | No | `llama3` | Ollama model name |
+| `SECTION_WORLD_ENABLED` | No | `true` | Include **World News** section |
+| `SECTION_US_TECH_ENABLED` | No | `true` | Include **US Tech** section |
+| `SECTION_US_INDUSTRY_ENABLED` | No | `true` | Include **US Industry** section |
+| `SECTION_MALAYSIA_TECH_ENABLED` | No | `true` | Include **Malaysia Tech** section |
+| `SECTION_MALAYSIA_INDUSTRY_ENABLED` | No | `true` | Include **Malaysia Industry** section |
 
 ## Supported News APIs
 
 ### MarketAux (Recommended)
-- Free tier: 100 requests/day
-- Sign up: https://www.marketaux.com/
+- **Free tier**: available, but results may vary by endpoint/plan
+- **Sign up**: `https://www.marketaux.com/`
+- This project fetches multiple feeds (World/US/Malaysia + Tech/Industry) and deduplicates URLs.
 
-### Financial Modeling Prep
-- Free tier: 250 requests/day
-- Sign up: https://financialmodelingprep.com/
+## LLM Trace Logs (Visibility)
 
-To use FMP, set:
-```
-NEWS_API_BASE_URL=https://financialmodelingprep.com
-```
+Every LLM summarization call writes a full trace (prompt + raw output) to:
+
+- `logs/{OLLAMA_MODEL}_trace_{YYYYMMDD}_{HHMMSS}.log`
+
+The `logs/` directory is git-ignored by default.
+
+## Blocked/Paywalled Pages
+
+Some sites return block pages (paywalls, adblock warnings, captcha). After extraction, the bot detects common block phrases (e.g., “Please enable Javascript and cookies”, “If you have an ad-blocker enabled…”).
+
+- Blocked articles are marked as **blocked** in the pipeline
+- The LLM is **not called** for blocked content
+- The email shows a fallback line: **“Summary unavailable due to site access restrictions.”**
 
 ## Gmail Setup
 
@@ -173,9 +199,8 @@ NEWS_API_BASE_URL=https://financialmodelingprep.com
 
 ## Article Categories
 
-- **Macro & Economics**: Fed, ECB, inflation, GDP, jobs, bonds, rates
-- **Deals & Corporate**: Mergers, acquisitions, IPOs, buyouts
-- **Feature & Trends**: Everything else (industry trends, earnings, etc.)
+The current email format is **sectioned** by region/industry (World/US/Malaysia + Tech/Industry).  
+Keyword-based categories still exist in code for legacy labeling, but the default pipeline focuses on **sectioned coverage**.
 
 ## Troubleshooting
 
@@ -189,6 +214,7 @@ Make sure Ollama is running: `ollama serve`
 ### No articles fetched
 - Verify your NEWS_API_KEY is valid
 - Check you haven't exceeded the free tier limits
+- Try enabling fewer sections to reduce requests and increase hit rate
 
 ## License
 
