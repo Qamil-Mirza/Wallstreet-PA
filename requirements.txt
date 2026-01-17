@@ -1,5 +1,6 @@
 requests>=2.31.0
 beautifulsoup4>=4.12.0
+trafilatura>=2.0.0
 python-dotenv>=1.0.0
 pytest>=8.0.0
 pytest-mock>=3.12.0

@@ -185,13 +185,15 @@ class TestSectionFeatureFlags:
         monkeypatch.setenv("SMTP_PASSWORD", "secret123")
         monkeypatch.setenv("RECIPIENT_EMAIL", "recipient@test.com")
         
-        # Clear section flags
+        # Clear section flags to ensure defaults are used
         for key in ["SECTION_WORLD_ENABLED", "SECTION_US_TECH_ENABLED",
                     "SECTION_US_INDUSTRY_ENABLED", "SECTION_MALAYSIA_TECH_ENABLED",
                     "SECTION_MALAYSIA_INDUSTRY_ENABLED"]:
             monkeypatch.delenv(key, raising=False)
 
-        config = load_config()
+        # Patch load_dotenv to prevent loading from .env file
+        with patch("news_bot.config.load_dotenv"):
+            config = load_config()
 
         assert config.section_world_enabled is True
         assert config.section_us_tech_enabled is True

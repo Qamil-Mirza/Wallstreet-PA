@@ -2,6 +2,7 @@
 Article content extraction.
 
 Ensures articles have usable content by scraping URLs when needed.
+Uses trafilatura for robust extraction with BeautifulSoup as fallback.
 Detects blocked/paywalled content and marks it appropriately.
 """
 
@@ -10,12 +11,30 @@ import re
 from typing import Optional
 
 import requests
+import trafilatura
 from bs4 import BeautifulSoup
 
 from .news_client import ArticleMeta
 
 
 logger = logging.getLogger(__name__)
+
+
+# Browser-like headers to avoid bot detection
+REQUEST_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "DNT": "1",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Cache-Control": "max-age=0",
+}
 
 
 # Marker for blocked content - used to signal that LLM should not be called
@@ -113,9 +132,46 @@ def is_blocked_content(text: str) -> bool:
     return False
 
 
-def _extract_text_from_html(html: str) -> str:
+def _extract_with_trafilatura(html: str, url: str = None) -> Optional[str]:
     """
-    Extract readable text from HTML content.
+    Extract article text using trafilatura (primary method).
+    
+    Trafilatura is specifically designed for news/article extraction
+    and handles boilerplate removal, ads, and navigation automatically.
+    
+    Args:
+        html: Raw HTML content.
+        url: Optional URL for better extraction context.
+    
+    Returns:
+        Extracted article text or None if extraction fails.
+    """
+    try:
+        # Use trafilatura's extract function with optimal settings for news
+        text = trafilatura.extract(
+            html,
+            url=url,
+            include_comments=False,
+            include_tables=False,
+            no_fallback=False,  # Allow fallback methods
+            favor_precision=True,  # Prefer quality over quantity
+            deduplicate=True,
+        )
+        
+        if text and len(text.strip()) > 50:
+            logger.debug(f"Trafilatura extracted {len(text)} chars")
+            return text.strip()
+        
+        return None
+        
+    except Exception as e:
+        logger.debug(f"Trafilatura extraction failed: {e}")
+        return None
+
+
+def _extract_with_beautifulsoup(html: str) -> str:
+    """
+    Extract readable text from HTML using BeautifulSoup (fallback method).
     
     Focuses on main content areas and paragraph text.
     """
@@ -152,9 +208,37 @@ def _extract_text_from_html(html: str) -> str:
     return main_content.get_text(separator="\n", strip=True)
 
 
-def _fetch_and_extract(url: str, timeout: int = 15) -> tuple[Optional[str], bool]:
+def _extract_text_from_html(html: str, url: str = None) -> str:
+    """
+    Extract readable text from HTML content.
+    
+    Uses trafilatura as the primary extraction method with
+    BeautifulSoup as a fallback.
+    
+    Args:
+        html: Raw HTML content.
+        url: Optional URL for better extraction context.
+    
+    Returns:
+        Extracted article text.
+    """
+    # Try trafilatura first (best for news articles)
+    text = _extract_with_trafilatura(html, url)
+    
+    if text:
+        return text
+    
+    # Fallback to BeautifulSoup
+    logger.debug("Falling back to BeautifulSoup extraction")
+    return _extract_with_beautifulsoup(html)
+
+
+def _fetch_and_extract(url: str, timeout: int = 20) -> tuple[Optional[str], bool]:
     """
     Fetch a URL and extract its text content.
+    
+    Uses browser-like headers to avoid bot detection and trafilatura
+    for robust article extraction.
     
     Args:
         url: The URL to fetch.
@@ -167,26 +251,36 @@ def _fetch_and_extract(url: str, timeout: int = 15) -> tuple[Optional[str], bool
         - If successful, returns (content, False).
     """
     try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        }
-        response = requests.get(url, headers=headers, timeout=timeout)
+        response = requests.get(url, headers=REQUEST_HEADERS, timeout=timeout)
         response.raise_for_status()
         
         content_type = response.headers.get("Content-Type", "")
         if "text/html" not in content_type.lower():
             return None, False
         
-        text = _extract_text_from_html(response.text)
+        html = response.text
+        
+        # Check for block indicators in raw HTML first (before extraction)
+        # Some sites return a block page with very little extractable content
+        html_lower = html.lower()
+        if "captcha" in html_lower or "robot" in html_lower:
+            if is_blocked_content(html[:2000]):  # Check first 2KB
+                logger.warning(f"Detected block page in raw HTML at {url}")
+                return None, True
+        
+        # Extract text using trafilatura (with BeautifulSoup fallback)
+        text = _extract_text_from_html(html, url)
         
         if not text:
+            logger.debug(f"No content extracted from {url}")
             return None, False
         
-        # Check if this is a block page
+        # Check if extracted content is a block page
         if is_blocked_content(text):
             logger.warning(f"Detected blocked content at {url}")
             return None, True
         
+        logger.info(f"Extracted {len(text)} chars from {url[:50]}...")
         return text, False
         
     except requests.RequestException as e:

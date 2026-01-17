@@ -1,17 +1,16 @@
 """Tests for article classification."""
 
 from datetime import datetime
-from unittest.mock import MagicMock, patch
 
 import pytest
 
 from news_bot.classifier import (
     ArticleCategory,
-    _classify_by_keywords,
+    _score_category,
     bucket_articles,
-    classify_article_llm,
-    is_finance_related,
-    select_three_articles,
+    classify_article,
+    MACRO_KEYWORDS,
+    DEAL_KEYWORDS,
 )
 from news_bot.news_client import ArticleMeta
 
@@ -35,314 +34,97 @@ def make_article(
     )
 
 
-class TestIsFinanceRelated:
-    """Tests for is_finance_related function."""
+class TestScoreCategory:
+    """Tests for _score_category function."""
 
-    def test_finance_article_returns_true(self):
-        """Test that finance article is identified as relevant."""
-        article = make_article(
-            "Fed Raises Rates",
-            summary="Federal Reserve raises interest rates by 25 basis points"
-        )
+    def test_score_with_matching_keywords(self):
+        """Test that matching keywords increase score."""
+        text = "the federal reserve raised interest rates"
+        score = _score_category(text, MACRO_KEYWORDS)
+        assert score > 0
 
-        with patch("news_bot.classifier._call_ollama") as mock_ollama:
-            mock_ollama.return_value = "YES"
+    def test_score_with_no_keywords(self):
+        """Test that no keywords results in zero score."""
+        text = "a completely unrelated topic about cats"
+        score = _score_category(text, MACRO_KEYWORDS)
+        assert score == 0
 
-            result = is_finance_related(article, "llama3", "http://localhost:11434")
-
-        assert result is True
-        mock_ollama.assert_called_once()
-
-    def test_non_finance_article_returns_false(self):
-        """Test that non-finance article is filtered out."""
-        article = make_article(
-            "Celebrity Gossip Update",
-            summary="Latest news about movie stars and celebrities"
-        )
-
-        with patch("news_bot.classifier._call_ollama") as mock_ollama:
-            mock_ollama.return_value = "NO"
-
-            result = is_finance_related(article, "llama3", "http://localhost:11434")
-
-        assert result is False
-
-    def test_defaults_to_true_on_error(self):
-        """Test that errors default to True to avoid over-filtering."""
-        article = make_article("Some Article")
-
-        with patch("news_bot.classifier._call_ollama") as mock_ollama:
-            from news_bot.classifier import ClassifierError
-            mock_ollama.side_effect = ClassifierError("Connection failed")
-
-            result = is_finance_related(article, "llama3", "http://localhost:11434")
-
-        # Should default to True on error
-        assert result is True
+    def test_score_counts_multiple_matches(self):
+        """Test that multiple keyword matches increase score."""
+        text = "federal reserve inflation interest rate hike"
+        score = _score_category(text, MACRO_KEYWORDS)
+        assert score >= 3  # Multiple keywords should match
 
 
-class TestClassifyArticleLlm:
-    """Tests for classify_article_llm function."""
-
-    def test_classify_macro(self):
-        """Test that macro articles are classified correctly."""
-        article = make_article(
-            "Fed Signals Rate Pause",
-            summary="Federal Reserve indicates pause in rate hikes"
-        )
-
-        with patch("news_bot.classifier._call_ollama") as mock_ollama:
-            mock_ollama.return_value = "MACRO"
-
-            result = classify_article_llm(article, "llama3", "http://localhost:11434")
-
-        assert result == "macro"
-
-    def test_classify_deal(self):
-        """Test that deal articles are classified correctly."""
-        article = make_article(
-            "Microsoft Acquires Startup",
-            summary="Microsoft announces acquisition of AI startup for $2B"
-        )
-
-        with patch("news_bot.classifier._call_ollama") as mock_ollama:
-            mock_ollama.return_value = "DEAL"
-
-            result = classify_article_llm(article, "llama3", "http://localhost:11434")
-
-        assert result == "deal"
-
-    def test_classify_feature(self):
-        """Test that feature articles are classified correctly."""
-        article = make_article(
-            "Tech Industry Trends 2024",
-            summary="Overview of emerging technology trends"
-        )
-
-        with patch("news_bot.classifier._call_ollama") as mock_ollama:
-            mock_ollama.return_value = "FEATURE"
-
-            result = classify_article_llm(article, "llama3", "http://localhost:11434")
-
-        assert result == "feature"
-
-    def test_defaults_to_feature_on_unknown(self):
-        """Test that unknown responses default to feature."""
-        article = make_article("Some Article")
-
-        with patch("news_bot.classifier._call_ollama") as mock_ollama:
-            mock_ollama.return_value = "UNKNOWN"
-
-            result = classify_article_llm(article, "llama3", "http://localhost:11434")
-
-        assert result == "feature"
-
-    def test_falls_back_to_keywords_on_error(self):
-        """Test that errors fall back to keyword classification."""
-        article = make_article(
-            "Fed Raises Interest Rates",
-            summary="Federal Reserve raises rates"
-        )
-
-        with patch("news_bot.classifier._call_ollama") as mock_ollama:
-            from news_bot.classifier import ClassifierError
-            mock_ollama.side_effect = ClassifierError("Connection failed")
-
-            result = classify_article_llm(article, "llama3", "http://localhost:11434")
-
-        # Should fall back to keyword classification (finds "fed", "rates")
-        assert result == "macro"
-
-
-class TestClassifyByKeywords:
-    """Tests for keyword-based fallback classification."""
+class TestClassifyArticle:
+    """Tests for classify_article function."""
 
     def test_classify_macro_keywords(self):
-        """Test that macro keywords are detected."""
-        article = make_article("Fed hikes rates again")
-        assert _classify_by_keywords(article) == "macro"
+        """Test that macro keywords classify as macro."""
+        article = make_article(
+            "Fed Raises Rates",
+            "The Federal Reserve raised interest rates by 25 basis points"
+        )
+        assert classify_article(article) == "macro"
 
     def test_classify_deal_keywords(self):
-        """Test that deal keywords are detected."""
-        article = make_article("Company acquires rival in $10B deal")
-        assert _classify_by_keywords(article) == "deal"
+        """Test that deal keywords classify as deal."""
+        article = make_article(
+            "Microsoft Acquires Startup",
+            "Microsoft announces acquisition of AI startup for $2B in merger deal"
+        )
+        assert classify_article(article) == "deal"
 
     def test_classify_feature_default(self):
         """Test that articles without keywords default to feature."""
-        article = make_article("Tech trends to watch")
-        assert _classify_by_keywords(article) == "feature"
+        article = make_article(
+            "Tech Industry Overview",
+            "A look at the latest technology trends"
+        )
+        assert classify_article(article) == "feature"
 
+    def test_classify_prefers_higher_score(self):
+        """Test that the category with more matches wins."""
+        # Article with more macro keywords than deal keywords
+        article = make_article(
+            "Fed inflation rates",
+            "The Federal Reserve, inflation, interest rate, monetary policy, yield curve"
+        )
+        result = classify_article(article)
+        assert result == "macro"
 
-class TestSelectThreeArticles:
-    """Tests for select_three_articles function."""
+    def test_classify_uses_title_weight(self):
+        """Test that title has extra weight in classification."""
+        # Title mentions Fed, content is generic
+        article = make_article(
+            "Fed Announces Decision",
+            "Some generic content about markets"
+        )
+        result = classify_article(article)
+        assert result == "macro"
 
-    def test_selects_one_per_category(self):
-        """Test that one article is selected per category."""
-        articles = [
-            make_article("Fed News", article_id="1"),
-            make_article("Merger News", article_id="2"),
-            make_article("Tech Trends", article_id="3"),
-        ]
-
-        with patch("news_bot.classifier.is_finance_related") as mock_relevance:
-            mock_relevance.return_value = True
-            
-            with patch("news_bot.classifier.classify_article_llm") as mock_classify:
-                mock_classify.side_effect = ["macro", "deal", "feature"]
-
-                selected, classifications = select_three_articles(
-                    articles, "llama3", "http://localhost:11434"
-                )
-
-        assert len(selected) == 3
-        # Articles should be in category order: macro, deal, feature
-        assert selected[0].id == "1"  # macro
-        assert selected[1].id == "2"  # deal
-        assert selected[2].id == "3"  # feature
-
-    def test_skips_non_finance_articles(self):
-        """Test that non-finance articles are skipped."""
-        articles = [
-            make_article("Celebrity News", article_id="1"),
-            make_article("Fed News", article_id="2"),
-            make_article("Merger News", article_id="3"),
-            make_article("Sports Update", article_id="4"),
-            make_article("Tech Trends", article_id="5"),
-        ]
-
-        with patch("news_bot.classifier.is_finance_related") as mock_relevance:
-            # Articles 1 and 4 are not finance-related
-            mock_relevance.side_effect = [False, True, True, False, True]
-            
-            with patch("news_bot.classifier.classify_article_llm") as mock_classify:
-                mock_classify.side_effect = ["macro", "deal", "feature"]
-
-                selected, classifications = select_three_articles(
-                    articles, "llama3", "http://localhost:11434"
-                )
-
-        assert len(selected) == 3
-        # Should have selected articles 2, 3, 5 (skipped 1 and 4)
-        selected_ids = [a.id for a in selected]
-        assert "2" in selected_ids
-        assert "3" in selected_ids
-        assert "5" in selected_ids
-
-    def test_stops_when_all_categories_filled(self):
-        """Test that processing stops once all 3 categories are filled."""
-        articles = [
-            make_article("Macro Article", article_id="1"),
-            make_article("Deal Article", article_id="2"),
-            make_article("Feature Article", article_id="3"),
-            make_article("Extra Article", article_id="4"),
-            make_article("Another Extra", article_id="5"),
-        ]
-
-        with patch("news_bot.classifier.is_finance_related") as mock_relevance:
-            mock_relevance.return_value = True
-            
-            with patch("news_bot.classifier.classify_article_llm") as mock_classify:
-                mock_classify.side_effect = ["macro", "deal", "feature"]
-
-                selected, classifications = select_three_articles(
-                    articles, "llama3", "http://localhost:11434"
-                )
-
-        # Should only have called classify 3 times (stopped after getting all categories)
-        assert mock_classify.call_count == 3
-        assert len(selected) == 3
-
-    def test_backfills_with_same_category(self):
-        """Test that if we can't find all categories, we backfill with available articles."""
-        articles = [
-            make_article("Feature 1", article_id="1"),
-            make_article("Feature 2", article_id="2"),
-            make_article("Feature 3", article_id="3"),
-        ]
-
-        with patch("news_bot.classifier.is_finance_related") as mock_relevance:
-            mock_relevance.return_value = True
-            
-            with patch("news_bot.classifier.classify_article_llm") as mock_classify:
-                # All articles are feature
-                mock_classify.side_effect = ["feature", "feature", "feature"]
-
-                selected, classifications = select_three_articles(
-                    articles, "llama3", "http://localhost:11434"
-                )
-
-        # Should have all 3 articles even though they're all feature
-        assert len(selected) == 3
-        selected_ids = [a.id for a in selected]
-        assert "1" in selected_ids
-        assert "2" in selected_ids
-        assert "3" in selected_ids
-
-    def test_partial_categories_with_backfill(self):
-        """Test that partial categories are filled, then backfill happens."""
-        articles = [
-            make_article("Macro 1", article_id="1"),
-            make_article("Macro 2", article_id="2"),
-            make_article("Macro 3", article_id="3"),
-        ]
-
-        with patch("news_bot.classifier.is_finance_related") as mock_relevance:
-            mock_relevance.return_value = True
-            
-            with patch("news_bot.classifier.classify_article_llm") as mock_classify:
-                mock_classify.side_effect = ["macro", "macro", "macro"]
-
-                selected, classifications = select_three_articles(
-                    articles, "llama3", "http://localhost:11434"
-                )
-
-        # Should have 3 articles: 1 macro selected first, then 2 backfilled
-        assert len(selected) == 3
-        assert selected[0].id == "1"  # First macro selected
-        # Other two are backfilled
-        assert selected[1].id == "2"
-        assert selected[2].id == "3"
-
-    def test_handles_few_articles(self):
-        """Test handling when fewer than 3 finance articles exist."""
-        articles = [
-            make_article("Non-finance", article_id="1"),
-            make_article("Finance 1", article_id="2"),
-        ]
-
-        with patch("news_bot.classifier.is_finance_related") as mock_relevance:
-            mock_relevance.side_effect = [False, True]
-            
-            with patch("news_bot.classifier.classify_article_llm") as mock_classify:
-                mock_classify.side_effect = ["feature"]
-
-                selected, classifications = select_three_articles(
-                    articles, "llama3", "http://localhost:11434"
-                )
-
-        # Only 1 finance article available
-        assert len(selected) == 1
-        assert selected[0].id == "2"
+    def test_classify_with_content_only(self):
+        """Test classification when only content has keywords."""
+        article = make_article(
+            "News Update",
+            "The company announced an acquisition and merger with a rival firm"
+        )
+        result = classify_article(article)
+        assert result == "deal"
 
 
 class TestBucketArticles:
     """Tests for bucket_articles function."""
 
-    def test_bucket_with_classifications(self):
-        """Test bucketing with pre-computed classifications."""
+    def test_bucket_articles_basic(self):
+        """Test basic article bucketing."""
         articles = [
-            make_article("Article 1", article_id="1"),
-            make_article("Article 2", article_id="2"),
-            make_article("Article 3", article_id="3"),
+            make_article("Fed raises rates", article_id="1"),
+            make_article("Company acquires rival", article_id="2"),
+            make_article("Tech trends overview", article_id="3"),
         ]
 
-        classifications = {
-            "1": "macro",
-            "2": "deal",
-            "3": "feature",
-        }
-
-        buckets = bucket_articles(articles, classifications)
+        buckets = bucket_articles(articles)
 
         assert len(buckets["macro"]) == 1
         assert len(buckets["deal"]) == 1
@@ -350,18 +132,6 @@ class TestBucketArticles:
         assert buckets["macro"][0].id == "1"
         assert buckets["deal"][0].id == "2"
         assert buckets["feature"][0].id == "3"
-
-    def test_bucket_without_classifications_uses_keywords(self):
-        """Test that missing classifications fall back to keywords."""
-        articles = [
-            make_article("Fed raises rates", article_id="1"),
-            make_article("Company acquires rival", article_id="2"),
-        ]
-
-        buckets = bucket_articles(articles)
-
-        assert len(buckets["macro"]) == 1
-        assert len(buckets["deal"]) == 1
 
     def test_bucket_empty_list(self):
         """Test bucketing empty list returns empty buckets."""
@@ -374,14 +144,57 @@ class TestBucketArticles:
     def test_bucket_sorted_by_date(self):
         """Test that buckets are sorted by date descending."""
         articles = [
-            make_article("Old article", article_id="1", published_at=datetime(2024, 1, 10)),
-            make_article("New article", article_id="2", published_at=datetime(2024, 1, 15)),
+            make_article("Old tech trends", article_id="1", published_at=datetime(2024, 1, 10)),
+            make_article("New tech trends", article_id="2", published_at=datetime(2024, 1, 15)),
         ]
 
-        classifications = {"1": "feature", "2": "feature"}
+        buckets = bucket_articles(articles)
 
-        buckets = bucket_articles(articles, classifications)
-
-        # Newer article should be first
+        # Both are feature articles, newer should be first
         assert buckets["feature"][0].id == "2"
         assert buckets["feature"][1].id == "1"
+
+    def test_bucket_all_same_category(self):
+        """Test bucketing when all articles are same category."""
+        articles = [
+            make_article("Fed news 1", article_id="1"),
+            make_article("Central bank policy", article_id="2"),
+            make_article("Interest rate decision", article_id="3"),
+        ]
+
+        buckets = bucket_articles(articles)
+
+        assert len(buckets["macro"]) == 3
+        assert len(buckets["deal"]) == 0
+        assert len(buckets["feature"]) == 0
+
+    def test_bucket_uses_summary_fallback(self):
+        """Test that summary is used when content is None."""
+        article = make_article(
+            "News",
+            content=None,
+            summary="The Federal Reserve raised rates today"
+        )
+
+        buckets = bucket_articles([article])
+
+        assert len(buckets["macro"]) == 1
+
+
+class TestKeywords:
+    """Tests for keyword lists."""
+
+    def test_macro_keywords_not_empty(self):
+        """Test that macro keywords list is populated."""
+        assert len(MACRO_KEYWORDS) > 0
+
+    def test_deal_keywords_not_empty(self):
+        """Test that deal keywords list is populated."""
+        assert len(DEAL_KEYWORDS) > 0
+
+    def test_keywords_are_lowercase(self):
+        """Test that all keywords are lowercase for matching."""
+        for keyword in MACRO_KEYWORDS:
+            assert keyword == keyword.lower(), f"Keyword '{keyword}' is not lowercase"
+        for keyword in DEAL_KEYWORDS:
+            assert keyword == keyword.lower(), f"Keyword '{keyword}' is not lowercase"
