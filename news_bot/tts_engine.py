@@ -26,6 +26,16 @@ class TTSConfig:
     model_name: str = "tts_models/en/ljspeech/tacotron2-DDC"
     vocoder_name: Optional[str] = None  # Use default vocoder for the model
     
+    # Language setting (required for multilingual models like XTTS)
+    language: str = "en"
+    
+    # Speaker settings for multi-speaker models (XTTS)
+    speaker: Optional[str] = "Claribel Dervla"  # Default XTTS speaker
+    speaker_wav: Optional[str] = None  # Optional: path to WAV file for voice cloning
+    
+    # Speed control (1.0 = normal, 1.2 = 20% faster, 0.8 = 20% slower)
+    speed: float = 1.0
+    
     # Output settings
     output_dir: Path = Path("audio_output")
     sample_rate: int = 22050
@@ -37,6 +47,11 @@ class TTSConfig:
         """Ensure output_dir is a Path object."""
         if isinstance(self.output_dir, str):
             self.output_dir = Path(self.output_dir)
+    
+    @property
+    def is_xtts_model(self) -> bool:
+        """Check if this is an XTTS model (requires special handling)."""
+        return "xtts" in self.model_name.lower()
 
 
 class TTSEngineError(Exception):
@@ -77,6 +92,38 @@ class TTSEngine:
             raise TTSEngineError(
                 "Coqui TTS is not installed. Install with: pip install TTS"
             )
+        
+        # For PyTorch 2.6+, we need to allowlist TTS config classes for model loading
+        try:
+            import torch
+            safe_classes = []
+            
+            # Try to import and add XTTS config classes
+            try:
+                from TTS.tts.configs.xtts_config import XttsConfig
+                safe_classes.append(XttsConfig)
+            except ImportError:
+                pass
+            
+            # Add other common TTS config classes that might be pickled
+            try:
+                from TTS.config import BaseAudioConfig, BaseDatasetConfig, BaseTrainingConfig
+                safe_classes.extend([BaseAudioConfig, BaseDatasetConfig, BaseTrainingConfig])
+            except ImportError:
+                pass
+            
+            try:
+                from TTS.tts.configs.shared_configs import BaseTTSConfig, CharactersConfig
+                safe_classes.extend([BaseTTSConfig, CharactersConfig])
+            except ImportError:
+                pass
+            
+            if safe_classes and hasattr(torch.serialization, 'add_safe_globals'):
+                torch.serialization.add_safe_globals(safe_classes)
+                logger.debug(f"Added {len(safe_classes)} TTS classes to torch safe globals")
+        except Exception as e:
+            # Older PyTorch versions don't have add_safe_globals
+            logger.debug(f"Could not add safe globals (may not be needed): {e}")
         
         logger.info(f"Loading TTS model: {self.config.model_name}")
         start_time = datetime.now()
@@ -216,10 +263,28 @@ class TTSEngine:
         start_time = datetime.now()
         
         try:
-            self._tts.tts_to_file(
-                text=processed_text,
-                file_path=str(output_path),
-            )
+            # XTTS models require language and speaker parameters
+            if self.config.is_xtts_model:
+                tts_kwargs = {
+                    "text": processed_text,
+                    "file_path": str(output_path),
+                    "language": self.config.language,
+                    "speed": self.config.speed,
+                }
+                # Use speaker_wav for voice cloning, otherwise use named speaker
+                if self.config.speaker_wav:
+                    tts_kwargs["speaker_wav"] = self.config.speaker_wav
+                elif self.config.speaker:
+                    tts_kwargs["speaker"] = self.config.speaker
+                
+                self._tts.tts_to_file(**tts_kwargs)
+            else:
+                # Standard models (Tacotron, VITS, etc.)
+                self._tts.tts_to_file(
+                    text=processed_text,
+                    file_path=str(output_path),
+                    speed=self.config.speed,
+                )
         except Exception as e:
             raise TTSEngineError(f"TTS synthesis failed: {e}")
         

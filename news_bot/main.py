@@ -70,6 +70,9 @@ def generate_tts_broadcast(summaries: dict[str, str], config: Config) -> Path | 
     # Step 2: Initialize TTS engine
     tts_config = TTSConfig(
         model_name=config.tts_model,
+        language=config.tts_language,
+        speaker=config.tts_speaker,
+        speed=config.tts_speed,
         output_dir=Path(config.tts_output_dir),
         use_cuda=config.tts_use_cuda,
     )

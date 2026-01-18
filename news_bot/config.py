@@ -40,6 +40,9 @@ class Config:
     # TTS settings (using Coqui TTS)
     tts_enabled: bool = True
     tts_model: str = "tts_models/en/ljspeech/tacotron2-DDC"
+    tts_language: str = "en"  # Language code for multilingual models (XTTS)
+    tts_speaker: str = "Claribel Dervla"  # Speaker name for multi-speaker models (XTTS)
+    tts_speed: float = 1.0  # Speech speed (1.0 = normal, 1.2 = faster, 0.8 = slower)
     tts_output_dir: str = "audio_output"
     tts_use_cuda: bool = False
     tts_duration_minutes: float = 2.0
@@ -123,6 +126,9 @@ def load_config(env_path: Optional[Path] = None) -> Config:
         # TTS settings
         tts_enabled=_get_bool_env("TTS_ENABLED", True),
         tts_model=_get_optional_env("TTS_MODEL", "tts_models/en/ljspeech/tacotron2-DDC"),
+        tts_language=_get_optional_env("TTS_LANGUAGE", "en"),
+        tts_speaker=_get_optional_env("TTS_SPEAKER", "Claribel Dervla"),
+        tts_speed=float(_get_optional_env("TTS_SPEED", "1.0")),
         tts_output_dir=_get_optional_env("TTS_OUTPUT_DIR", "audio_output"),
         tts_use_cuda=_get_bool_env("TTS_USE_CUDA", False),
         tts_duration_minutes=tts_duration,

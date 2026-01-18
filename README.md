@@ -14,7 +14,7 @@ All components run locally on modest hardware using only free services.
 
 - 🆓 **Free tier news**: MarketAux (recommended)
 - 🤖 **Local LLM**: Ollama (llama3, llama3.1, etc.)
-- 🎙️ **Text-to-Speech**: Coqui TTS generates audio podcasts from summaries
+- 🎙️ **Text-to-Speech**: Coqui TTS generates audio podcasts from summaries (non-commercial use only)
 - 📧 **SMTP email**: Works with Gmail, Outlook, or any SMTP provider
 - 🧩 **Section feature flags**: Toggle which sections appear in the final email
 - 🧾 **LLM trace logs**: Full prompt + raw model output saved to `logs/`
@@ -138,6 +138,17 @@ tts --list_models
 # - tts_models/en/vctk/vits (multi-speaker)
 ```
 
+### Adjusting Speech Speed
+
+Control the speech speed in your `.env`:
+
+```bash
+TTS_SPEED=1.0   # Normal speed
+TTS_SPEED=1.2   # 20% faster
+TTS_SPEED=1.5   # 50% faster
+TTS_SPEED=0.8   # 20% slower
+```
+
 ### Disabling TTS
 
 To disable audio generation, set in `.env`:
@@ -233,6 +244,9 @@ pytest --cov=news_bot --cov-report=term-missing
 | `OLLAMA_MODEL` | No | `llama3` | Ollama model name |
 | `TTS_ENABLED` | No | `true` | Enable/disable audio generation |
 | `TTS_MODEL` | No | `tts_models/en/ljspeech/tacotron2-DDC` | Coqui TTS model |
+| `TTS_LANGUAGE` | No | `en` | Language code for multilingual models |
+| `TTS_SPEAKER` | No | `Claribel Dervla` | Speaker name for XTTS models |
+| `TTS_SPEED` | No | `1.0` | Speech speed (1.0=normal, 1.2=faster, 0.8=slower) |
 | `TTS_OUTPUT_DIR` | No | `audio_output` | Directory for audio files |
 | `TTS_USE_CUDA` | No | `false` | Use GPU for TTS (requires CUDA) |
 | `TTS_DURATION_MINUTES` | No | `2.0` | Target audio duration in minutes |
@@ -309,4 +323,15 @@ Make sure Ollama is running: `ollama serve`
 
 ## License
 
-MIT
+This project is licensed under **MIT**.
+
+### Coqui TTS License Notice
+
+⚠️ **The Coqui TTS library and XTTS models are licensed for non-commercial use only.**
+
+If you intend to use this project commercially, you must either:
+- Obtain a commercial license from Coqui AI
+- Replace the TTS component with a commercially-licensed alternative
+- Disable TTS generation (`TTS_ENABLED=false`)
+
+For more information, see the [Coqui TTS License](https://github.com/coqui-ai/TTS/blob/dev/LICENSE.txt).
