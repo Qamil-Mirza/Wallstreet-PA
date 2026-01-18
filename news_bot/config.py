@@ -37,6 +37,13 @@ class Config:
     ollama_base_url: str
     ollama_model: str
     
+    # TTS settings (using Coqui TTS)
+    tts_enabled: bool = True
+    tts_model: str = "tts_models/en/ljspeech/tacotron2-DDC"
+    tts_output_dir: str = "audio_output"
+    tts_use_cuda: bool = False
+    tts_duration_minutes: float = 2.0
+    
     # Section feature flags (all enabled by default)
     section_world_enabled: bool = True
     section_us_tech_enabled: bool = True
@@ -93,6 +100,13 @@ def load_config(env_path: Optional[Path] = None) -> Config:
     except ValueError:
         raise ConfigError(f"SMTP_PORT must be an integer, got: {smtp_port_str}")
     
+    # Parse TTS duration
+    tts_duration_str = _get_optional_env("TTS_DURATION_MINUTES", "2.0")
+    try:
+        tts_duration = float(tts_duration_str)
+    except ValueError:
+        raise ConfigError(f"TTS_DURATION_MINUTES must be a number, got: {tts_duration_str}")
+    
     return Config(
         news_api_key=_get_required_env("NEWS_API_KEY"),
         news_api_base_url=_get_optional_env(
@@ -106,6 +120,12 @@ def load_config(env_path: Optional[Path] = None) -> Config:
         recipient_email=_get_required_env("RECIPIENT_EMAIL"),
         ollama_base_url=_get_optional_env("OLLAMA_BASE_URL", "http://localhost:11434"),
         ollama_model=_get_optional_env("OLLAMA_MODEL", "llama3"),
+        # TTS settings
+        tts_enabled=_get_bool_env("TTS_ENABLED", True),
+        tts_model=_get_optional_env("TTS_MODEL", "tts_models/en/ljspeech/tacotron2-DDC"),
+        tts_output_dir=_get_optional_env("TTS_OUTPUT_DIR", "audio_output"),
+        tts_use_cuda=_get_bool_env("TTS_USE_CUDA", False),
+        tts_duration_minutes=tts_duration,
         # Section feature flags
         section_world_enabled=_get_bool_env("SECTION_WORLD_ENABLED", True),
         section_us_tech_enabled=_get_bool_env("SECTION_US_TECH_ENABLED", True),

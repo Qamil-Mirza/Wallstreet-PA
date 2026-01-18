@@ -3,17 +3,21 @@
 Main entry point for the 3 Things newsletter bot.
 
 Orchestrates the daily run: fetch → summarize → email (organized by region/industry sections).
+Optionally generates TTS audio broadcast from summaries.
 """
 
 import logging
 import sys
 from datetime import date
+from pathlib import Path
 
 from .article_extractor import ensure_batch_content
-from .config import ConfigError, load_config
+from .config import Config, ConfigError, load_config
 from .email_client import EmailError, build_sectioned_email_html, send_email
 from .news_client import NewsClientError, fetch_articles_by_section
+from .script_generator import ScriptGeneratorError, generate_broadcast_script
 from .summarizer import summarize_articles
+from .tts_engine import TTSConfig, TTSEngine, TTSEngineError
 
 
 # Configure logging
@@ -23,6 +27,71 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger(__name__)
+
+
+def generate_tts_broadcast(summaries: dict[str, str], config: Config) -> Path | None:
+    """
+    Generate TTS audio broadcast from article summaries.
+    
+    Steps:
+    1. Generate radio host script from summaries
+    2. Convert script to audio using Coqui TTS
+    3. Save MP3 to configured output directory
+    
+    Args:
+        summaries: Dictionary mapping article IDs to summary text.
+        config: Application configuration.
+    
+    Returns:
+        Path to generated MP3 file, or None if TTS is disabled or fails.
+    """
+    if not config.tts_enabled:
+        logger.info("TTS is disabled, skipping audio generation")
+        return None
+    
+    if not summaries:
+        logger.warning("No summaries available for TTS generation")
+        return None
+    
+    # Step 1: Generate radio script
+    logger.info("Generating radio broadcast script...")
+    try:
+        script = generate_broadcast_script(
+            summaries=summaries,
+            ollama_model=config.ollama_model,
+            ollama_base_url=config.ollama_base_url,
+            duration_minutes=config.tts_duration_minutes,
+        )
+        logger.info(f"Script generated: {len(script)} characters, ~{len(script.split())} words")
+    except ScriptGeneratorError as e:
+        logger.error(f"Script generation failed: {e}")
+        return None
+    
+    # Step 2: Initialize TTS engine
+    tts_config = TTSConfig(
+        model_name=config.tts_model,
+        output_dir=Path(config.tts_output_dir),
+        use_cuda=config.tts_use_cuda,
+    )
+    
+    try:
+        engine = TTSEngine(tts_config)
+    except TTSEngineError as e:
+        logger.error(f"TTS engine initialization failed: {e}")
+        return None
+    
+    # Step 3: Generate audio
+    logger.info("Generating TTS audio...")
+    today = date.today()
+    filename = f"broadcast_{today.strftime('%Y%m%d')}"
+    
+    try:
+        audio_path = engine.synthesize_to_mp3(script, filename)
+        logger.info(f"Audio broadcast saved: {audio_path}")
+        return audio_path
+    except TTSEngineError as e:
+        logger.error(f"TTS synthesis failed: {e}")
+        return None
 
 
 def run_daily() -> None:
@@ -78,7 +147,12 @@ def run_daily() -> None:
     summaries = summarize_articles(all_articles, config)
     logger.info(f"Generated {len(summaries)} summaries")
     
-    # Step 5: Build and send sectioned email
+    # Step 5: Generate TTS audio broadcast (optional)
+    audio_path = generate_tts_broadcast(summaries, config)
+    if audio_path:
+        logger.info(f"TTS broadcast ready: {audio_path}")
+    
+    # Step 6: Build and send sectioned email
     today = date.today()
     subject = f"The Daily Briefing – {today.strftime('%b %d, %Y')}"
     

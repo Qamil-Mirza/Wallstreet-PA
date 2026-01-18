@@ -8,3 +8,4 @@ __pycache__/
 
 # LLM trace logs
 logs/
+audio_output/

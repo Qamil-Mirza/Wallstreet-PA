@@ -5,6 +5,7 @@ A fully automated daily finance/economics email bot that runs locally and:
 - **Pulls** recent financial news from MarketAux (multi-feed, sectioned)
 - **Extracts** full article text using `trafilatura` (with BeautifulSoup fallback)
 - **Summarizes** each story using a local Ollama LLM in an analyst-style voice (3-sentence brief)
+- **Generates** an audio podcast using Coqui TTS with a "Wall Street radio host" persona
 - **Sends** a beautifully formatted HTML email every morning, organized by enabled sections
 
 All components run locally on modest hardware using only free services.
@@ -13,25 +14,46 @@ All components run locally on modest hardware using only free services.
 
 - 🆓 **Free tier news**: MarketAux (recommended)
 - 🤖 **Local LLM**: Ollama (llama3, llama3.1, etc.)
+- 🎙️ **Text-to-Speech**: Coqui TTS generates audio podcasts from summaries
 - 📧 **SMTP email**: Works with Gmail, Outlook, or any SMTP provider
 - 🧩 **Section feature flags**: Toggle which sections appear in the final email
 - 🧾 **LLM trace logs**: Full prompt + raw model output saved to `logs/`
 - 🧱 **Block-page detection**: Detects paywalls/adblock/captcha pages and skips LLM calls
-- 🧪 **Fully tested**: pytest test suite with mocks
+- 🧪 **Fully tested**: pytest test suite with mocks (200+ tests)
 - 📦 **Modular design**: Each component in its own module
 
 ## Quick Start
 
 ### 1. Clone and Install
 
+> ⚠️ **Python 3.11 Required**: Coqui TTS requires Python 3.9-3.11. Python 3.12+ is not supported.
+
 ```bash
 cd newsletter
-python -m venv venv
+
+# Create venv with Python 3.11
+python3.11 -m venv venv
 source venv/bin/activate  # On Windows: venv\Scripts\activate
+
 pip install -r requirements.txt
 ```
 
-### 2. Configure Environment
+### 2. Install System Dependencies
+
+For TTS audio generation, you need `ffmpeg` installed:
+
+```bash
+# macOS
+brew install ffmpeg
+
+# Ubuntu/Debian
+sudo apt install ffmpeg
+
+# Windows (via chocolatey)
+choco install ffmpeg
+```
+
+### 3. Configure Environment
 
 Copy the example config and fill in your values:
 
@@ -59,6 +81,13 @@ RECIPIENT_EMAIL=recipient@example.com
 OLLAMA_BASE_URL=http://localhost:11434
 OLLAMA_MODEL=llama3
 
+# TTS Settings (Coqui TTS)
+TTS_ENABLED=true
+TTS_MODEL=tts_models/en/ljspeech/tacotron2-DDC
+TTS_OUTPUT_DIR=audio_output
+TTS_USE_CUDA=false
+TTS_DURATION_MINUTES=2.0
+
 # Section Feature Flags (true/false)
 SECTION_WORLD_ENABLED=true
 SECTION_US_TECH_ENABLED=true
@@ -67,7 +96,7 @@ SECTION_MALAYSIA_TECH_ENABLED=true
 SECTION_MALAYSIA_INDUSTRY_ENABLED=true
 ```
 
-### 3. Start Ollama
+### 4. Start Ollama
 
 Make sure Ollama is running with your chosen model:
 
@@ -76,10 +105,45 @@ ollama pull llama3
 ollama serve
 ```
 
-### 4. Run the Bot
+### 5. Run the Bot
 
 ```bash
 python -m news_bot.main
+```
+
+## TTS Audio Generation
+
+The bot generates an audio podcast from article summaries using a two-stage process:
+
+1. **Script Generation**: Summaries are passed to Ollama with a "Wall Street radio host" persona prompt, creating an engaging broadcast script
+2. **Speech Synthesis**: The script is converted to audio using Coqui TTS
+
+### Audio Output
+
+- Audio files are saved to `audio_output/` (configurable via `TTS_OUTPUT_DIR`)
+- Filename format: `broadcast_YYYYMMDD.mp3`
+- Default duration target: ~2 minutes (configurable via `TTS_DURATION_MINUTES`)
+
+### Available TTS Models
+
+The default model (`tts_models/en/ljspeech/tacotron2-DDC`) provides good quality with reasonable speed. Other options:
+
+```bash
+# List all available models
+tts --list_models
+
+# High-quality alternatives:
+# - tts_models/en/ljspeech/glow-tts
+# - tts_models/en/ljspeech/tacotron2-DCA
+# - tts_models/en/vctk/vits (multi-speaker)
+```
+
+### Disabling TTS
+
+To disable audio generation, set in `.env`:
+
+```bash
+TTS_ENABLED=false
 ```
 
 ## Scheduling
@@ -114,14 +178,16 @@ Add:
 newsletter/
 ├── news_bot/
 │   ├── __init__.py
-│   ├── config.py           # Configuration management
-│   ├── news_client.py      # News API client
-│   ├── article_extractor.py # Content extraction (trafilatura + fallback + block detection)
-│   ├── classifier.py       # Keyword-based categorization helpers
-│   ├── selection.py        # Category labels (legacy)
-│   ├── summarizer.py       # Ollama LLM integration (smart chunking + trace logs)
-│   ├── email_client.py     # HTML email rendering & SMTP
-│   └── main.py             # Orchestration & entry point
+│   ├── config.py             # Configuration management
+│   ├── news_client.py        # News API client
+│   ├── article_extractor.py  # Content extraction (trafilatura + fallback + block detection)
+│   ├── classifier.py         # Keyword-based categorization helpers
+│   ├── selection.py          # Category labels (legacy)
+│   ├── summarizer.py         # Ollama LLM integration (smart chunking + trace logs)
+│   ├── script_generator.py   # Radio host script generation from summaries
+│   ├── tts_engine.py         # Coqui TTS audio synthesis
+│   ├── email_client.py       # HTML email rendering & SMTP
+│   └── main.py               # Orchestration & entry point
 ├── tests/
 │   ├── test_config.py
 │   ├── test_news_client.py
@@ -129,7 +195,11 @@ newsletter/
 │   ├── test_classifier.py
 │   ├── test_selection.py
 │   ├── test_summarizer.py
+│   ├── test_script_generator.py
+│   ├── test_tts_engine.py
 │   └── test_email_client.py
+├── audio_output/             # Generated audio files (git-ignored)
+├── logs/                     # LLM trace logs (git-ignored)
 ├── requirements.txt
 ├── env.example
 └── README.md
@@ -161,6 +231,11 @@ pytest --cov=news_bot --cov-report=term-missing
 | `RECIPIENT_EMAIL` | Yes | - | Email recipient |
 | `OLLAMA_BASE_URL` | No | `http://localhost:11434` | Ollama API URL |
 | `OLLAMA_MODEL` | No | `llama3` | Ollama model name |
+| `TTS_ENABLED` | No | `true` | Enable/disable audio generation |
+| `TTS_MODEL` | No | `tts_models/en/ljspeech/tacotron2-DDC` | Coqui TTS model |
+| `TTS_OUTPUT_DIR` | No | `audio_output` | Directory for audio files |
+| `TTS_USE_CUDA` | No | `false` | Use GPU for TTS (requires CUDA) |
+| `TTS_DURATION_MINUTES` | No | `2.0` | Target audio duration in minutes |
 | `SECTION_WORLD_ENABLED` | No | `true` | Include **World News** section |
 | `SECTION_US_TECH_ENABLED` | No | `true` | Include **US Tech** section |
 | `SECTION_US_INDUSTRY_ENABLED` | No | `true` | Include **US Industry** section |
@@ -184,11 +259,11 @@ The `logs/` directory is git-ignored by default.
 
 ## Blocked/Paywalled Pages
 
-Some sites return block pages (paywalls, adblock warnings, captcha). After extraction, the bot detects common block phrases (e.g., “Please enable Javascript and cookies”, “If you have an ad-blocker enabled…”).
+Some sites return block pages (paywalls, adblock warnings, captcha). After extraction, the bot detects common block phrases (e.g., "Please enable Javascript and cookies", "If you have an ad-blocker enabled…").
 
 - Blocked articles are marked as **blocked** in the pipeline
 - The LLM is **not called** for blocked content
-- The email shows a fallback line: **“Summary unavailable due to site access restrictions.”**
+- The email shows a fallback line: **"Summary unavailable due to site access restrictions."**
 
 ## Gmail Setup
 
@@ -215,6 +290,22 @@ Make sure Ollama is running: `ollama serve`
 - Verify your NEWS_API_KEY is valid
 - Check you haven't exceeded the free tier limits
 - Try enabling fewer sections to reduce requests and increase hit rate
+
+### TTS: "Coqui TTS is not installed"
+- Ensure you're using Python 3.11 (not 3.12+)
+- Run `pip install TTS pydub`
+
+### TTS: "pydub is required for MP3 conversion"
+- Run `pip install pydub`
+- Ensure `ffmpeg` is installed on your system
+
+### TTS: Model download is slow
+- First run downloads the TTS model (~100MB)
+- Subsequent runs use the cached model
+
+### TTS: CUDA/GPU errors
+- Set `TTS_USE_CUDA=false` in `.env` to use CPU
+- GPU acceleration requires CUDA-compatible NVIDIA GPU and proper drivers
 
 ## License
 
