@@ -221,6 +221,111 @@ class TTSEngine:
         
         return text.strip()
     
+    def _chunk_text(self, text: str, max_chars: int = 240) -> list[str]:
+        """
+        Split text into chunks that fit within the XTTS character limit.
+        
+        Splits on sentence boundaries when possible, falling back to
+        other punctuation or word boundaries.
+        
+        Args:
+            text: Text to chunk.
+            max_chars: Maximum characters per chunk (default 240 for safety margin).
+        
+        Returns:
+            List of text chunks.
+        """
+        if len(text) <= max_chars:
+            return [text]
+        
+        chunks = []
+        remaining = text
+        
+        while remaining:
+            if len(remaining) <= max_chars:
+                chunks.append(remaining.strip())
+                break
+            
+            # Find the best split point within max_chars
+            chunk = remaining[:max_chars]
+            
+            # Try to split at sentence end (. ! ?)
+            split_idx = -1
+            for end_char in ['. ', '! ', '? ', '.\n', '!\n', '?\n']:
+                idx = chunk.rfind(end_char)
+                if idx > split_idx:
+                    split_idx = idx + 1  # Include the punctuation
+            
+            # If no sentence end, try comma or semicolon
+            if split_idx < max_chars // 2:
+                for punct in [', ', '; ', ',\n', ';\n']:
+                    idx = chunk.rfind(punct)
+                    if idx > split_idx:
+                        split_idx = idx + 1
+            
+            # If still no good split, try any space
+            if split_idx < max_chars // 3:
+                idx = chunk.rfind(' ')
+                if idx > 0:
+                    split_idx = idx
+            
+            # Last resort: hard cut
+            if split_idx <= 0:
+                split_idx = max_chars
+            
+            chunks.append(remaining[:split_idx].strip())
+            remaining = remaining[split_idx:].strip()
+        
+        return [c for c in chunks if c]  # Filter empty chunks
+    
+    def _synthesize_chunks(self, chunks: list[str], output_path: Path) -> None:
+        """
+        Synthesize multiple text chunks and concatenate into single audio file.
+        
+        Args:
+            chunks: List of text chunks to synthesize.
+            output_path: Path for final output file.
+        """
+        from pydub import AudioSegment
+        
+        combined_audio = AudioSegment.empty()
+        temp_files = []
+        
+        try:
+            for i, chunk in enumerate(chunks):
+                # Create temp file for this chunk
+                temp_path = output_path.parent / f"_temp_chunk_{i}.wav"
+                temp_files.append(temp_path)
+                
+                # Synthesize chunk
+                tts_kwargs = {
+                    "text": chunk,
+                    "file_path": str(temp_path),
+                    "language": self.config.language,
+                    "speed": self.config.speed,
+                }
+                if self.config.speaker_wav:
+                    tts_kwargs["speaker_wav"] = self.config.speaker_wav
+                elif self.config.speaker:
+                    tts_kwargs["speaker"] = self.config.speaker
+                
+                self._tts.tts_to_file(**tts_kwargs)
+                
+                # Load and append to combined audio
+                chunk_audio = AudioSegment.from_wav(str(temp_path))
+                combined_audio += chunk_audio
+            
+            # Export combined audio
+            combined_audio.export(str(output_path), format="wav")
+            
+        finally:
+            # Clean up temp files
+            for temp_file in temp_files:
+                try:
+                    temp_file.unlink()
+                except OSError:
+                    pass
+    
     def synthesize(
         self,
         text: str,
@@ -265,19 +370,25 @@ class TTSEngine:
         try:
             # XTTS models require language and speaker parameters
             if self.config.is_xtts_model:
-                tts_kwargs = {
-                    "text": processed_text,
-                    "file_path": str(output_path),
-                    "language": self.config.language,
-                    "speed": self.config.speed,
-                }
-                # Use speaker_wav for voice cloning, otherwise use named speaker
-                if self.config.speaker_wav:
-                    tts_kwargs["speaker_wav"] = self.config.speaker_wav
-                elif self.config.speaker:
-                    tts_kwargs["speaker"] = self.config.speaker
-                
-                self._tts.tts_to_file(**tts_kwargs)
+                # XTTS has a 250 character limit - chunk long texts
+                if len(processed_text) > 240:
+                    chunks = self._chunk_text(processed_text, max_chars=240)
+                    logger.info(f"Text split into {len(chunks)} chunks for XTTS")
+                    self._synthesize_chunks(chunks, output_path)
+                else:
+                    tts_kwargs = {
+                        "text": processed_text,
+                        "file_path": str(output_path),
+                        "language": self.config.language,
+                        "speed": self.config.speed,
+                    }
+                    # Use speaker_wav for voice cloning, otherwise use named speaker
+                    if self.config.speaker_wav:
+                        tts_kwargs["speaker_wav"] = self.config.speaker_wav
+                    elif self.config.speaker:
+                        tts_kwargs["speaker"] = self.config.speaker
+                    
+                    self._tts.tts_to_file(**tts_kwargs)
             else:
                 # Standard models (Tacotron, VITS, etc.)
                 self._tts.tts_to_file(
