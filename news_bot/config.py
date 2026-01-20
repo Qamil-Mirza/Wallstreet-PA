@@ -6,7 +6,7 @@ typed accessors with validation.
 """
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -16,6 +16,17 @@ from dotenv import load_dotenv
 class ConfigError(Exception):
     """Raised when configuration is invalid or missing required values."""
     pass
+
+
+@dataclass
+class RSSFeedEntry:
+    """Configuration for a single RSS feed from environment."""
+    
+    name: str
+    url: str
+    section: str = "RSS Feeds"
+    enabled: bool = True
+    limit: int = 5
 
 
 @dataclass
@@ -53,6 +64,10 @@ class Config:
     section_us_industry_enabled: bool = True
     section_malaysia_tech_enabled: bool = True
     section_malaysia_industry_enabled: bool = True
+    
+    # RSS feed settings
+    rss_enabled: bool = False
+    rss_feeds: list[RSSFeedEntry] = field(default_factory=list)
 
 
 def _get_required_env(key: str) -> str:
@@ -74,6 +89,43 @@ def _get_bool_env(key: str, default: bool = True) -> bool:
     if value is None:
         return default
     return value.lower() in ("true", "1", "yes", "on")
+
+
+def _parse_rss_feeds() -> list[RSSFeedEntry]:
+    """
+    Parse RSS feed configuration from environment variables.
+    
+    Format: RSS_FEEDS=url1,url2,url3 (comma-separated URLs)
+    
+    The feed name is automatically derived from the URL domain.
+    
+    Returns:
+        List of RSSFeedEntry objects.
+    """
+    feeds = []
+    
+    simple_feeds = os.environ.get("RSS_FEEDS", "")
+    if simple_feeds:
+        for url in simple_feeds.split(","):
+            url = url.strip()
+            if url:
+                # Extract name from URL domain
+                try:
+                    from urllib.parse import urlparse
+                    domain = urlparse(url).netloc
+                    name = domain.replace("www.", "").split(".")[0].title()
+                except Exception:
+                    name = "RSS Feed"
+                
+                feeds.append(RSSFeedEntry(
+                    name=name,
+                    url=url,
+                    section="RSS Feeds",
+                    enabled=True,
+                    limit=5,
+                ))
+    
+    return feeds
 
 
 def load_config(env_path: Optional[Path] = None) -> Config:
@@ -110,6 +162,9 @@ def load_config(env_path: Optional[Path] = None) -> Config:
     except ValueError:
         raise ConfigError(f"TTS_DURATION_MINUTES must be a number, got: {tts_duration_str}")
     
+    # Parse RSS feeds from environment
+    rss_feeds = _parse_rss_feeds()
+    
     return Config(
         news_api_key=_get_required_env("NEWS_API_KEY"),
         news_api_base_url=_get_optional_env(
@@ -138,4 +193,7 @@ def load_config(env_path: Optional[Path] = None) -> Config:
         section_us_industry_enabled=_get_bool_env("SECTION_US_INDUSTRY_ENABLED", True),
         section_malaysia_tech_enabled=_get_bool_env("SECTION_MALAYSIA_TECH_ENABLED", True),
         section_malaysia_industry_enabled=_get_bool_env("SECTION_MALAYSIA_INDUSTRY_ENABLED", True),
+        # RSS settings
+        rss_enabled=_get_bool_env("RSS_ENABLED", False),
+        rss_feeds=rss_feeds,
     )

@@ -2,6 +2,7 @@
 News API client for fetching financial/economic articles.
 
 Supports multiple free news APIs with normalization to a common schema.
+Also integrates RSS feed support for custom news sources.
 """
 
 import logging
@@ -17,6 +18,13 @@ from .config import Config
 
 
 logger = logging.getLogger(__name__)
+
+
+# Import RSS client (lazy to avoid circular imports)
+def _get_rss_module():
+    """Lazy import of RSS client module."""
+    from . import rss_client
+    return rss_client
 
 
 def _sanitize_error(error: Exception) -> str:
@@ -221,6 +229,8 @@ def fetch_articles_by_section(config: Config, per_section_limit: int = 5) -> dic
     Makes multiple API calls to get diverse news coverage, returning articles
     grouped by their feed section for sectioned email rendering.
     
+    Also fetches from RSS feeds if RSS_ENABLED is true.
+    
     Args:
         config: Application configuration with API credentials.
         per_section_limit: Maximum articles per section.
@@ -228,6 +238,7 @@ def fetch_articles_by_section(config: Config, per_section_limit: int = 5) -> dic
     Returns:
         Dictionary mapping section names to lists of ArticleMeta objects.
         Sections: "World News", "US Tech", "US Industry", "Malaysia Tech", "Malaysia Industry"
+        Plus any custom RSS feed sections.
     
     Raises:
         NewsClientError: If all API requests fail.
@@ -272,12 +283,81 @@ def fetch_articles_by_section(config: Config, per_section_limit: int = 5) -> dic
             sections[feed.name] = []  # Empty section on failure
             continue
     
+    # Fetch RSS feeds if enabled
+    if config.rss_enabled and config.rss_feeds:
+        rss_sections = _fetch_rss_feeds_by_section(config, seen_urls, per_section_limit)
+        for section_name, articles in rss_sections.items():
+            if section_name in sections:
+                # Merge with existing section
+                sections[section_name].extend(articles)
+            else:
+                sections[section_name] = articles
+    
     # Check if we got any articles at all
     total_articles = sum(len(arts) for arts in sections.values())
     if total_articles == 0 and errors:
         raise NewsClientError(f"All feeds failed: {'; '.join(errors)}")
     
     logger.info(f"Total articles fetched: {total_articles} across {len(sections)} sections")
+    return sections
+
+
+def _fetch_rss_feeds_by_section(
+    config: Config,
+    seen_urls: set[str],
+    per_section_limit: int = 5,
+) -> dict[str, list[ArticleMeta]]:
+    """
+    Fetch articles from configured RSS feeds, organized by section.
+    
+    Args:
+        config: Application configuration with RSS feed settings.
+        seen_urls: Set of URLs already seen (for deduplication).
+        per_section_limit: Maximum articles per section.
+    
+    Returns:
+        Dictionary mapping section names to lists of ArticleMeta objects.
+    """
+    rss_client = _get_rss_module()
+    
+    sections: dict[str, list[ArticleMeta]] = {}
+    
+    for feed_entry in config.rss_feeds:
+        if not feed_entry.enabled:
+            continue
+        
+        try:
+            # Convert config entry to RSSFeedConfig
+            feed_config = rss_client.RSSFeedConfig(
+                name=feed_entry.name,
+                url=feed_entry.url,
+                section=feed_entry.section,
+                enabled=feed_entry.enabled,
+                limit=min(feed_entry.limit, per_section_limit),
+            )
+            
+            articles = rss_client.fetch_rss_feed(
+                url=feed_config.url,
+                feed_name=feed_config.name,
+                limit=feed_config.limit,
+            )
+            
+            # Initialize section if needed
+            if feed_config.section not in sections:
+                sections[feed_config.section] = []
+            
+            # Deduplicate by URL
+            for article in articles:
+                if article.url not in seen_urls:
+                    seen_urls.add(article.url)
+                    sections[feed_config.section].append(article)
+            
+            logger.info(f"RSS '{feed_entry.name}': {len(articles)} articles")
+            
+        except rss_client.RSSClientError as e:
+            logger.warning(f"Failed to fetch RSS feed {feed_entry.name}: {e}")
+            continue
+    
     return sections
 
 

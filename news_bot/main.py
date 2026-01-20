@@ -8,7 +8,7 @@ Optionally generates TTS audio broadcast from summaries.
 
 import logging
 import sys
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 from .article_extractor import ensure_batch_content
@@ -20,12 +20,48 @@ from .summarizer import summarize_articles
 from .tts_engine import TTSConfig, TTSEngine, TTSEngineError
 
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
+def _setup_logging() -> Path:
+    """
+    Configure logging to both console and file.
+    
+    Creates a timestamped log file in the logs/ directory.
+    
+    Returns:
+        Path to the log file.
+    """
+    # Create logs directory if it doesn't exist
+    logs_dir = Path("logs")
+    logs_dir.mkdir(exist_ok=True)
+    
+    # Generate timestamped log filename
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_file = logs_dir / f"run_{timestamp}.log"
+    
+    # Log format
+    log_format = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+    date_format = "%Y-%m-%d %H:%M:%S"
+    
+    # Configure root logger
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+    
+    # Console handler
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(logging.Formatter(log_format, date_format))
+    root_logger.addHandler(console_handler)
+    
+    # File handler
+    file_handler = logging.FileHandler(log_file, encoding="utf-8")
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(logging.Formatter(log_format, date_format))
+    root_logger.addHandler(file_handler)
+    
+    return log_file
+
+
+# Setup logging and get log file path
+_log_file = _setup_logging()
 logger = logging.getLogger(__name__)
 
 
@@ -109,6 +145,7 @@ def run_daily() -> None:
     5. Build and send sectioned email
     """
     logger.info("Starting daily newsletter run...")
+    logger.info(f"Log file: {_log_file.absolute()}")
     
     # Step 1: Load configuration
     try:

@@ -27,6 +27,7 @@ SECTION_CONFIG = {
     "US Industry": {"emoji": "🇺🇸🏭", "color": "#14b8a6"},
     "Malaysia Tech": {"emoji": "🇲🇾💻", "color": "#f59e0b"},
     "Malaysia Industry": {"emoji": "🇲🇾🏭", "color": "#ef4444"},
+    "RSS Feeds": {"emoji": "📡", "color": "#8b5cf6"},
 }
 
 
@@ -316,13 +317,20 @@ def build_sectioned_email_html(
     formatted_date = email_date.strftime("%A, %B %d, %Y")
     
     # Define section order (for consistent ordering when multiple sections enabled)
+    # Additional sections (like custom RSS feeds) will be rendered at the end
     section_order = [
         "World News",
         "US Tech",
         "US Industry",
         "Malaysia Tech",
         "Malaysia Industry",
+        "RSS Feeds",
     ]
+    
+    # Add any sections not in the predefined order (custom RSS sections)
+    for section_name in sections.keys():
+        if section_name not in section_order:
+            section_order.append(section_name)
     
     sections_html_parts = []
     
