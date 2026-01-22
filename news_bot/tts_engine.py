@@ -460,9 +460,12 @@ class TTSEngine:
                 bitrate="192k",
             )
         except Exception as e:
-            raise TTSEngineError(f"MP3 conversion failed: {e}")
+            # MP3 conversion failed - fall back to WAV file
+            logger.warning(f"MP3 conversion failed: {e}")
+            logger.info(f"Falling back to WAV file: {wav_path.name}")
+            return wav_path
         
-        # Clean up WAV file
+        # Clean up WAV file only if MP3 conversion succeeded
         try:
             wav_path.unlink()
         except OSError:

@@ -200,7 +200,7 @@ def run_daily() -> None:
     logger.info("Sectioned email HTML generated")
     
     try:
-        send_email(config, subject, html)
+        send_email(config, subject, html, attachment_path=audio_path)
         logger.info("Newsletter sent successfully!")
     except EmailError as e:
         logger.error(f"Failed to send email: {e}")

@@ -7,8 +7,11 @@ Builds HTML emails and sends them using configured SMTP server.
 import logging
 import smtplib
 from datetime import date
+from email.encoders import encode_base64
+from email.mime.audio import MIMEAudio
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from pathlib import Path
 from typing import Optional
 
 from .classifier import ArticleCategory, bucket_articles
@@ -387,19 +390,26 @@ class EmailError(Exception):
     pass
 
 
-def send_email(config: Config, subject: str, html_body: str) -> None:
+def send_email(
+    config: Config,
+    subject: str,
+    html_body: str,
+    attachment_path: Optional[Path] = None,
+) -> None:
     """
-    Send an HTML email via SMTP.
+    Send an HTML email via SMTP with optional MP3 attachment.
     
     Args:
         config: Application configuration with SMTP settings.
         subject: Email subject line.
         html_body: HTML content for the email body.
+        attachment_path: Optional path to an MP3 file to attach.
     
     Raises:
         EmailError: If sending fails.
     """
-    msg = MIMEMultipart("alternative")
+    # Use mixed for attachments, alternative for HTML-only
+    msg = MIMEMultipart("mixed" if attachment_path else "alternative")
     msg["Subject"] = subject
     msg["From"] = config.smtp_user
     msg["To"] = config.recipient_email
@@ -407,6 +417,30 @@ def send_email(config: Config, subject: str, html_body: str) -> None:
     # Attach HTML content
     html_part = MIMEText(html_body, "html")
     msg.attach(html_part)
+    
+    # Attach audio file if provided (supports MP3 and WAV)
+    if attachment_path and attachment_path.exists():
+        try:
+            # Determine audio subtype based on file extension
+            suffix = attachment_path.suffix.lower()
+            if suffix == ".mp3":
+                subtype = "mpeg"
+            elif suffix == ".wav":
+                subtype = "wav"
+            else:
+                subtype = "mpeg"  # Default to MP3
+            
+            with open(attachment_path, "rb") as audio_file:
+                audio_part = MIMEAudio(audio_file.read(), _subtype=subtype)
+            audio_part.add_header(
+                "Content-Disposition",
+                "attachment",
+                filename=attachment_path.name,
+            )
+            msg.attach(audio_part)
+            logger.info(f"Attached audio file: {attachment_path.name}")
+        except Exception as e:
+            logger.warning(f"Failed to attach audio file: {e}")
     
     try:
         with smtplib.SMTP(config.smtp_host, config.smtp_port) as server:
