@@ -1,0 +1,87 @@
+# =============================================================================
+# Newsletter Bot - Docker Compose Configuration
+# =============================================================================
+# Usage:
+#   docker compose up -d          # Start all services
+#   docker compose run bot        # Run newsletter once
+#   docker compose logs -f        # View logs
+#   docker compose down           # Stop all services
+#
+# First-time setup:
+#   1. Copy env.example to .env and configure
+#   2. docker compose up -d ollama
+#   3. docker compose exec ollama ollama pull llama3
+#   4. docker compose run bot
+
+services:
+  # ===========================================================================
+  # Newsletter Bot
+  # ===========================================================================
+  bot:
+    build:
+      context: .
+      target: production
+    container_name: newsletter-bot
+    env_file:
+      - .env
+    environment:
+      # Override Ollama URL to use Docker networking
+      - OLLAMA_BASE_URL=http://ollama:11434
+    volumes:
+      # Persist generated audio files
+      - ./audio_output:/app/audio_output
+      # Persist logs
+      - ./logs:/app/logs
+    depends_on:
+      - ollama
+    # Run once and exit (for cron-based scheduling)
+    restart: "no"
+    networks:
+      - newsletter-net
+
+  # ===========================================================================
+  # Ollama LLM Server
+  # ===========================================================================
+  ollama:
+    image: ollama/ollama:latest
+    container_name: newsletter-ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      # Persist downloaded models
+      - ollama-models:/root/.ollama
+    restart: unless-stopped
+    networks:
+      - newsletter-net
+    # Uncomment for GPU support (NVIDIA):
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+
+  # ===========================================================================
+  # Test Runner (development)
+  # ===========================================================================
+  test:
+    build:
+      context: .
+      target: development
+    container_name: newsletter-test
+    command: python -m pytest tests/ -v
+    volumes:
+      - .:/app
+    profiles:
+      - test
+    networks:
+      - newsletter-net
+
+networks:
+  newsletter-net:
+    driver: bridge
+
+volumes:
+  ollama-models:
+    driver: local

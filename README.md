@@ -111,6 +111,111 @@ ollama serve
 python -m news_bot.main
 ```
 
+## Deployment
+
+### Option 1: Docker (Recommended)
+
+The easiest way to deploy is with Docker, which handles all dependencies automatically.
+
+```bash
+# 1. Clone the repo
+git clone https://github.com/yourusername/newsletter.git
+cd newsletter
+
+# 2. Create your configuration
+cp env.example .env
+# Edit .env with your API keys and settings
+
+# 3. Start services (Ollama + Bot)
+docker compose up -d ollama
+
+# 4. Pull the LLM model (first time only)
+docker compose exec ollama ollama pull llama3
+
+# 5. Run the newsletter
+docker compose run bot
+```
+
+#### Scheduling with Docker
+
+For daily runs, add to crontab:
+
+```bash
+0 7 * * * cd /path/to/newsletter && docker compose run --rm bot >> logs/cron.log 2>&1
+```
+
+#### GPU Support
+
+For NVIDIA GPU acceleration, uncomment the GPU section in `docker-compose.yml`.
+
+### Option 2: Setup Script (Server Deployment)
+
+For non-Docker deployments, use the automated setup script:
+
+```bash
+# 1. Clone the repo
+git clone https://github.com/yourusername/newsletter.git
+cd newsletter
+
+# 2. Run setup (installs dependencies, creates venv)
+chmod +x scripts/setup.sh
+./scripts/setup.sh
+
+# 3. Configure
+# Edit .env with your settings (created by setup script)
+
+# 4. Start Ollama
+ollama serve &
+
+# 5. Run
+source venv/bin/activate
+python -m news_bot.main
+```
+
+#### Scheduling (Server)
+
+Use the run script with cron:
+
+```bash
+crontab -e
+```
+
+Add:
+```
+0 7 * * * /path/to/newsletter/scripts/run.sh >> /path/to/newsletter/logs/cron.log 2>&1
+```
+
+### Server Requirements
+
+| Component | Minimum | Recommended |
+|-----------|---------|-------------|
+| Python | 3.9 | 3.11 |
+| RAM | 4GB | 8GB+ |
+| Disk | 5GB | 10GB+ |
+| OS | Ubuntu 20.04+ | Ubuntu 22.04+ |
+
+#### System Dependencies
+
+```bash
+# Ubuntu/Debian
+sudo apt update && sudo apt install -y ffmpeg espeak-ng python3.11 python3.11-venv
+
+# macOS
+brew install ffmpeg espeak python@3.11
+
+# Install Ollama
+curl -fsSL https://ollama.ai/install.sh | sh
+ollama pull llama3
+```
+
+### Known Compatibility Issues
+
+| Issue | Solution |
+|-------|----------|
+| `BeamSearchScorer` import error | Pin `transformers==4.40.0` (included in requirements.txt) |
+| PyTorch `weights_only` error | Use `torch<2.6` (included in setup) |
+| TTS not installing | Use Python 3.9-3.11 (not 3.12+) |
+
 ## TTS Audio Generation
 
 The bot generates an audio podcast from article summaries using a two-stage process:
@@ -199,19 +304,16 @@ newsletter/
 │   ├── tts_engine.py         # Coqui TTS audio synthesis
 │   ├── email_client.py       # HTML email rendering & SMTP
 │   └── main.py               # Orchestration & entry point
+├── scripts/
+│   ├── setup.sh              # Automated setup for server deployment
+│   └── run.sh                # Run script for cron jobs
 ├── tests/
-│   ├── test_config.py
-│   ├── test_news_client.py
-│   ├── test_article_extractor.py
-│   ├── test_classifier.py
-│   ├── test_selection.py
-│   ├── test_summarizer.py
-│   ├── test_script_generator.py
-│   ├── test_tts_engine.py
-│   └── test_email_client.py
+│   ├── test_*.py             # Comprehensive test suite (230+ tests)
 ├── audio_output/             # Generated audio files (git-ignored)
 ├── logs/                     # LLM trace logs (git-ignored)
-├── requirements.txt
+├── Dockerfile                # Container build configuration
+├── docker-compose.yml        # Multi-service orchestration
+├── requirements.txt          # Pinned Python dependencies
 ├── env.example
 └── README.md
 ```

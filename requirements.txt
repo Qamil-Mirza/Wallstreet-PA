@@ -1,8 +1,25 @@
+# Core dependencies
 requests>=2.31.0
 beautifulsoup4>=4.12.0
 trafilatura>=2.0.0
 python-dotenv>=1.0.0
+
+# Testing
 pytest>=8.0.0
 pytest-mock>=3.12.0
+
+# TTS dependencies (Coqui TTS)
+# NOTE: Coqui TTS is licensed for non-commercial use only
 TTS>=0.22.0
 pydub>=0.25.1
+
+# Pinned for TTS compatibility
+# transformers 4.41+ removed BeamSearchScorer which TTS needs
+transformers==4.40.0
+# Required for XTTS models
+deepmultilingualpunctuation
+
+# PyTorch - pin to avoid weights_only security breaking change in 2.6+
+# Uncomment and adjust for your platform if needed:
+# torch==2.5.1
+# torchaudio==2.5.1
