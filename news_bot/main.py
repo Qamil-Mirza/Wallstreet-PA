@@ -16,6 +16,7 @@ from .config import Config, ConfigError, load_config
 from .email_client import EmailError, build_sectioned_email_html, send_email
 from .news_client import NewsClientError, fetch_articles_by_section
 from .script_generator import ScriptGeneratorError, generate_broadcast_script
+from .news_client import ArticleMeta
 from .summarizer import summarize_articles
 from .tts_engine import TTSConfig, TTSEngine, TTSEngineError
 
@@ -89,7 +90,7 @@ def generate_tts_broadcast(summaries: dict[str, str], config: Config) -> Path | 
         logger.warning("No summaries available for TTS generation")
         return None
     
-    # Step 1: Generate radio script
+    # Generate radio script
     logger.info("Generating radio broadcast script...")
     try:
         script = generate_broadcast_script(
@@ -103,7 +104,7 @@ def generate_tts_broadcast(summaries: dict[str, str], config: Config) -> Path | 
         logger.error(f"Script generation failed: {e}")
         return None
     
-    # Step 2: Initialize TTS engine
+    # Initialize TTS engine
     tts_config = TTSConfig(
         model_name=config.tts_model,
         language=config.tts_language,
@@ -119,7 +120,7 @@ def generate_tts_broadcast(summaries: dict[str, str], config: Config) -> Path | 
         logger.error(f"TTS engine initialization failed: {e}")
         return None
     
-    # Step 3: Generate audio
+    # Generate audio
     logger.info("Generating TTS audio...")
     today = date.today()
     filename = f"broadcast_{today.strftime('%Y%m%d')}"
@@ -147,7 +148,7 @@ def run_daily() -> None:
     logger.info("Starting daily newsletter run...")
     logger.info(f"Log file: {_log_file.absolute()}")
     
-    # Step 1: Load configuration
+    # Load config
     try:
         config = load_config()
         logger.info("Configuration loaded successfully")
@@ -155,7 +156,7 @@ def run_daily() -> None:
         logger.error(f"Configuration error: {e}")
         sys.exit(1)
     
-    # Step 2: Fetch articles by section
+    # Fetch articles by section
     try:
         sections = fetch_articles_by_section(config, per_section_limit=5)
         total_articles = sum(len(arts) for arts in sections.values())
@@ -172,31 +173,54 @@ def run_daily() -> None:
     for section_name, articles in sections.items():
         logger.info(f"  {section_name}: {len(articles)} articles")
     
-    # Step 3: Ensure content is available for all articles
+    # Ensure content is available for all articles
     logger.info("Extracting article content...")
     for section_name in sections:
         sections[section_name] = ensure_batch_content(sections[section_name])
     logger.info("Content extraction complete")
     
-    # Step 4: Summarize all articles across all sections
+    # Summarize all articles across all sections
     all_articles = []
     for articles in sections.values():
         all_articles.extend(articles)
     
     logger.info(f"Generating summaries for {len(all_articles)} articles with Ollama...")
     summaries = summarize_articles(all_articles, config)
-    logger.info(f"Generated {len(summaries)} summaries")
     
-    # Step 5: Generate TTS audio broadcast (optional)
-    audio_path = generate_tts_broadcast(summaries, config)
+    # Filter out dropped articles (None summaries = invalid/refusal)
+    valid_summaries = {k: v for k, v in summaries.items() if v is not None}
+    dropped_count = len(summaries) - len(valid_summaries)
+    
+    if dropped_count > 0:
+        logger.info(f"Dropped {dropped_count} article(s) with invalid summaries")
+    
+    logger.info(f"Generated {len(valid_summaries)} valid summaries")
+    
+    # Filter sections to only include articles with valid summaries
+    for section_name in sections:
+        sections[section_name] = [
+            article for article in sections[section_name]
+            if article.id in valid_summaries
+        ]
+    
+    # Check if we have any articles left after filtering
+    remaining_articles = sum(len(arts) for arts in sections.values())
+    if remaining_articles == 0:
+        logger.error("No articles with valid summaries - nothing to send")
+        sys.exit(1)
+    
+    logger.info(f"Final article count after filtering: {remaining_articles}")
+    
+    # Generate TTS audio broadcast if enabled (use only valid summaries)
+    audio_path = generate_tts_broadcast(valid_summaries, config)
     if audio_path:
         logger.info(f"TTS broadcast ready: {audio_path}")
     
-    # Step 6: Build and send sectioned email
+    # Build and send sectioned email
     today = date.today()
     subject = f"The Daily Briefing – {today.strftime('%b %d, %Y')}"
     
-    html = build_sectioned_email_html(today, sections, summaries)
+    html = build_sectioned_email_html(today, sections, valid_summaries)
     logger.info("Sectioned email HTML generated")
     
     try:

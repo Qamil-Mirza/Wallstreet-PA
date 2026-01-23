@@ -17,10 +17,14 @@ import requests
 from .article_extractor import BLOCKED_CONTENT_MARKER
 from .config import Config
 from .news_client import ArticleMeta
+from .summary_validator import validate_summary
 
 
 # Fallback summary for blocked articles
 BLOCKED_SUMMARY_FALLBACK = "Summary unavailable due to site access restrictions."
+
+# Marker for dropped articles (invalid summaries)
+DROPPED_ARTICLE_MARKER = None
 
 
 logger = logging.getLogger(__name__)
@@ -539,11 +543,12 @@ def is_article_blocked(article: ArticleMeta) -> bool:
 def summarize_articles(
     articles: list[ArticleMeta],
     config: Config
-) -> dict[str, str]:
+) -> dict[str, Optional[str]]:
     """
-    Summarize multiple articles.
+    Summarize multiple articles with quality validation.
     
-    Skips articles with blocked content and provides a fallback message.
+    Skips articles with blocked content. Validates generated summaries
+    and drops articles with invalid summaries (e.g., LLM refusals).
     
     Args:
         articles: List of articles to summarize.
@@ -551,10 +556,12 @@ def summarize_articles(
     
     Returns:
         Dictionary mapping article IDs to summary text.
-        Blocked articles get BLOCKED_SUMMARY_FALLBACK.
+        - Blocked articles get BLOCKED_SUMMARY_FALLBACK.
+        - Articles with invalid summaries get None (DROPPED_ARTICLE_MARKER).
     """
-    summaries: dict[str, str] = {}
+    summaries: dict[str, Optional[str]] = {}
     blocked_count = 0
+    dropped_count = 0
     
     for article in articles:
         # Skip blocked content - don't call LLM
@@ -573,18 +580,36 @@ def summarize_articles(
                 model=config.ollama_model,
                 base_url=config.ollama_base_url,
             )
+            
+            # Validate the generated summary
+            validation = validate_summary(
+                summary=summary,
+                model=config.ollama_model,
+                base_url=config.ollama_base_url,
+                use_llm_fallback=True,
+            )
+            
+            if not validation.is_valid:
+                logger.warning(
+                    f"Dropped article (invalid summary): {article.title[:50]}... "
+                    f"Reason: {validation.reason}"
+                )
+                summaries[article.id] = DROPPED_ARTICLE_MARKER
+                dropped_count += 1
+                continue
+            
             summaries[article.id] = summary
             logger.info(f"Summarized: {article.title[:50]}...")
             
         except SummarizerError as e:
             logger.error(f"Failed to summarize '{article.title}': {e}")
-            # Provide fallback summary as narrative
-            fallback = article.title
-            if article.summary:
-                fallback += f" {article.summary[:200]}"
-            summaries[article.id] = fallback
+            # Mark as dropped instead of providing fallback
+            summaries[article.id] = DROPPED_ARTICLE_MARKER
+            dropped_count += 1
     
     if blocked_count > 0:
         logger.info(f"Skipped {blocked_count} blocked article(s)")
+    if dropped_count > 0:
+        logger.info(f"Dropped {dropped_count} article(s) due to invalid summaries")
     
     return summaries

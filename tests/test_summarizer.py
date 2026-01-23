@@ -165,9 +165,21 @@ class TestSummarizeArticles:
             make_article("article-2", "Second Article", "Content 2"),
         ]
 
+        # Use properly formatted summaries that pass validation
+        valid_summary_1 = (
+            "Company X announced Q4 earnings beating estimates. "
+            "Revenue reached $10B with margins expanding to 25%. "
+            "So what? Strong demand validates the growth strategy (theme: Tech)."
+        )
+        valid_summary_2 = (
+            "Company Y reported record sales in the consumer segment. "
+            "Operating income grew 15% year-over-year to $5B. "
+            "So what? Premium pricing power supports valuation expansion (theme: Consumer)."
+        )
+
         responses = [
-            {"response": "• Summary for article 1"},
-            {"response": "• Summary for article 2"},
+            {"response": valid_summary_1},
+            {"response": valid_summary_2},
         ]
 
         with patch("news_bot.summarizer.requests.post") as mock_post:
@@ -176,11 +188,13 @@ class TestSummarizeArticles:
 
             result = summarize_articles(articles, mock_config)
 
-        assert len(result) == 2
-        assert "article-1" in result
-        assert "article-2" in result
-        assert "Summary for article 1" in result["article-1"]
-        assert "Summary for article 2" in result["article-2"]
+        # Filter out None values (dropped articles) for counting valid summaries
+        valid_results = {k: v for k, v in result.items() if v is not None}
+        assert len(valid_results) == 2
+        assert "article-1" in valid_results
+        assert "article-2" in valid_results
+        assert "Company X" in result["article-1"]
+        assert "Company Y" in result["article-2"]
 
     def test_summarize_articles_handles_failures(self, mock_config):
         """Test that failures for one article don't block others."""
@@ -188,6 +202,13 @@ class TestSummarizeArticles:
             make_article("article-1", "First Article", "Content 1"),
             make_article("article-2", "Second Article", "Content 2"),
         ]
+
+        # Valid summary that passes validation
+        valid_summary = (
+            "Company Z reported quarterly results exceeding expectations. "
+            "Revenue grew 20% to $8B with strong operating leverage. "
+            "So what? Execution validates management guidance (theme: Industrials)."
+        )
 
         call_count = 0
 
@@ -202,7 +223,7 @@ class TestSummarizeArticles:
                 raise req.Timeout()
             else:
                 # Second call succeeds
-                mock_response.json.return_value = {"response": "• Success"}
+                mock_response.json.return_value = {"response": valid_summary}
                 mock_response.raise_for_status = MagicMock()
                 return mock_response
 
@@ -212,11 +233,11 @@ class TestSummarizeArticles:
             result = summarize_articles(articles, mock_config)
 
         assert len(result) == 2
-        # First article should have fallback summary
+        # First article should be dropped (None) due to failure
         assert "article-1" in result
-        assert "First Article" in result["article-1"]  # Title as fallback
+        assert result["article-1"] is None  # Dropped due to summarization failure
         # Second should have actual summary
-        assert "Success" in result["article-2"]
+        assert "Company Z" in result["article-2"]
 
     def test_summarize_articles_empty_list(self, mock_config):
         """Test summarizing empty list returns empty dict."""
@@ -393,8 +414,15 @@ class TestBlockedArticleHandling:
             make_article("normal-1", "Normal Article", "Valid content for summarization."),
         ]
 
+        # Valid summary that passes validation
+        valid_summary = (
+            "Company A announced strategic partnership with major retailer. "
+            "Deal expected to generate $500M in incremental revenue over 3 years. "
+            "So what? Distribution expansion de-risks growth targets (theme: Consumer)."
+        )
+
         with patch("news_bot.summarizer.requests.post") as mock_post:
-            mock_post.return_value.json.return_value = {"response": "• Summary"}
+            mock_post.return_value.json.return_value = {"response": valid_summary}
             mock_post.return_value.raise_for_status = MagicMock()
 
             result = summarize_articles(articles, mock_config)
@@ -406,7 +434,7 @@ class TestBlockedArticleHandling:
         assert result["blocked-1"] == BLOCKED_SUMMARY_FALLBACK
         
         # Normal article gets actual summary
-        assert "Summary" in result["normal-1"]
+        assert "Company A" in result["normal-1"]
 
     def test_summarize_articles_all_blocked(self, mock_config):
         """Test handling when all articles are blocked."""
