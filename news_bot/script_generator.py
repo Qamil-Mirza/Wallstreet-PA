@@ -286,4 +286,5 @@ def generate_broadcast_script(
         model=ollama_model,
         base_url=ollama_base_url,
         script_config=config,
+        timeout=300
     )
