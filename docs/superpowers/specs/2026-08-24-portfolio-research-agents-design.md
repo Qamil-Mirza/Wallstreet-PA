@@ -34,7 +34,8 @@ The target style is a thesis-first research note such as the locally supplied Mo
 - Generate HTML email and archival PDF reports in a consistent institutional style.
 - Keep exact portfolio values and all brokerage credentials local.
 - Keep paid model API usage below a hard monthly ceiling of $5.
-- Dockerize the complete runtime, including optional local inference and persistent data.
+- Remain operational without an external API key by automatically using Ollama as the inference provider.
+- Dockerize the complete runtime, including the local fallback service and persistent data.
 - Preserve the existing newsletter's source ingestion, email, summary validation, and optional audio capabilities where they remain useful.
 
 ## 4. Non-Goals
@@ -146,7 +147,7 @@ SQLite migrations are explicit and versioned. Concurrent writes use short transa
 
 ### 6.5 Model Gateway
 
-The model gateway exposes provider-neutral operations for structured generation. Initial production support targets OpenAI's Responses API, with an Ollama-compatible provider retained as an optional offline fallback. The interface permits later Anthropic or Gemini adapters without changing agent logic.
+The model gateway exposes provider-neutral operations for structured generation. Initial production support targets OpenAI's Responses API, with an Ollama-compatible provider as the automatic offline fallback. The interface permits later Anthropic or Gemini adapters without changing agent logic.
 
 The initial OpenAI routing is:
 
@@ -156,7 +157,14 @@ The initial OpenAI routing is:
 
 Model names, prices, effort levels, timeouts, and per-role routes are configuration rather than hard-coded policy. Production uses pinned model configuration and records the exact provider/model for every agent run.
 
-Ollama is not the primary research engine. It is an optional Docker profile for offline operation, private preprocessing, and budget-exhaustion fallback. A consumer chat subscription is not treated as API access.
+Provider selection follows an explicit fallback chain:
+
+1. Use the configured external provider when its API key is present and valid for the selected role.
+2. If no external API key is configured, automatically enter local-only mode and route every agent role to its configured Ollama model.
+3. If an external provider becomes unavailable during a run, use Ollama only for roles whose fallback policy permits it; otherwise defer the task rather than silently changing the quality tier.
+4. If neither an external provider nor a healthy configured Ollama model is available, continue deterministic ingestion and defer model-dependent work with a visible diagnostic.
+
+Ollama is not the preferred research engine when external inference is available, but it is a standard Docker service and a supported zero-API-key operating mode. Local-only reports disclose their inference mode and model. They must pass the same evidence, citation, schema, and skeptical-review gates; a local model's lower confidence results in no rating or deferred publication rather than relaxed standards. A consumer chat subscription is not treated as API access.
 
 ## 7. Specialist Agents
 
@@ -349,6 +357,7 @@ Paid model spend uses a local ledger based on provider-reported token usage and 
 - At the soft limit, only critical final judgment or review tasks may use paid models.
 - At the hard limit, tasks are deferred or routed to Ollama when their risk level permits.
 - Deferred work remains visible in the report and task queue.
+- When no paid API key is configured, the paid budget ledger remains at zero and all model-dependent tasks use the local-only routing policy.
 
 The initial planning envelope, using prices available on 2026-08-24, is:
 
@@ -367,6 +376,8 @@ These are routing targets, not guaranteed allocations. Configuration and tests u
 - **Invalid structured model output:** validate, retry once with validation feedback, then fall back or block.
 - **Contradictory evidence:** retain both claims, surface the contradiction, and reduce confidence or return no rating.
 - **Budget exhausted:** defer frontier work or use approved local fallback; never overspend silently.
+- **External API key absent:** enter local-only mode automatically, verify Ollama health and model availability, and label resulting reports with the local inference mode.
+- **External API key invalid:** do not repeatedly retry authentication; record the redacted failure and apply the same local fallback policy as a missing key.
 - **PDF rendering failure:** retain HTML, record the failure, and send HTML only when the underlying report passed quality gates.
 - **Email failure:** preserve the approved report and retry delivery without rerunning research.
 - **Partial daily run:** may publish with explicit omissions. Weekly, monthly, foundational, and recommendation outputs require all critical gates.
@@ -388,7 +399,8 @@ Docker Compose defines:
 
 - `research-bot`: the Python application, scheduler, connectors, orchestration, report rendering, email, and optional audio.
 - `research-runner`: an on-demand Compose profile for `daily`, `weekly`, `monthly`, `backfill`, `dry-run`, and report-regeneration commands.
-- `ollama`: an optional profile with a persistent model volume; it is not required for external-API-first production operation.
+- `ollama`: the standard local fallback service with a persistent model volume. It remains available when external inference is selected and is used automatically when no external API key is configured.
+- `ollama-init`: an idempotent one-shot service that verifies or pulls the configured fallback model after Ollama becomes healthy.
 
 Named volumes persist:
 
@@ -397,7 +409,7 @@ Named volumes persist:
 - generated reports;
 - logs and redacted traces;
 - audio output;
-- optional Ollama models.
+- Ollama fallback models.
 
 The image includes reproducible PDF-rendering, extraction, audio, and system dependencies. Compose includes health checks, dependency ordering, restart policy, secret mounts, and explicit service commands. Database backups use SQLite's online backup mechanism and are written to a separate mounted backup directory.
 
@@ -414,10 +426,10 @@ Configuration remains environment-driven and typed. New settings cover:
 - reasoning effort, token limits, timeouts, and retry policy;
 - $4 soft and $5 hard monthly API limits;
 - storage, report, cache, backup, and template paths;
-- optional Ollama profile and fallback policy;
+- Ollama endpoint, fallback models, health timeout, and per-role fallback policy;
 - dry-run and historical replay dates.
 
-Configuration validation fails before network activity when a selected workflow lacks required credentials or has unsafe budget values.
+External provider credentials are optional. Configuration validation selects local-only mode when they are absent. It fails before research execution only when no usable inference provider is configured, required non-model credentials for the selected workflow are absent, or budget values are unsafe.
 
 ## 17. Testing and Evaluation
 
@@ -430,6 +442,7 @@ Configuration validation fails before network activity when a selected workflow 
 - Agent input/output schemas and orchestration state transitions.
 - Recommendation and publication gates.
 - Model routing, reservation, reconciliation, soft-limit behavior, and hard-limit enforcement.
+- Missing-key, invalid-key, provider-outage, and local-only Ollama routing.
 - Report calculations, exhibits, HTML escaping, and citations.
 
 ### 17.2 Contract and Integration Tests
@@ -484,7 +497,8 @@ The design is complete when the implemented system can:
 7. Trace every material published claim and exhibit to stored evidence.
 8. Degrade safely under stale data, unavailable sources, invalid model output, and provider failure.
 9. Prevent cumulative paid model spend from crossing $5 in a calendar month.
-10. Pass unit, contract, Docker integration, golden-report, claim-lineage, and historical-replay tests.
+10. Complete model-dependent workflows in disclosed local-only mode when no external API key is supplied and Ollama is healthy.
+11. Pass unit, contract, Docker integration, golden-report, claim-lineage, and historical-replay tests.
 
 ## 20. Source Notes Used During Design
 
