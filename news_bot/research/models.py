@@ -63,8 +63,11 @@ def _require_decimal(
     record_name: str, field_name: str, value: Decimal | None
 ) -> None:
     """Prevent implicit float or string values at exact-number boundaries."""
-    if value is not None and not isinstance(value, Decimal):
-        raise TypeError(f"{record_name}.{field_name} must be Decimal")
+    if value is not None:
+        if not isinstance(value, Decimal):
+            raise TypeError(f"{record_name}.{field_name} must be Decimal")
+        if not value.is_finite():
+            raise ValueError(f"{record_name}.{field_name} must be finite")
 
 
 @dataclass(frozen=True)
@@ -136,6 +139,10 @@ class EvidenceClaim:
     def __post_init__(self) -> None:
         _require_timezone(type(self).__name__, "as_of", self.as_of)
         _require_decimal(type(self).__name__, "confidence", self.confidence)
+        if not Decimal("0") <= self.confidence <= Decimal("1"):
+            raise ValueError(
+                "EvidenceClaim.confidence must be between 0 and 1"
+            )
 
 
 @dataclass(frozen=True)
@@ -154,6 +161,12 @@ class ModelUsage:
     def __post_init__(self) -> None:
         _require_timezone(type(self).__name__, "recorded_at", self.recorded_at)
         _require_decimal(type(self).__name__, "cost_usd", self.cost_usd)
+        if self.cost_usd < 0:
+            raise ValueError("ModelUsage.cost_usd must be non-negative")
+        if self.input_tokens < 0:
+            raise ValueError("ModelUsage.input_tokens must be non-negative")
+        if self.output_tokens < 0:
+            raise ValueError("ModelUsage.output_tokens must be non-negative")
 
 
 @dataclass(frozen=True)

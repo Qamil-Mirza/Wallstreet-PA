@@ -1,7 +1,7 @@
 """Environment-driven configuration for the investment research pipeline."""
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
@@ -59,7 +59,9 @@ def _get_decimal(name: str, default: str) -> Decimal:
 
 def _get_text(name: str, default: str) -> str:
     value = os.getenv(name)
-    return value.strip() if value is not None else default
+    if value is None:
+        return default
+    return value.strip() or default
 
 
 @dataclass(frozen=True)
@@ -68,12 +70,15 @@ class ResearchConfig:
 
     enabled: bool
     data_dir: Path
-    openai_api_key: str | None
+    openai_api_key: str | None = field(repr=False)
     inference_mode: InferenceMode
     ollama_base_url: str
     ollama_model: str
     budget_soft_usd: Decimal
     budget_hard_usd: Decimal
+
+    def __post_init__(self) -> None:
+        self.validate()
 
     @property
     def database_path(self) -> Path:
@@ -95,7 +100,7 @@ class ResearchConfig:
     def from_env(cls) -> "ResearchConfig":
         """Build configuration from the process environment without loading `.env`."""
         openai_key = _read_secret("OPENAI_API_KEY")
-        config = cls(
+        return cls(
             enabled=_get_bool("RESEARCH_ENABLED", False),
             data_dir=Path(_get_text("RESEARCH_DATA_DIR", "research_data")),
             openai_api_key=openai_key,
@@ -109,11 +114,29 @@ class ResearchConfig:
             budget_soft_usd=_get_decimal("MODEL_BUDGET_SOFT_USD", "4.00"),
             budget_hard_usd=_get_decimal("MODEL_BUDGET_HARD_USD", "5.00"),
         )
-        config.validate()
-        return config
 
     def validate(self) -> None:
-        """Reject budget thresholds that cannot enforce a distinct hard ceiling."""
+        """Reject unsafe budget thresholds and inconsistent inference routing."""
+        if not isinstance(self.data_dir, Path):
+            raise ResearchConfigError("data_dir must be Path")
+        if not str(self.data_dir).strip():
+            raise ResearchConfigError("data_dir must be a non-empty path")
+        for field_name, value in (
+            ("ollama_base_url", self.ollama_base_url),
+            ("ollama_model", self.ollama_model),
+        ):
+            if not isinstance(value, str) or not value.strip():
+                raise ResearchConfigError(f"{field_name} must be non-empty")
+
+        for field_name, value in (
+            ("budget_soft_usd", self.budget_soft_usd),
+            ("budget_hard_usd", self.budget_hard_usd),
+        ):
+            if not isinstance(value, Decimal):
+                raise ResearchConfigError(f"{field_name} must be Decimal")
+            if not value.is_finite():
+                raise ResearchConfigError(f"{field_name} must be finite")
+
         if self.budget_soft_usd < 0 or self.budget_hard_usd < 0:
             raise ResearchConfigError("Model budget limits must be non-negative")
         if self.budget_soft_usd >= self.budget_hard_usd:
@@ -122,3 +145,21 @@ class ResearchConfig:
             )
         if self.budget_hard_usd > Decimal("5.00"):
             raise ResearchConfigError("MODEL_BUDGET_HARD_USD must not exceed 5.00")
+
+        if not isinstance(self.inference_mode, InferenceMode):
+            raise ResearchConfigError("inference_mode must be InferenceMode")
+        if self.openai_api_key is not None:
+            if not isinstance(self.openai_api_key, str):
+                raise ResearchConfigError("openai_api_key must be str or None")
+            if not self.openai_api_key.strip():
+                raise ResearchConfigError(
+                    "openai_api_key must be non-empty when provided"
+                )
+        if self.openai_api_key is None and self.inference_mode is not InferenceMode.LOCAL_ONLY:
+            raise ResearchConfigError(
+                "inference_mode must be local_only when OPENAI_API_KEY is absent"
+            )
+        if self.openai_api_key is not None and self.inference_mode is not InferenceMode.EXTERNAL:
+            raise ResearchConfigError(
+                "inference_mode must be external when OPENAI_API_KEY is configured"
+            )

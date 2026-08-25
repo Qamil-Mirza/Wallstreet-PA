@@ -1,8 +1,9 @@
 """Tests for research configuration and foundational domain types."""
 
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 from datetime import datetime, timezone
 from decimal import Decimal
+from pathlib import Path
 
 import pytest
 
@@ -36,6 +37,20 @@ def clear_research_environment(monkeypatch):
         "MODEL_BUDGET_HARD_USD",
     ):
         monkeypatch.delenv(name, raising=False)
+
+
+def valid_research_config() -> ResearchConfig:
+    """Build a valid config directly so construction invariants are testable."""
+    return ResearchConfig(
+        enabled=False,
+        data_dir=Path("research_data"),
+        openai_api_key=None,
+        inference_mode=InferenceMode.LOCAL_ONLY,
+        ollama_base_url="http://localhost:11434",
+        ollama_model="llama3.1:8b",
+        budget_soft_usd=Decimal("4.00"),
+        budget_hard_usd=Decimal("5.00"),
+    )
 
 
 def test_missing_openai_key_selects_local_only(monkeypatch, tmp_path):
@@ -212,6 +227,152 @@ def test_timestamp_bearing_domain_records_reject_naive_datetimes():
         )
 
 
+@pytest.mark.parametrize("value", ["NaN", "Infinity", "-Infinity"])
+@pytest.mark.parametrize(
+    ("record", "field_name"),
+    [
+        (
+            PortfolioSnapshot(
+                snapshot_id="snapshot-1",
+                as_of=datetime(2026, 8, 24, tzinfo=timezone.utc),
+                base_currency="USD",
+                nav=Decimal("4500.00"),
+                cash=Decimal("500.00"),
+                is_stale=False,
+            ),
+            "nav",
+        ),
+        (
+            PortfolioSnapshot(
+                snapshot_id="snapshot-1",
+                as_of=datetime(2026, 8, 24, tzinfo=timezone.utc),
+                base_currency="USD",
+                nav=Decimal("4500.00"),
+                cash=Decimal("500.00"),
+                is_stale=False,
+            ),
+            "cash",
+        ),
+        (
+            Position(
+                position_id="position-1",
+                snapshot_id="snapshot-1",
+                symbol="NVDA",
+                quantity=Decimal("2.5"),
+                market_value=Decimal("450.00"),
+                currency="USD",
+                cost_basis=Decimal("300.00"),
+            ),
+            "quantity",
+        ),
+        (
+            Position(
+                position_id="position-1",
+                snapshot_id="snapshot-1",
+                symbol="NVDA",
+                quantity=Decimal("2.5"),
+                market_value=Decimal("450.00"),
+                currency="USD",
+                cost_basis=Decimal("300.00"),
+            ),
+            "market_value",
+        ),
+        (
+            Position(
+                position_id="position-1",
+                snapshot_id="snapshot-1",
+                symbol="NVDA",
+                quantity=Decimal("2.5"),
+                market_value=Decimal("450.00"),
+                currency="USD",
+                cost_basis=Decimal("300.00"),
+            ),
+            "cost_basis",
+        ),
+        (
+            EvidenceClaim(
+                claim_id="claim-1",
+                entity_id=None,
+                kind=ClaimKind.FACT,
+                text="Revenue grew 20%.",
+                as_of=datetime(2026, 8, 24, tzinfo=timezone.utc),
+                confidence=Decimal("0.90"),
+                status="active",
+            ),
+            "confidence",
+        ),
+        (
+            ModelUsage(
+                usage_id="usage-1",
+                run_id="run-1",
+                provider="openai",
+                model="example-model",
+                input_tokens=100,
+                output_tokens=50,
+                cost_usd=Decimal("0.02"),
+                recorded_at=datetime(2026, 8, 24, tzinfo=timezone.utc),
+            ),
+            "cost_usd",
+        ),
+    ],
+)
+def test_domain_decimal_fields_reject_non_finite_values(record, field_name, value):
+    with pytest.raises(
+        ValueError,
+        match=rf"{type(record).__name__}.{field_name} must be finite$",
+    ):
+        replace(record, **{field_name: Decimal(value)})
+
+
+@pytest.mark.parametrize("confidence", ["-0.01", "1.01"])
+def test_evidence_claim_confidence_must_be_between_zero_and_one(confidence):
+    with pytest.raises(
+        ValueError, match="EvidenceClaim.confidence must be between 0 and 1"
+    ):
+        EvidenceClaim(
+            claim_id="claim-1",
+            entity_id=None,
+            kind=ClaimKind.FACT,
+            text="Revenue grew 20%.",
+            as_of=datetime(2026, 8, 24, tzinfo=timezone.utc),
+            confidence=Decimal(confidence),
+            status="active",
+        )
+
+
+def test_model_usage_cost_must_be_non_negative():
+    with pytest.raises(ValueError, match="ModelUsage.cost_usd must be non-negative"):
+        ModelUsage(
+            usage_id="usage-1",
+            run_id="run-1",
+            provider="openai",
+            model="example-model",
+            input_tokens=100,
+            output_tokens=50,
+            cost_usd=Decimal("-0.01"),
+            recorded_at=datetime(2026, 8, 24, tzinfo=timezone.utc),
+        )
+
+
+@pytest.mark.parametrize("field_name", ["input_tokens", "output_tokens"])
+def test_model_usage_token_counts_must_be_non_negative(field_name):
+    usage = ModelUsage(
+        usage_id="usage-1",
+        run_id="run-1",
+        provider="openai",
+        model="example-model",
+        input_tokens=100,
+        output_tokens=50,
+        cost_usd=Decimal("0.02"),
+        recorded_at=datetime(2026, 8, 24, tzinfo=timezone.utc),
+    )
+
+    with pytest.raises(
+        ValueError, match=rf"ModelUsage.{field_name} must be non-negative$"
+    ):
+        replace(usage, **{field_name: -1})
+
+
 def test_direct_secret_value_is_stripped(monkeypatch):
     monkeypatch.delenv("OPENAI_API_KEY_FILE", raising=False)
     monkeypatch.setenv("OPENAI_API_KEY", "  environment-key\n")
@@ -220,6 +381,83 @@ def test_direct_secret_value_is_stripped(monkeypatch):
 
     assert config.openai_api_key == "environment-key"
     assert config.inference_mode is InferenceMode.EXTERNAL
+
+
+def test_research_config_repr_does_not_expose_openai_key(monkeypatch):
+    secret = "sk-exact-secret-that-must-not-leak"
+    monkeypatch.setenv("OPENAI_API_KEY", secret)
+
+    config = ResearchConfig.from_env()
+
+    assert secret not in repr(config)
+
+
+@pytest.mark.parametrize("field_name", ["budget_soft_usd", "budget_hard_usd"])
+def test_direct_config_rejects_non_decimal_budgets(field_name):
+    with pytest.raises(
+        ResearchConfigError, match=rf"{field_name} must be Decimal$"
+    ):
+        replace(valid_research_config(), **{field_name: "4.00"})
+
+
+@pytest.mark.parametrize("field_name", ["budget_soft_usd", "budget_hard_usd"])
+@pytest.mark.parametrize("value", ["NaN", "Infinity", "-Infinity"])
+def test_direct_config_rejects_non_finite_budgets(field_name, value):
+    with pytest.raises(
+        ResearchConfigError, match=rf"{field_name} must be finite$"
+    ):
+        replace(valid_research_config(), **{field_name: Decimal(value)})
+
+
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    [
+        (
+            {"budget_soft_usd": Decimal("-0.01")},
+            "Model budget limits must be non-negative",
+        ),
+        (
+            {
+                "budget_soft_usd": Decimal("5.00"),
+                "budget_hard_usd": Decimal("5.00"),
+            },
+            "MODEL_BUDGET_SOFT_USD must be less than MODEL_BUDGET_HARD_USD",
+        ),
+        (
+            {"budget_hard_usd": Decimal("5.01")},
+            "MODEL_BUDGET_HARD_USD must not exceed 5.00",
+        ),
+    ],
+)
+def test_direct_config_enforces_budget_safety_bounds(changes, message):
+    with pytest.raises(ResearchConfigError, match=message):
+        replace(valid_research_config(), **changes)
+
+
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    [
+        (
+            {"inference_mode": InferenceMode.EXTERNAL},
+            "inference_mode must be local_only when OPENAI_API_KEY is absent",
+        ),
+        (
+            {"openai_api_key": "configured-key"},
+            "inference_mode must be external when OPENAI_API_KEY is configured",
+        ),
+        (
+            {"openai_api_key": " "},
+            "openai_api_key must be non-empty when provided",
+        ),
+        (
+            {"inference_mode": "local_only"},
+            "inference_mode must be InferenceMode",
+        ),
+    ],
+)
+def test_direct_config_enforces_inference_routing(changes, message):
+    with pytest.raises(ResearchConfigError, match=message):
+        replace(valid_research_config(), **changes)
 
 
 def test_unreadable_secret_file_has_clear_error(monkeypatch, tmp_path):
@@ -285,3 +523,34 @@ def test_research_paths_are_derived_without_creating_them(monkeypatch, tmp_path)
     assert config.report_dir == data_dir / "reports"
     assert config.backup_dir == data_dir / "backups"
     assert not data_dir.exists()
+
+
+@pytest.mark.parametrize(
+    ("env_name", "field_name", "default"),
+    [
+        ("RESEARCH_DATA_DIR", "data_dir", Path("research_data")),
+        ("OLLAMA_BASE_URL", "ollama_base_url", "http://localhost:11434"),
+        ("OLLAMA_RESEARCH_MODEL", "ollama_model", "llama3.1:8b"),
+    ],
+)
+def test_blank_text_environment_settings_use_defaults(
+    monkeypatch, env_name, field_name, default
+):
+    monkeypatch.setenv(env_name, " \t ")
+
+    config = ResearchConfig.from_env()
+
+    assert getattr(config, field_name) == default
+
+
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    [
+        ({"data_dir": Path(" ")}, "data_dir must be a non-empty path"),
+        ({"ollama_base_url": " \t"}, "ollama_base_url must be non-empty"),
+        ({"ollama_model": " \t"}, "ollama_model must be non-empty"),
+    ],
+)
+def test_direct_config_rejects_blank_required_settings(changes, message):
+    with pytest.raises(ResearchConfigError, match=message):
+        replace(valid_research_config(), **changes)
