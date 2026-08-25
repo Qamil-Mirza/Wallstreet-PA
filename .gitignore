@@ -3,6 +3,7 @@
 venv/
 .vscode/
 .idea/
+.worktrees/
 .pytest_cache/
 __pycache__/
 
