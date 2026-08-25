@@ -253,12 +253,16 @@ CREATE TABLE model_usage (
 
 CREATE TABLE budget_reservations (
     reservation_id TEXT PRIMARY KEY,
-    task_id TEXT NOT NULL,
+    owner_key TEXT NOT NULL CHECK (length(trim(owner_key)) > 0),
+    task_id TEXT,
     run_id TEXT,
     amount_usd TEXT NOT NULL CHECK (typeof(amount_usd) = 'text'),
     state TEXT NOT NULL
-        CHECK (state IN ('reserved', 'consumed', 'released', 'expired')),
-    reserved_at TEXT NOT NULL,
+        CHECK (state IN (
+            'reserved', 'consumed', 'released', 'expired',
+            'usage_unknown', 'reconciled'
+        )),
+    created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     expires_at TEXT,
     metadata_json TEXT,
@@ -273,5 +277,81 @@ CREATE INDEX idx_securities_symbol ON securities(symbol);
 CREATE INDEX idx_claims_status ON claims(status);
 CREATE INDEX idx_research_tasks_state ON research_tasks(state);
 CREATE INDEX idx_positions_symbol ON positions(symbol);
+CREATE INDEX idx_positions_snapshot_id ON positions(snapshot_id);
+CREATE INDEX idx_positions_security_id ON positions(security_id);
+CREATE INDEX idx_securities_entity_id ON securities(entity_id);
+CREATE INDEX idx_relationships_source_entity_id
+    ON relationships(source_entity_id);
+CREATE INDEX idx_relationships_target_entity_id
+    ON relationships(target_entity_id);
+CREATE INDEX idx_document_passages_document_id
+    ON document_passages(document_id);
 CREATE INDEX idx_industry_theses_key_version
     ON industry_theses(industry_key, version);
+CREATE INDEX idx_claims_entity_as_of ON claims(entity_id, as_of);
+CREATE INDEX idx_claim_evidence_passage_id ON claim_evidence(passage_id);
+CREATE INDEX idx_thesis_evidence_passage_id ON thesis_evidence(passage_id);
+CREATE INDEX idx_recommendations_entity_id ON recommendations(entity_id);
+CREATE INDEX idx_recommendations_security_id ON recommendations(security_id);
+CREATE INDEX idx_research_tasks_parent_task_id
+    ON research_tasks(parent_task_id);
+CREATE INDEX idx_agent_runs_task_id ON agent_runs(task_id);
+CREATE INDEX idx_reports_created_by_run_id ON reports(created_by_run_id);
+CREATE INDEX idx_model_usage_run_id ON model_usage(run_id);
+CREATE INDEX idx_model_usage_recorded_at ON model_usage(recorded_at);
+CREATE INDEX idx_budget_reservations_owner_key
+    ON budget_reservations(owner_key);
+CREATE INDEX idx_budget_reservations_task_id ON budget_reservations(task_id);
+CREATE INDEX idx_budget_reservations_run_id ON budget_reservations(run_id);
+CREATE INDEX idx_budget_reservations_state_created_at
+    ON budget_reservations(state, created_at);
+
+CREATE TRIGGER claims_immutable_fields
+BEFORE UPDATE OF claim_id, entity_id, kind, text, as_of, confidence, created_at
+ON claims
+BEGIN
+    SELECT RAISE(ABORT, 'claim immutable fields cannot be updated');
+END;
+
+CREATE TRIGGER claims_no_delete
+BEFORE DELETE ON claims
+BEGIN
+    SELECT RAISE(ABORT, 'claims cannot be deleted');
+END;
+
+CREATE TRIGGER claim_evidence_no_update
+BEFORE UPDATE ON claim_evidence
+BEGIN
+    SELECT RAISE(ABORT, 'claim evidence links are immutable');
+END;
+
+CREATE TRIGGER claim_evidence_no_delete
+BEFORE DELETE ON claim_evidence
+BEGIN
+    SELECT RAISE(ABORT, 'claim evidence links are immutable');
+END;
+
+CREATE TRIGGER industry_theses_immutable_fields
+BEFORE UPDATE OF thesis_id, industry_key, version, thesis_text, created_at
+ON industry_theses
+BEGIN
+    SELECT RAISE(ABORT, 'industry thesis revisions are immutable');
+END;
+
+CREATE TRIGGER industry_theses_no_delete
+BEFORE DELETE ON industry_theses
+BEGIN
+    SELECT RAISE(ABORT, 'industry thesis revisions cannot be deleted');
+END;
+
+CREATE TRIGGER thesis_evidence_no_update
+BEFORE UPDATE ON thesis_evidence
+BEGIN
+    SELECT RAISE(ABORT, 'thesis evidence links are immutable');
+END;
+
+CREATE TRIGGER thesis_evidence_no_delete
+BEFORE DELETE ON thesis_evidence
+BEGIN
+    SELECT RAISE(ABORT, 'thesis evidence links are immutable');
+END;

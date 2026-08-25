@@ -4,6 +4,8 @@ import hashlib
 import json
 import re
 import sqlite3
+from importlib import resources
+from importlib.resources.abc import Traversable
 from collections.abc import Generator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -15,6 +17,29 @@ from .models import ClaimKind, EvidenceClaim, SourceDocument
 
 
 _MIGRATION_NAME = re.compile(r"^(?P<version>[0-9]+)_.+\.sql$")
+
+
+class ResearchStoreError(RuntimeError):
+    """Raised when the research store cannot safely initialize."""
+
+
+def _has_sql_content(script: str) -> bool:
+    """Return whether text contains anything other than whitespace/comments."""
+    index = 0
+    while index < len(script):
+        if script[index].isspace():
+            index += 1
+            continue
+        if script.startswith("--", index):
+            newline = script.find("\n", index + 2)
+            index = len(script) if newline < 0 else newline + 1
+            continue
+        if script.startswith("/*", index):
+            closing = script.find("*/", index + 2)
+            index = len(script) if closing < 0 else closing + 2
+            continue
+        return True
+    return False
 
 
 def _utc_text(value: datetime, field_name: str = "store datetime") -> str:
@@ -96,12 +121,18 @@ class ResearchStore:
         finally:
             connection.close()
 
-    def _migration_files(self) -> tuple[Path, ...]:
-        migration_dir = Path(__file__).with_name("migrations")
-        return tuple(sorted(migration_dir.glob("[0-9]*_*.sql")))
+    def _migration_files(self) -> tuple[Traversable, ...]:
+        migration_dir = resources.files("news_bot.research").joinpath("migrations")
+        if not migration_dir.is_dir():
+            return ()
+        return tuple(
+            child
+            for child in migration_dir.iterdir()
+            if child.is_file() and child.name.endswith(".sql")
+        )
 
     @staticmethod
-    def _migration_version(path: Path) -> int:
+    def _migration_version(path: Traversable) -> int:
         match = _MIGRATION_NAME.fullmatch(path.name)
         if match is None:
             raise ValueError(f"Invalid migration filename: {path.name}")
@@ -112,23 +143,29 @@ class ResearchStore:
         connection: sqlite3.Connection, script: str
     ) -> None:
         """Execute a script without sqlite3.executescript's implicit COMMIT."""
-        statement_lines: list[str] = []
-        for line in script.splitlines(keepends=True):
-            statement_lines.append(line)
-            statement = "".join(statement_lines)
+        statement_parts: list[str] = []
+        for character in script:
+            statement_parts.append(character)
+            statement = "".join(statement_parts)
             if sqlite3.complete_statement(statement):
-                if statement.strip():
+                if _has_sql_content(statement):
                     connection.execute(statement)
-                statement_lines.clear()
-        if "".join(statement_lines).strip():
+                statement_parts.clear()
+        if _has_sql_content("".join(statement_parts)):
             raise sqlite3.OperationalError("incomplete SQL migration statement")
 
     def migrate(self) -> None:
         """Apply each packaged numbered migration exactly once, in order."""
         migration_files = self._migration_files()
-        versions = [self._migration_version(path) for path in migration_files]
+        if not migration_files:
+            raise ResearchStoreError("No research store migrations found")
+        migrations = [
+            (self._migration_version(path), path) for path in migration_files
+        ]
+        versions = [version for version, _ in migrations]
         if len(versions) != len(set(versions)):
             raise ValueError("Migration versions must be unique")
+        migrations.sort(key=lambda item: item[0])
 
         with self.transaction() as connection:
             connection.execute(
@@ -138,7 +175,7 @@ class ResearchStore:
                 "applied_at TEXT NOT NULL)"
             )
 
-        for path, version in zip(migration_files, versions, strict=True):
+        for version, path in migrations:
             with self.transaction() as connection:
                 applied = connection.execute(
                     "SELECT name FROM schema_migrations WHERE version = ?",
@@ -278,6 +315,21 @@ class ResearchStore:
             confidence=Decimal(row[5]),
             status=row[6],
         )
+
+    def update_claim_status(self, claim_id: str, status: str) -> None:
+        """Apply an intentional status transition without rewriting claim content."""
+        allowed_statuses = {"active", "contradicted", "superseded"}
+        if status not in allowed_statuses:
+            raise ValueError(
+                "claim status must be active, contradicted, or superseded"
+            )
+        with self.transaction() as connection:
+            cursor = connection.execute(
+                "UPDATE claims SET status = ? WHERE claim_id = ?",
+                (status, claim_id),
+            )
+            if cursor.rowcount != 1:
+                raise KeyError(f"Unknown claim_id: {claim_id}")
 
     def append_thesis_revision(
         self,

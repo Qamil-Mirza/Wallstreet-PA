@@ -26,6 +26,12 @@ dev = [
     "pytest-cov>=4.1.0",
 ]
 
+[tool.setuptools.packages.find]
+include = ["news_bot*"]
+
+[tool.setuptools.package-data]
+"news_bot.research" = ["migrations/*.sql"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]

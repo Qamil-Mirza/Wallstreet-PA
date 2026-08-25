@@ -1,6 +1,10 @@
 """Integration tests for the durable SQLite research store."""
 
 import sqlite3
+import shutil
+import subprocess
+import sys
+import zipfile
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -63,6 +67,11 @@ def seed_passage(store: ResearchStore, passage_id: str = "passage-1") -> None:
     )
 
 
+def seed_claim_with_evidence(store: ResearchStore) -> None:
+    seed_passage(store)
+    store.insert_claim(make_claim("claim-1"), evidence_ids=["passage-1"])
+
+
 def test_store_migrates_empty_database(tmp_path):
     store = ResearchStore(tmp_path / "research.db")
     store.migrate()
@@ -83,6 +92,70 @@ def test_migration_is_idempotent_and_recorded_once(tmp_path):
     assert len(rows) == 1
     assert rows[0][0:2] == (1, "001_initial.sql")
     assert rows[0][2].endswith("Z")
+
+
+def test_store_fails_closed_when_no_migrations_are_available(tmp_path, monkeypatch):
+    store = ResearchStore(tmp_path / "research.db")
+    monkeypatch.setattr(store, "_migration_files", lambda: ())
+
+    with pytest.raises(RuntimeError, match="No research store migrations found"):
+        store.migrate()
+
+    assert not store.database_path.exists()
+
+
+def test_built_wheel_contains_discoverable_initial_migration(tmp_path):
+    project_root = Path(__file__).resolve().parents[2]
+    source_copy = tmp_path / "source"
+    wheel_dir = tmp_path / "wheelhouse"
+    shutil.copytree(
+        project_root,
+        source_copy,
+        ignore=shutil.ignore_patterns(
+            ".git", ".worktrees", "venv", "__pycache__", ".pytest_cache", "*.pyc"
+        ),
+    )
+    wheel_dir.mkdir()
+
+    build = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "wheel",
+            "--no-deps",
+            "--no-build-isolation",
+            "--wheel-dir",
+            str(wheel_dir),
+            str(source_copy),
+        ],
+        cwd=tmp_path,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert build.returncode == 0, build.stdout + build.stderr
+    wheels = list(wheel_dir.glob("*.whl"))
+    assert len(wheels) == 1
+    wheel = wheels[0]
+    migration_name = "news_bot/research/migrations/001_initial.sql"
+    with zipfile.ZipFile(wheel) as archive:
+        assert migration_name in archive.namelist()
+
+    resource_probe = (
+        "import sys; from importlib import resources; "
+        f"sys.path.insert(0, {str(wheel)!r}); "
+        "migration = resources.files('news_bot.research').joinpath("
+        "'migrations', '001_initial.sql'); "
+        "assert 'CREATE TABLE portfolio_snapshots' in migration.read_text('utf-8')"
+    )
+    subprocess.run(
+        [sys.executable, "-I", "-c", resource_probe],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
 
 
 def test_failed_multi_statement_migration_is_atomic(tmp_path, monkeypatch):
@@ -107,6 +180,137 @@ def test_failed_multi_statement_migration_is_atomic(tmp_path, monkeypatch):
             "SELECT version FROM schema_migrations ORDER BY version"
         ).fetchall()
     assert versions == [(1,)]
+
+
+def test_migrations_are_sorted_by_numeric_version(tmp_path, monkeypatch):
+    store = ResearchStore(tmp_path / "research.db")
+    migration_two = tmp_path / "2_create.sql"
+    migration_ten = tmp_path / "10_insert.sql"
+    migration_two.write_text(
+        "CREATE TABLE ordered_migrations (value TEXT);", encoding="utf-8"
+    )
+    migration_ten.write_text(
+        "INSERT INTO ordered_migrations (value) VALUES ('ten');", encoding="utf-8"
+    )
+    monkeypatch.setattr(
+        store, "_migration_files", lambda: (migration_ten, migration_two)
+    )
+
+    store.migrate()
+
+    with store.connect() as connection:
+        values = connection.execute(
+            "SELECT value FROM ordered_migrations"
+        ).fetchall()
+        versions = connection.execute(
+            "SELECT version FROM schema_migrations ORDER BY version"
+        ).fetchall()
+    assert values == [("ten",)]
+    assert versions == [(2,), (10,)]
+
+
+def test_duplicate_numeric_migration_versions_are_rejected(tmp_path, monkeypatch):
+    store = ResearchStore(tmp_path / "research.db")
+    first = tmp_path / "2_first.sql"
+    duplicate = tmp_path / "02_duplicate.sql"
+    first.write_text("SELECT 1;", encoding="utf-8")
+    duplicate.write_text("SELECT 2;", encoding="utf-8")
+    monkeypatch.setattr(store, "_migration_files", lambda: (first, duplicate))
+
+    with pytest.raises(ValueError, match="Migration versions must be unique"):
+        store.migrate()
+
+
+@pytest.mark.parametrize("filename", ["migration_2.sql", "2.sql", "2_bad.txt"])
+def test_migration_filenames_require_strict_numeric_prefix(
+    tmp_path, monkeypatch, filename
+):
+    store = ResearchStore(tmp_path / "research.db")
+    invalid = tmp_path / filename
+    invalid.write_text("SELECT 1;", encoding="utf-8")
+    monkeypatch.setattr(store, "_migration_files", lambda: (invalid,))
+
+    with pytest.raises(ValueError, match=rf"Invalid migration filename: {filename}"):
+        store.migrate()
+
+
+def test_migration_parser_splits_multiple_statements_on_one_line(tmp_path):
+    store = ResearchStore(tmp_path / "research.db")
+    with store.transaction() as connection:
+        store._execute_script_atomically(
+            connection,
+            "CREATE TABLE first_table (id INTEGER); "
+            "CREATE TABLE second_table (id INTEGER);",
+        )
+
+    assert {"first_table", "second_table"} <= store.table_names()
+
+
+def test_migration_parser_supports_multiline_trigger_bodies(tmp_path):
+    store = ResearchStore(tmp_path / "research.db")
+    script = """
+    CREATE TABLE source_rows (id INTEGER PRIMARY KEY, value TEXT);
+    CREATE TABLE audit_rows (source_id INTEGER, old_value TEXT, new_value TEXT);
+    CREATE TRIGGER audit_source_update
+    AFTER UPDATE ON source_rows
+    BEGIN
+        INSERT INTO audit_rows (source_id, old_value, new_value)
+        VALUES (OLD.id, OLD.value, NEW.value);
+        UPDATE audit_rows SET new_value = upper(new_value) WHERE source_id = NEW.id;
+    END;
+    INSERT INTO source_rows (id, value) VALUES (1, 'before');
+    UPDATE source_rows SET value = 'after' WHERE id = 1;
+    """
+
+    with store.transaction() as connection:
+        store._execute_script_atomically(connection, script)
+
+    with store.connect() as connection:
+        audit = connection.execute(
+            "SELECT source_id, old_value, new_value FROM audit_rows"
+        ).fetchall()
+    assert audit == [(1, "before", "AFTER")]
+
+
+@pytest.mark.parametrize(
+    "script",
+    [
+        "",
+        "   \n\t",
+        "-- comment only, with a semicolon;\n",
+        "/* block comment only; */",
+    ],
+)
+def test_migration_parser_accepts_blank_or_comment_only_scripts(tmp_path, script):
+    store = ResearchStore(tmp_path / "research.db")
+
+    with store.transaction() as connection:
+        store._execute_script_atomically(connection, script)
+
+
+def test_migration_parser_accepts_trailing_comments(tmp_path):
+    store = ResearchStore(tmp_path / "research.db")
+    with store.transaction() as connection:
+        store._execute_script_atomically(
+            connection,
+            "CREATE TABLE before_comment (id INTEGER);\n"
+            "-- migration explanation without a final semicolon\n",
+        )
+
+    assert "before_comment" in store.table_names()
+
+
+def test_one_line_migration_failure_rolls_back_all_statements(tmp_path):
+    store = ResearchStore(tmp_path / "research.db")
+    with pytest.raises(sqlite3.Error):
+        with store.transaction() as connection:
+            store._execute_script_atomically(
+                connection,
+                "CREATE TABLE rolled_back (id INTEGER); "
+                "INSERT INTO missing_table (id) VALUES (1);",
+            )
+
+    assert "rolled_back" not in store.table_names()
 
 
 def test_connections_enable_required_sqlite_pragmas(tmp_path):
@@ -181,6 +385,78 @@ def test_schema_uses_text_for_decimal_values_and_required_indexes(tmp_path):
     } <= indexes
 
 
+def test_budget_reservation_supports_fresh_owner_and_reconciliation_states(tmp_path):
+    store = make_migrated_store(tmp_path)
+    created_at = "2026-08-24T00:00:00.000000Z"
+
+    with store.transaction() as connection:
+        connection.execute(
+            "INSERT INTO budget_reservations ("
+            "reservation_id, owner_key, amount_usd, state, created_at, updated_at"
+            ") VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                "reservation-1",
+                "fresh-run-1",
+                "1.2500",
+                "reserved",
+                created_at,
+                created_at,
+            ),
+        )
+        connection.execute(
+            "UPDATE budget_reservations SET state = ?, updated_at = ? "
+            "WHERE reservation_id = ?",
+            ("usage_unknown", "2026-08-24T01:00:00.000000Z", "reservation-1"),
+        )
+        connection.execute(
+            "UPDATE budget_reservations SET state = ?, updated_at = ? "
+            "WHERE reservation_id = ?",
+            ("reconciled", "2026-08-24T02:00:00.000000Z", "reservation-1"),
+        )
+
+    with store.connect() as connection:
+        stored = connection.execute(
+            "SELECT owner_key, task_id, run_id, amount_usd, state "
+            "FROM budget_reservations WHERE reservation_id = ?",
+            ("reservation-1",),
+        ).fetchone()
+    assert stored == ("fresh-run-1", None, None, "1.2500", "reconciled")
+
+
+def test_schema_indexes_child_foreign_keys_and_research_workflows(tmp_path):
+    store = make_migrated_store(tmp_path)
+    with store.connect() as connection:
+        indexes = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index'"
+            )
+        }
+
+    assert {
+        "idx_positions_snapshot_id",
+        "idx_positions_security_id",
+        "idx_securities_entity_id",
+        "idx_relationships_source_entity_id",
+        "idx_relationships_target_entity_id",
+        "idx_document_passages_document_id",
+        "idx_claims_entity_as_of",
+        "idx_claim_evidence_passage_id",
+        "idx_thesis_evidence_passage_id",
+        "idx_recommendations_entity_id",
+        "idx_recommendations_security_id",
+        "idx_research_tasks_parent_task_id",
+        "idx_agent_runs_task_id",
+        "idx_reports_created_by_run_id",
+        "idx_model_usage_run_id",
+        "idx_model_usage_recorded_at",
+        "idx_budget_reservations_owner_key",
+        "idx_budget_reservations_task_id",
+        "idx_budget_reservations_run_id",
+        "idx_budget_reservations_state_created_at",
+    } <= indexes
+
+
 def test_claim_requires_evidence(tmp_path):
     store = make_migrated_store(tmp_path)
     with pytest.raises(IntegrityError):
@@ -245,6 +521,55 @@ def test_claim_repository_rejects_naive_datetime_atomically(tmp_path):
     assert store.get_claim("claim-1") is None
 
 
+@pytest.mark.parametrize(
+    ("statement", "parameters", "message"),
+    [
+        (
+            "UPDATE claims SET text = ? WHERE claim_id = ?",
+            ("rewritten", "claim-1"),
+            "claim immutable fields cannot be updated",
+        ),
+        (
+            "DELETE FROM claims WHERE claim_id = ?",
+            ("claim-1",),
+            "claims cannot be deleted",
+        ),
+        (
+            "UPDATE claim_evidence SET stance = ? WHERE claim_id = ?",
+            ("contradicts", "claim-1"),
+            "claim evidence links are immutable",
+        ),
+        (
+            "DELETE FROM claim_evidence WHERE claim_id = ?",
+            ("claim-1",),
+            "claim evidence links are immutable",
+        ),
+    ],
+)
+def test_claim_history_rejects_direct_mutation(
+    tmp_path, statement, parameters, message
+):
+    store = make_migrated_store(tmp_path)
+    seed_claim_with_evidence(store)
+
+    with pytest.raises(IntegrityError, match=message):
+        with store.transaction() as connection:
+            connection.execute(statement, parameters)
+
+    assert store.get_claim("claim-1") == make_claim("claim-1")
+
+
+def test_claim_status_transition_uses_focused_store_method(tmp_path):
+    store = make_migrated_store(tmp_path)
+    seed_claim_with_evidence(store)
+
+    store.update_claim_status("claim-1", "contradicted")
+
+    assert store.get_claim("claim-1") == replace(
+        make_claim("claim-1"), status="contradicted"
+    )
+
+
 def test_source_content_hash_is_unique(tmp_path):
     store = make_migrated_store(tmp_path)
     store.insert_source_document(make_document())
@@ -286,3 +611,44 @@ def test_thesis_missing_passage_does_not_create_revision(tmp_path):
         store.append_thesis_revision("semiconductors", "base thesis", ["missing"])
 
     assert store.list_thesis_revisions("semiconductors") == []
+
+
+@pytest.mark.parametrize(
+    ("statement", "parameters", "message"),
+    [
+        (
+            "UPDATE industry_theses SET thesis_text = ? WHERE thesis_id = ?",
+            ("rewritten", 1),
+            "industry thesis revisions are immutable",
+        ),
+        (
+            "DELETE FROM industry_theses WHERE thesis_id = ?",
+            (1,),
+            "industry thesis revisions cannot be deleted",
+        ),
+        (
+            "UPDATE thesis_evidence SET ordinal = ? WHERE thesis_id = ?",
+            (2, 1),
+            "thesis evidence links are immutable",
+        ),
+        (
+            "DELETE FROM thesis_evidence WHERE thesis_id = ?",
+            (1,),
+            "thesis evidence links are immutable",
+        ),
+    ],
+)
+def test_thesis_history_rejects_direct_mutation(
+    tmp_path, statement, parameters, message
+):
+    store = make_migrated_store(tmp_path)
+    seed_passage(store)
+    revision = store.append_thesis_revision(
+        "semiconductors", "base thesis", ["passage-1"]
+    )
+
+    with pytest.raises(IntegrityError, match=message):
+        with store.transaction() as connection:
+            connection.execute(statement, parameters)
+
+    assert store.list_thesis_revisions("semiconductors") == [revision]
