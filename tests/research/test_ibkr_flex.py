@@ -9,6 +9,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from threading import Barrier
+from urllib.parse import urlsplit
 
 import pytest
 import requests
@@ -377,7 +378,12 @@ def test_send_and_poll_use_get_params_headers_and_timeout(requests_mock, flex_co
     assert send.stream is True
     assert statement.stream is True
     assert all(response.closed for response in requests_mock.responses)
-    assert TOKEN not in send.url and TOKEN not in statement.url
+    allowed_hosts = set(flex_config.allowed_statement_hosts)
+    assert all(
+        urlsplit(request.url).hostname in allowed_hosts
+        for request in requests_mock.request_history
+        if request.params.get("t") == TOKEN
+    )
 
 
 @pytest.mark.parametrize("content_length", ["-1", "not-an-integer", "999"])
@@ -492,6 +498,77 @@ def test_http_library_debug_logs_redact_flex_query_values(caplog, flex_config):
     assert "logging-secret%252Ftoken" not in caplog.text
     assert query_marker not in caplog.text
     assert "t=%5BREDACTED%5D" in caplog.text or "t=[REDACTED]" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "logger_name",
+    [
+        "urllib3.util.retry",
+        "urllib3.poolmanager",
+        "urllib3.future.transport.detail",
+        "requests.packages.urllib3.connectionpool",
+        "requests.sessions",
+    ],
+)
+def test_all_http_library_descendant_logs_are_redacted(
+    caplog, flex_config, logger_name
+):
+    FlexClient(flex_config)
+    marker = "descendant-log-secret-marker"
+    prepared = requests.Request(
+        "GET",
+        flex_config.send_url,
+        params={"t": marker, "q": f"{marker}-query", "v": "3"},
+    ).prepare()
+
+    with caplog.at_level(logging.DEBUG, logger=logger_name):
+        logging.getLogger(logger_name).debug(
+            "request data %s",
+            {"nested": [{"target": prepared.url}]},
+        )
+
+    records = [record for record in caplog.records if record.name == logger_name]
+    rendered = caplog.text + "".join(record.getMessage() for record in records)
+    assert marker not in rendered
+    assert "[REDACTED]" in rendered
+
+
+def test_http_log_redaction_install_is_idempotent(flex_config):
+    FlexClient(flex_config)
+    installed = logging.getLogRecordFactory()
+    FlexClient(flex_config)
+    assert logging.getLogRecordFactory() is installed
+
+
+def test_http_log_redaction_preserves_custom_factory_and_unrelated_logs(
+    caplog, flex_config, monkeypatch
+):
+    previous = logging.getLogRecordFactory()
+
+    def custom_factory(*args, **kwargs):
+        record = previous(*args, **kwargs)
+        record.custom_factory_attribute = "preserved"
+        return record
+
+    monkeypatch.setattr(logging, "_logRecordFactory", custom_factory)
+    FlexClient(flex_config)
+    marker = "unrelated-app-query?t=must-remain&q=must-remain"
+    with caplog.at_level(logging.INFO):
+        logging.getLogger("portfolio.application").info(marker)
+        logging.getLogger("urllib3.any.child").info(
+            "https://example.test/?t=secret&q=secret"
+        )
+
+    app_record = next(
+        record for record in caplog.records if record.name == "portfolio.application"
+    )
+    http_record = next(
+        record for record in caplog.records if record.name == "urllib3.any.child"
+    )
+    assert app_record.getMessage() == marker
+    assert app_record.custom_factory_attribute == "preserved"
+    assert http_record.custom_factory_attribute == "preserved"
+    assert "secret" not in http_record.getMessage()
 
 
 @pytest.mark.parametrize(
@@ -870,6 +947,33 @@ def test_report_date_drives_source_freshness_not_generation_time():
     assert portfolio_is_stale(result.snapshot.as_of, utc(2026, 8, 26), max_hours=24)
 
 
+def test_parse_without_evaluation_context_has_no_freshness_result():
+    result = parse_statement(fixture("ibkr_statement.xml"), account_salt=ACCOUNT_SALT)
+    assert result.freshness is None
+    assert result.snapshot.is_stale is None
+
+
+def test_sync_uses_clock_to_evaluate_source_freshness(
+    requests_mock, flex_config
+):
+    requests_mock.get(flex_config.send_url, text=fixture("ibkr_send_success.xml"))
+    statement = fixture("ibkr_statement.xml").replace(
+        'whenGenerated="20260824;120000"',
+        'whenGenerated="20260826;120000"',
+    )
+    requests_mock.get(flex_config.statement_url, text=statement)
+    evaluated_at = utc(2026, 8, 26)
+
+    result = FlexClient(flex_config, clock=lambda: evaluated_at).sync()
+
+    assert result.snapshot.is_stale is None
+    assert result.freshness is not None
+    assert result.freshness.evaluated_at == evaluated_at
+    assert result.freshness.as_of == result.snapshot.as_of
+    assert result.freshness.max_hours == flex_config.max_staleness_hours
+    assert result.freshness.is_stale is True
+
+
 def test_evaluation_clock_does_not_change_snapshot_or_persistence(tmp_path):
     xml = fixture("ibkr_statement.xml")
     before = parse_statement(
@@ -884,12 +988,92 @@ def test_evaluation_clock_does_not_change_snapshot_or_persistence(tmp_path):
         now=utc(2026, 8, 30),
         max_staleness_hours=24,
     )
-    assert before == after
-    assert before.snapshot.is_stale is False
+    assert before.snapshot == after.snapshot
+    assert before.positions == after.positions
+    assert before.generated_at == after.generated_at
+    assert before.freshness is not None
+    assert after.freshness is not None
+    assert before.freshness.is_stale is False
+    assert after.freshness.is_stale is True
+    assert before.snapshot.is_stale is None
 
     store = make_migrated_store(tmp_path)
     store.insert_portfolio_snapshot(before.snapshot, before.positions, before.account_ref)
     store.insert_portfolio_snapshot(after.snapshot, after.positions, after.account_ref)
+    with store.connect() as connection:
+        assert connection.execute(
+            "SELECT is_stale FROM portfolio_snapshots"
+        ).fetchone() == (None,)
+
+
+def test_freshness_context_validation_is_explicit():
+    xml = fixture("ibkr_statement.xml")
+    with pytest.raises(ValueError, match="provided together"):
+        parse_statement(xml, account_salt=ACCOUNT_SALT, now=utc(2026, 8, 24))
+    with pytest.raises(ValueError, match="timezone-aware"):
+        parse_statement(
+            xml,
+            account_salt=ACCOUNT_SALT,
+            now=datetime(2026, 8, 24),
+            max_staleness_hours=24,
+        )
+    with pytest.raises(ValueError, match="positive"):
+        parse_statement(
+            xml,
+            account_salt=ACCOUNT_SALT,
+            now=utc(2026, 8, 24),
+            max_staleness_hours=0,
+        )
+
+
+def test_sync_result_and_freshness_domain_invariants():
+    result = parse_statement(
+        fixture("ibkr_statement.xml"),
+        account_salt=ACCOUNT_SALT,
+        now=utc(2026, 8, 24),
+        max_staleness_hours=24,
+    )
+    assert result.freshness is not None
+    with pytest.raises(ValueError, match="generated_at.*timezone-aware"):
+        replace(result, generated_at=datetime(2026, 8, 24))
+    with pytest.raises(ValueError, match="account_ref"):
+        replace(result, account_ref=ACCOUNT_ID)
+    with pytest.raises(ValueError, match="snapshot_id"):
+        replace(
+            result,
+            positions=(replace(result.positions[0], snapshot_id="other"),),
+        )
+    with pytest.raises(ValueError, match="timezone-aware"):
+        replace(result.freshness, evaluated_at=datetime(2026, 8, 24))
+    with pytest.raises(ValueError, match="as_of"):
+        replace(result.freshness, as_of=utc(2026, 8, 23))
+
+
+def test_portfolio_snapshot_staleness_allows_only_bool_or_none():
+    result = parse_statement(fixture("ibkr_statement.xml"), account_salt=ACCOUNT_SALT)
+    assert result.snapshot.is_stale is None
+    replace(result.snapshot, is_stale=True)
+    replace(result.snapshot, is_stale=False)
+    with pytest.raises(TypeError, match="is_stale"):
+        replace(result.snapshot, is_stale=0)
+
+
+def test_store_schema_and_flex_persistence_keep_unevaluated_staleness_null(
+    tmp_path,
+):
+    store = make_migrated_store(tmp_path)
+    result = parse_statement(fixture("ibkr_statement.xml"), account_salt=ACCOUNT_SALT)
+    store.insert_portfolio_snapshot(result.snapshot, result.positions, result.account_ref)
+
+    with store.connect() as connection:
+        columns = {
+            row[1]: row for row in connection.execute("PRAGMA table_info(portfolio_snapshots)")
+        }
+        stored = connection.execute(
+            "SELECT is_stale FROM portfolio_snapshots"
+        ).fetchone()
+    assert columns["is_stale"][3] == 0
+    assert stored == (None,)
 
 
 def test_multiple_report_dates_select_latest_summary_and_holdings():

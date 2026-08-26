@@ -240,7 +240,7 @@ class ResearchStore:
             snapshot.base_currency,
             _decimal_text(snapshot.nav),
             _decimal_text(snapshot.cash),
-            int(snapshot.is_stale),
+            int(snapshot.is_stale) if snapshot.is_stale is not None else None,
             account_ref,
         )
         security_records = tuple(

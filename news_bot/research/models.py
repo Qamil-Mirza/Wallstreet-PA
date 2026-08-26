@@ -95,12 +95,14 @@ class PortfolioSnapshot:
     base_currency: str
     nav: Decimal
     cash: Decimal
-    is_stale: bool
+    is_stale: bool | None
 
     def __post_init__(self) -> None:
         _require_timezone(type(self).__name__, "as_of", self.as_of)
         _require_decimal(type(self).__name__, "nav", self.nav)
         _require_decimal(type(self).__name__, "cash", self.cash)
+        if self.is_stale is not None and not isinstance(self.is_stale, bool):
+            raise TypeError("PortfolioSnapshot.is_stale must be bool or None")
 
 
 @dataclass(frozen=True)

@@ -7,9 +7,10 @@ import hmac
 import logging
 import math
 import re
+import threading
 import time
 import xml.etree.ElementTree as ET
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
@@ -42,6 +43,8 @@ _XML_DECLARATION = re.compile(
     re.IGNORECASE,
 )
 _QUERY_SECRET = re.compile(r"([?&](?:t|q)=)[^&#\s\"']*")
+_LOG_FACTORY_LOCK = threading.Lock()
+_LOG_FACTORY_MARKER = "_ibkr_flex_query_redaction_factory"
 
 
 class FlexError(RuntimeError):
@@ -166,13 +169,90 @@ class FlexConfig:
 
 
 @dataclass(frozen=True)
+class PortfolioFreshness:
+    """One explicit consumption-time evaluation of source freshness."""
+
+    evaluated_at: datetime
+    as_of: datetime
+    max_hours: int | float | Decimal
+    age: timedelta
+    is_stale: bool
+
+    def __post_init__(self) -> None:
+        for field_name in ("evaluated_at", "as_of"):
+            value = getattr(self, field_name)
+            if (
+                not isinstance(value, datetime)
+                or value.tzinfo is None
+                or value.utcoffset() is None
+            ):
+                raise ValueError(
+                    f"PortfolioFreshness.{field_name} must be timezone-aware"
+                )
+            object.__setattr__(self, field_name, value.astimezone(timezone.utc))
+        if not _positive_finite(self.max_hours):
+            raise ValueError(
+                "PortfolioFreshness.max_hours must be positive and finite"
+            )
+        if not isinstance(self.age, timedelta):
+            raise TypeError("PortfolioFreshness.age must be timedelta")
+        expected_age = self.evaluated_at - self.as_of
+        if self.age != expected_age:
+            raise ValueError(
+                "PortfolioFreshness.age must match evaluated_at minus as_of"
+            )
+        if not isinstance(self.is_stale, bool):
+            raise TypeError("PortfolioFreshness.is_stale must be bool")
+        expected_stale = portfolio_is_stale(
+            self.as_of, self.evaluated_at, self.max_hours
+        )
+        if self.is_stale is not expected_stale:
+            raise ValueError("PortfolioFreshness.is_stale is inconsistent")
+
+
+@dataclass(frozen=True)
 class PortfolioSyncResult:
-    """Immutable normalized output from one Flex statement."""
+    """Immutable normalized output from one single-account Flex statement."""
 
     snapshot: PortfolioSnapshot
     positions: tuple[Position, ...]
     account_ref: str
     generated_at: datetime
+    freshness: PortfolioFreshness | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.generated_at, datetime)
+            or self.generated_at.tzinfo is None
+            or self.generated_at.utcoffset() is None
+        ):
+            raise ValueError(
+                "PortfolioSyncResult.generated_at must be timezone-aware"
+            )
+        object.__setattr__(
+            self, "generated_at", self.generated_at.astimezone(timezone.utc)
+        )
+        if (
+            not isinstance(self.account_ref, str)
+            or re.fullmatch(r"acct_[0-9a-f]{24}", self.account_ref) is None
+        ):
+            raise ValueError("PortfolioSyncResult.account_ref must be a local hash")
+        if not isinstance(self.positions, tuple):
+            raise TypeError("PortfolioSyncResult.positions must be a tuple")
+        if any(
+            position.snapshot_id != self.snapshot.snapshot_id
+            for position in self.positions
+        ):
+            raise ValueError("PortfolioSyncResult position snapshot_id mismatch")
+        if self.freshness is not None:
+            if not isinstance(self.freshness, PortfolioFreshness):
+                raise TypeError(
+                    "PortfolioSyncResult.freshness must be PortfolioFreshness or None"
+                )
+            if self.freshness.as_of != self.snapshot.as_of.astimezone(timezone.utc):
+                raise ValueError(
+                    "PortfolioSyncResult freshness as_of must match snapshot"
+                )
 
 
 def _utf8_bytes(
@@ -563,15 +643,28 @@ def parse_statement(
 
     if (now is None) != (max_staleness_hours is None):
         raise ValueError("now and max_staleness_hours must be provided together")
+    freshness = None
+    if now is not None and max_staleness_hours is not None:
+        is_stale = portfolio_is_stale(as_of, now, max_staleness_hours)
+        evaluated_at = now.astimezone(timezone.utc)
+        freshness = PortfolioFreshness(
+            evaluated_at=evaluated_at,
+            as_of=as_of,
+            max_hours=max_staleness_hours,
+            age=evaluated_at - as_of,
+            is_stale=is_stale,
+        )
     snapshot = PortfolioSnapshot(
         snapshot_id=snapshot_id,
         as_of=as_of,
         base_currency=base_currency,
         nav=nav,
         cash=cash,
-        is_stale=False,
+        is_stale=None,
     )
-    return PortfolioSyncResult(snapshot, tuple(positions), account_ref, generated_at)
+    return PortfolioSyncResult(
+        snapshot, tuple(positions), account_ref, generated_at, freshness
+    )
 
 
 def _utc_now() -> datetime:
@@ -583,30 +676,42 @@ def _redact_log_value(value: object) -> object:
         return _QUERY_SECRET.sub(r"\1[REDACTED]", value)
     if isinstance(value, tuple):
         return tuple(_redact_log_value(item) for item in value)
-    if isinstance(value, dict):
+    if isinstance(value, list):
+        return [_redact_log_value(item) for item in value]
+    if isinstance(value, Mapping):
         return {key: _redact_log_value(item) for key, item in value.items()}
     return value
 
 
-class _FlexQueryLogFilter(logging.Filter):
-    """Redact Flex protocol query values from HTTP-library debug records."""
+def _is_http_library_logger(name: str) -> bool:
+    return (
+        name == "urllib3"
+        or name.startswith("urllib3.")
+        or name == "requests"
+        or name.startswith("requests.")
+    )
 
-    def filter(self, record: logging.LogRecord) -> bool:
-        record.msg = _redact_log_value(record.msg)
-        record.args = _redact_log_value(record.args)
-        return True
+
+def _redacting_record_factory(
+    previous: Callable[..., logging.LogRecord],
+) -> Callable[..., logging.LogRecord]:
+    def factory(*args: object, **kwargs: object) -> logging.LogRecord:
+        record = previous(*args, **kwargs)
+        if _is_http_library_logger(record.name):
+            record.msg = _redact_log_value(record.msg)
+            record.args = _redact_log_value(record.args)
+        return record
+
+    setattr(factory, _LOG_FACTORY_MARKER, True)
+    return factory
 
 
 def _install_http_log_redaction() -> None:
-    for logger_name in (
-        "urllib3.connectionpool",
-        "urllib3",
-        "requests.packages.urllib3.connectionpool",
-        "requests",
-    ):
-        logger = logging.getLogger(logger_name)
-        if not any(isinstance(item, _FlexQueryLogFilter) for item in logger.filters):
-            logger.addFilter(_FlexQueryLogFilter())
+    with _LOG_FACTORY_LOCK:
+        current = logging.getLogRecordFactory()
+        if getattr(current, _LOG_FACTORY_MARKER, False):
+            return
+        logging.setLogRecordFactory(_redacting_record_factory(current))
 
 
 class FlexClient:
@@ -748,6 +853,8 @@ class FlexClient:
         result = parse_statement(
             statement_body,
             account_salt=self.config.account_salt,
+            now=self.clock(),
+            max_staleness_hours=self.config.max_staleness_hours,
             max_bytes=self.config.max_response_bytes,
         )
         if store is not None:
