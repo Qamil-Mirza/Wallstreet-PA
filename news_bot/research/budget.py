@@ -2,10 +2,10 @@
 
 import sqlite3
 import uuid
-from collections.abc import Mapping
-from dataclasses import dataclass
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
-from decimal import ROUND_UP, Decimal
+from decimal import ROUND_UP, Decimal, InvalidOperation
 from types import MappingProxyType
 
 from .models import AgentRole
@@ -14,11 +14,31 @@ from .store import ResearchStore
 
 _MICRODOLLAR = Decimal("0.000001")
 _ONE_MILLION = Decimal("1000000")
-_COUNTED_STATES = ("reserved", "usage_unknown", "reconciled")
+_STATE_TRANSITIONS = MappingProxyType(
+    {
+        "reserved": frozenset({"released", "usage_unknown", "reconciled"}),
+        "usage_unknown": frozenset({"reconciled"}),
+        "reconciled": frozenset(),
+        "released": frozenset(),
+        "consumed": frozenset(),
+        "expired": frozenset(),
+    }
+)
+_RECOGNIZED_STATES = frozenset(_STATE_TRANSITIONS)
+_RELEASED_STATE = "released"
 _CRITICAL_ROLES = {
     AgentRole.SKEPTICAL_REVIEWER,
     AgentRole.RESEARCH_EDITOR,
 }
+_ID_GENERATION_ATTEMPTS = 3
+
+
+def _system_utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _uuid_id() -> str:
+    return str(uuid.uuid4())
 
 
 class BudgetError(Exception):
@@ -27,6 +47,10 @@ class BudgetError(Exception):
 
 class BudgetExceeded(BudgetError):
     """Raised when counted monthly spend would exceed the hard ceiling."""
+
+
+class BudgetIntegrityError(BudgetError):
+    """Raised when persisted ledger data cannot be trusted for policy."""
 
 
 class SoftBudgetExceeded(BudgetError):
@@ -51,6 +75,10 @@ class InvalidReservationState(BudgetError):
 
 class ReservationNotFound(BudgetError):
     """Raised when a reservation identifier is unknown."""
+
+
+class ReservationIdExhausted(BudgetError):
+    """Raised when bounded reservation identifier generation is exhausted."""
 
 
 @dataclass(frozen=True)
@@ -82,6 +110,8 @@ class Reservation:
         if not isinstance(self.owner_key, str) or not self.owner_key.strip():
             raise InvalidBudgetValue("owner_key must be a non-empty string")
         _require_amount("amount", self.amount)
+        if self.state not in _RECOGNIZED_STATES:
+            raise InvalidBudgetValue("state must be a recognized reservation state")
         created_at = _require_utc("created_at", self.created_at)
         updated_at = _require_utc("updated_at", self.updated_at)
         if updated_at < created_at:
@@ -90,23 +120,29 @@ class Reservation:
         object.__setattr__(self, "updated_at", updated_at)
 
 
+@dataclass(frozen=True)
 class PriceTable:
     """Dated model prices used for pessimistic call estimates."""
 
-    def __init__(
-        self, effective_until: date, prices: Mapping[str, ModelPrice]
-    ) -> None:
-        if type(effective_until) is not date:
+    effective_until: date
+    prices: Mapping[str, ModelPrice]
+    clock: Callable[[], datetime] = field(
+        default=_system_utc_now, repr=False, compare=False
+    )
+
+    def __post_init__(self) -> None:
+        if type(self.effective_until) is not date:
             raise InvalidBudgetValue("effective_until must be date")
-        if not isinstance(prices, Mapping):
+        if not isinstance(self.prices, Mapping):
             raise InvalidBudgetValue("prices must be a mapping")
-        for model, price in prices.items():
+        for model, price in self.prices.items():
             if not isinstance(model, str) or not model.strip():
                 raise InvalidBudgetValue("price model names must be non-empty strings")
             if not isinstance(price, ModelPrice):
                 raise InvalidBudgetValue("price entries must be ModelPrice")
-        self.effective_until = effective_until
-        self.prices = MappingProxyType(dict(prices))
+        if not callable(self.clock):
+            raise InvalidBudgetValue("clock must be callable")
+        object.__setattr__(self, "prices", MappingProxyType(dict(self.prices)))
 
     def estimate(
         self,
@@ -117,7 +153,11 @@ class PriceTable:
         as_of: date | None = None,
     ) -> Decimal:
         """Return a pessimistic token-cost estimate rounded up to a microdollar."""
-        estimate_date = date.today() if as_of is None else as_of
+        estimate_date = (
+            _require_utc("clock result", self.clock()).date()
+            if as_of is None
+            else as_of
+        )
         if type(estimate_date) is not date:
             raise InvalidBudgetValue("as_of must be date")
         if estimate_date > self.effective_until:
@@ -137,6 +177,7 @@ class PriceTable:
         return raw.quantize(_MICRODOLLAR, rounding=ROUND_UP)
 
 
+@dataclass(frozen=True)
 class BudgetLedger:
     """SQLite-backed strict UTC calendar-month spending ledger.
 
@@ -144,21 +185,22 @@ class BudgetLedger:
     even when reconciliation occurs later. Released reservations count as zero.
     """
 
-    def __init__(
-        self,
-        store: ResearchStore,
-        soft_limit: Decimal,
-        hard_limit: Decimal,
-    ) -> None:
-        _require_amount("soft_limit", soft_limit)
-        _require_amount("hard_limit", hard_limit)
-        if not soft_limit < hard_limit <= Decimal("5.00"):
+    store: ResearchStore
+    soft_limit: Decimal
+    hard_limit: Decimal
+    id_factory: Callable[[], str] = field(
+        default=_uuid_id, repr=False, compare=False
+    )
+
+    def __post_init__(self) -> None:
+        _require_amount("soft_limit", self.soft_limit)
+        _require_amount("hard_limit", self.hard_limit)
+        if not self.soft_limit < self.hard_limit <= Decimal("5.00"):
             raise InvalidBudgetValue(
                 "limits must satisfy 0 <= soft_limit < hard_limit <= 5.00"
             )
-        self.store = store
-        self.soft_limit = soft_limit
-        self.hard_limit = hard_limit
+        if not callable(self.id_factory):
+            raise InvalidBudgetValue("id_factory must be callable")
 
     def reserve(
         self,
@@ -176,7 +218,6 @@ class BudgetLedger:
         if role is not None and not isinstance(role, AgentRole):
             raise InvalidBudgetValue("role must be AgentRole or None")
         month_start, month_end = _month_bounds(instant.year, instant.month)
-        reservation_id = str(uuid.uuid4())
 
         with self.store.transaction() as connection:
             current = self._counted_total(connection, month_start, month_end)
@@ -192,6 +233,7 @@ class BudgetLedger:
                 raise SoftBudgetExceeded(
                     f"monthly soft limit {self.soft_limit} requires a critical role"
                 )
+            reservation_id = self._available_reservation_id(connection)
             timestamp = _utc_text(instant)
             connection.execute(
                 "INSERT INTO budget_reservations ("
@@ -234,7 +276,7 @@ class BudgetLedger:
                 raise InvalidReservationState(
                     "reservation is already reconciled with a different cost"
                 )
-            if current.state != "reserved":
+            if "reconciled" not in _STATE_TRANSITIONS[current.state]:
                 raise InvalidReservationState(
                     f"cannot reconcile reservation in state {current.state!r}"
                 )
@@ -314,7 +356,7 @@ class BudgetLedger:
             current = self._reservation_in(connection, reservation_id)
             if current.state == target_state:
                 return current
-            if current.state != "reserved":
+            if target_state not in _STATE_TRANSITIONS[current.state]:
                 raise InvalidReservationState(
                     f"cannot transition {current.state!r} to {target_state!r}"
                 )
@@ -344,13 +386,30 @@ class BudgetLedger:
         ).fetchone()
         if row is None:
             raise ReservationNotFound(f"unknown reservation: {reservation_id}")
-        return Reservation(
-            id=row[0],
-            owner_key=row[1],
-            amount=Decimal(row[2]),
-            state=row[3],
-            created_at=_parse_utc(row[4]),
-            updated_at=_parse_utc(row[5]),
+        return _persisted_reservation(row)
+
+    def _available_reservation_id(
+        self, connection: sqlite3.Connection
+    ) -> str:
+        for _ in range(_ID_GENERATION_ATTEMPTS):
+            try:
+                candidate = self.id_factory()
+            except Exception as exc:
+                raise ReservationIdExhausted(
+                    "reservation identifier generation failed"
+                ) from exc
+            if not isinstance(candidate, str) or not candidate:
+                raise InvalidBudgetValue(
+                    "id_factory must return a non-empty string"
+                )
+            exists = connection.execute(
+                "SELECT 1 FROM budget_reservations WHERE reservation_id = ?",
+                (candidate,),
+            ).fetchone()
+            if exists is None:
+                return candidate
+        raise ReservationIdExhausted(
+            "reservation identifier allocation attempts exhausted"
         )
 
     @staticmethod
@@ -359,14 +418,28 @@ class BudgetLedger:
         month_start: datetime,
         month_end: datetime,
     ) -> Decimal:
-        placeholders = ", ".join("?" for _ in _COUNTED_STATES)
+        """Scan and validate the full ledger before counting one UTC month.
+
+        SQL text filtering is deliberately avoided: malformed timestamps must
+        fail closed instead of disappearing from a calendar-month query.
+        """
         rows = connection.execute(
-            "SELECT amount_usd FROM budget_reservations "
-            f"WHERE state IN ({placeholders}) "
-            "AND created_at >= ? AND created_at < ?",
-            (*_COUNTED_STATES, _utc_text(month_start), _utc_text(month_end)),
+            "SELECT reservation_id, amount_usd, state, created_at "
+            "FROM budget_reservations"
         ).fetchall()
-        return sum((Decimal(row[0]) for row in rows), Decimal("0"))
+        total = Decimal("0")
+        for reservation_id, amount_text, state, created_text in rows:
+            amount = _persisted_amount(reservation_id, amount_text)
+            created_at = _persisted_utc(
+                reservation_id, "created_at", created_text
+            )
+            _require_persisted_state(reservation_id, state)
+            if (
+                state != _RELEASED_STATE
+                and month_start <= created_at < month_end
+            ):
+                total += amount
+        return total
 
 
 def _require_amount(name: str, value: Decimal) -> None:
@@ -400,6 +473,80 @@ def _parse_utc(value: str) -> datetime:
     return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(
         timezone.utc
     )
+
+
+def _require_persisted_state(reservation_id: str, state: object) -> None:
+    if state not in _RECOGNIZED_STATES:
+        raise BudgetIntegrityError(
+            f"reservation {reservation_id!r} has an unrecognized state"
+        )
+
+
+def _persisted_amount(reservation_id: str, value: object) -> Decimal:
+    if not isinstance(value, str):
+        raise BudgetIntegrityError(
+            f"reservation {reservation_id!r} has a non-text amount"
+        )
+    try:
+        amount = Decimal(value)
+    except (InvalidOperation, ValueError) as exc:
+        raise BudgetIntegrityError(
+            f"reservation {reservation_id!r} has an invalid amount"
+        ) from exc
+    if not amount.is_finite() or amount < 0:
+        raise BudgetIntegrityError(
+            f"reservation {reservation_id!r} has an invalid amount"
+        )
+    return amount
+
+
+def _persisted_utc(
+    reservation_id: str, field_name: str, value: object
+) -> datetime:
+    if not isinstance(value, str):
+        raise BudgetIntegrityError(
+            f"reservation {reservation_id!r} has invalid {field_name}"
+        )
+    iso_value = value[:-1] + "+00:00" if value.endswith("Z") else value
+    try:
+        parsed = datetime.fromisoformat(iso_value)
+        offset = parsed.utcoffset()
+    except (TypeError, ValueError) as exc:
+        raise BudgetIntegrityError(
+            f"reservation {reservation_id!r} has invalid {field_name}"
+        ) from exc
+    if parsed.tzinfo is None or offset is None or offset.total_seconds() != 0:
+        raise BudgetIntegrityError(
+            f"reservation {reservation_id!r} has invalid {field_name}"
+        )
+    return parsed.astimezone(timezone.utc)
+
+
+def _persisted_reservation(row: tuple[object, ...]) -> Reservation:
+    reservation_id, owner_key, amount_text, state, created_text, updated_text = row
+    if not isinstance(reservation_id, str):
+        raise BudgetIntegrityError("reservation has an invalid identifier")
+    _require_persisted_state(reservation_id, state)
+    amount = _persisted_amount(reservation_id, amount_text)
+    created_at = _persisted_utc(reservation_id, "created_at", created_text)
+    updated_at = _persisted_utc(reservation_id, "updated_at", updated_text)
+    if updated_at < created_at:
+        raise BudgetIntegrityError(
+            f"reservation {reservation_id!r} has invalid timestamp ordering"
+        )
+    try:
+        return Reservation(
+            id=reservation_id,
+            owner_key=owner_key,
+            amount=amount,
+            state=state,
+            created_at=created_at,
+            updated_at=updated_at,
+        )
+    except InvalidBudgetValue as exc:
+        raise BudgetIntegrityError(
+            f"reservation {reservation_id!r} has invalid persisted fields"
+        ) from exc
 
 
 def _decimal_text(value: Decimal) -> str:

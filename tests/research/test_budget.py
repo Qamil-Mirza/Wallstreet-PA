@@ -1,6 +1,7 @@
 """Tests for the transactional paid-model budget ledger."""
 
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import FrozenInstanceError
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from threading import Barrier
@@ -10,6 +11,7 @@ import pytest
 from news_bot.research.budget import (
     BudgetError,
     BudgetExceeded,
+    BudgetIntegrityError,
     BudgetLedger,
     ExpiredPricing,
     InvalidBudgetValue,
@@ -17,6 +19,7 @@ from news_bot.research.budget import (
     ModelPrice,
     PriceTable,
     Reservation,
+    ReservationIdExhausted,
     ReservationNotFound,
     SoftBudgetExceeded,
     UnknownModelPrice,
@@ -200,6 +203,18 @@ def test_reservation_record_rejects_updated_at_before_created_at():
             state="reserved",
             created_at=utc(2026, 8, 1, 2),
             updated_at=utc(2026, 8, 1, 1),
+        )
+
+
+def test_reservation_record_rejects_unrecognized_state():
+    with pytest.raises(InvalidBudgetValue, match="state"):
+        Reservation(
+            id="reservation-1",
+            owner_key="run-1",
+            amount=Decimal("1"),
+            state="unexpected",
+            created_at=utc(2026, 8, 1),
+            updated_at=utc(2026, 8, 1),
         )
 
 
@@ -603,3 +618,204 @@ def test_concurrent_reservations_cannot_overspend(migrated_store):
     assert outcomes.count("reserved") == 1
     assert outcomes.count("rejected") == 1
     assert first.month_total(2026, 8) == Decimal("5")
+
+
+def insert_persisted_reservation(
+    store,
+    *,
+    reservation_id="persisted-1",
+    state="reserved",
+    amount="1.00",
+    created_at="2026-08-01T00:00:00.000000Z",
+):
+    connection = store.connect()
+    try:
+        connection.execute("PRAGMA ignore_check_constraints = ON")
+        connection.execute(
+            "INSERT INTO budget_reservations ("
+            "reservation_id, owner_key, amount_usd, state, created_at, updated_at"
+            ") VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                reservation_id,
+                "persisted-owner",
+                amount,
+                state,
+                created_at,
+                "2026-08-01T00:00:00.000000Z",
+            ),
+        )
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize("state", ["consumed", "expired"])
+def test_all_nonreleased_recognized_states_count_conservatively(
+    migrated_store, state
+):
+    insert_persisted_reservation(migrated_store, state=state, amount="1.2500")
+    ledger = BudgetLedger(migrated_store, Decimal("4"), Decimal("5"))
+
+    assert ledger.month_total(2026, 8) == Decimal("1.2500")
+
+
+@pytest.mark.parametrize(
+    ("state", "amount", "created_at"),
+    [
+        ("reserved", "-0.01", "2026-08-01T00:00:00.000000Z"),
+        ("reserved", "NaN", "2026-08-01T00:00:00.000000Z"),
+        ("reserved", "Infinity", "2026-08-01T00:00:00.000000Z"),
+        ("reserved", "not-a-decimal", "2026-08-01T00:00:00.000000Z"),
+        ("reserved", "1.00", "2026-08-01T00:00:00.000000"),
+        ("reserved", "1.00", "not-a-timestamp"),
+        ("reserved", "1.00", "2026-08-01T01:00:00.000000+01:00"),
+        ("unknown_state", "1.00", "2026-08-01T00:00:00.000000Z"),
+    ],
+)
+@pytest.mark.parametrize("operation", ["month_total", "reserve"])
+def test_corrupt_persisted_ledger_fails_closed_without_new_reservation(
+    migrated_store, state, amount, created_at, operation
+):
+    insert_persisted_reservation(
+        migrated_store, state=state, amount=amount, created_at=created_at
+    )
+    ledger = BudgetLedger(migrated_store, Decimal("4"), Decimal("5"))
+
+    with pytest.raises(BudgetIntegrityError):
+        if operation == "month_total":
+            ledger.month_total(2026, 8)
+        else:
+            ledger.reserve("new-owner", Decimal("0.10"), now=utc(2026, 8, 2))
+
+    with migrated_store.connect() as connection:
+        count = connection.execute(
+            "SELECT COUNT(*) FROM budget_reservations"
+        ).fetchone()[0]
+    assert count == 1
+
+
+def test_usage_unknown_can_reconcile_to_lower_provider_actual(migrated_store):
+    ledger = BudgetLedger(migrated_store, Decimal("4"), Decimal("5"))
+    reservation = ledger.reserve(
+        "run-1", Decimal("1.25"), now=utc(2026, 8, 1)
+    )
+    ledger.mark_usage_unknown(reservation.id, now=utc(2026, 8, 2))
+
+    reconciled = ledger.reconcile(
+        reservation.id, Decimal("0.40"), now=utc(2026, 8, 3)
+    )
+
+    assert reconciled.state == "reconciled"
+    assert reconciled.amount == Decimal("0.40")
+    assert ledger.month_total(2026, 8) == Decimal("0.40")
+
+
+def test_usage_unknown_provider_overage_is_recorded_before_error(migrated_store):
+    ledger = BudgetLedger(migrated_store, Decimal("4"), Decimal("5"))
+    reservation = ledger.reserve(
+        "run-1", Decimal("1"), now=utc(2026, 8, 1)
+    )
+    ledger.mark_usage_unknown(reservation.id, now=utc(2026, 8, 2))
+
+    with pytest.raises(BudgetExceeded, match="recorded provider overage"):
+        ledger.reconcile(
+            reservation.id, Decimal("5.10"), now=utc(2026, 8, 3)
+        )
+
+    assert ledger.get_reservation(reservation.id).state == "reconciled"
+    assert ledger.month_total(2026, 8) == Decimal("5.10")
+
+
+def test_usage_unknown_reconciliation_retries_are_consistent(migrated_store):
+    ledger = BudgetLedger(migrated_store, Decimal("4"), Decimal("5"))
+    reservation = ledger.reserve(
+        "run-1", Decimal("1"), now=utc(2026, 8, 1)
+    )
+    ledger.mark_usage_unknown(reservation.id, now=utc(2026, 8, 2))
+
+    first = ledger.reconcile(
+        reservation.id, Decimal("0.42"), now=utc(2026, 8, 3)
+    )
+    same = ledger.reconcile(
+        reservation.id, Decimal("0.420"), now=utc(2026, 8, 4)
+    )
+
+    assert same == first
+    with pytest.raises(InvalidReservationState):
+        ledger.reconcile(
+            reservation.id, Decimal("0.43"), now=utc(2026, 8, 4)
+        )
+
+
+def test_price_table_policy_and_nested_mapping_are_immutable():
+    source_prices = {"known": ModelPrice(Decimal("1"), Decimal("1"))}
+    table = PriceTable(date(2026, 8, 24), source_prices)
+
+    with pytest.raises(FrozenInstanceError):
+        table.effective_until = date(2099, 1, 1)
+    with pytest.raises(FrozenInstanceError):
+        table.prices = {}
+    with pytest.raises(TypeError):
+        table.prices["bypass"] = ModelPrice(Decimal("0"), Decimal("0"))
+    source_prices["bypass"] = ModelPrice(Decimal("0"), Decimal("0"))
+    with pytest.raises(UnknownModelPrice):
+        table.estimate("bypass", 0, 0, as_of=date(2026, 8, 24))
+
+
+def test_budget_ledger_policy_fields_are_immutable(migrated_store):
+    ledger = BudgetLedger(migrated_store, Decimal("4"), Decimal("5"))
+
+    for name, value in (
+        ("store", object()),
+        ("soft_limit", Decimal("0")),
+        ("hard_limit", Decimal("100")),
+    ):
+        with pytest.raises(FrozenInstanceError):
+            setattr(ledger, name, value)
+
+
+def test_reservation_id_collision_retries_with_injected_factory(migrated_store):
+    ids = iter(("same-id", "same-id", "fresh-id"))
+    ledger = BudgetLedger(
+        migrated_store,
+        Decimal("4"),
+        Decimal("5"),
+        id_factory=lambda: next(ids),
+    )
+    first = ledger.reserve("run-1", Decimal("1"), now=utc(2026, 8, 1))
+
+    second = ledger.reserve("run-2", Decimal("1"), now=utc(2026, 8, 1))
+
+    assert first.id == "same-id"
+    assert second.id == "fresh-id"
+
+
+def test_exhausted_reservation_id_collisions_raise_typed_error(migrated_store):
+    ledger = BudgetLedger(
+        migrated_store,
+        Decimal("4"),
+        Decimal("5"),
+        id_factory=lambda: "same-id",
+    )
+    ledger.reserve("run-1", Decimal("1"), now=utc(2026, 8, 1))
+
+    with pytest.raises(ReservationIdExhausted) as error:
+        ledger.reserve("run-2", Decimal("1"), now=utc(2026, 8, 1))
+
+    assert "sqlite" not in str(error.value).lower()
+    assert "unique" not in str(error.value).lower()
+    assert ledger.month_total(2026, 8) == Decimal("1")
+
+
+def test_price_table_default_date_uses_injected_instant_in_utc():
+    pacific = timezone(timedelta(hours=-7))
+    local_august_24_but_utc_august_25 = datetime(
+        2026, 8, 24, 17, 30, tzinfo=pacific
+    )
+    table = PriceTable(
+        effective_until=date(2026, 8, 24),
+        prices={},
+        clock=lambda: local_august_24_but_utc_august_25,
+    )
+
+    with pytest.raises(ExpiredPricing):
+        table.estimate("unknown", 0, 0)
