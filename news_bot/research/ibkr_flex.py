@@ -140,8 +140,8 @@ class FlexConfig:
             for host in self.allowed_statement_hosts
         ):
             raise ValueError("allowed_statement_hosts must contain nonblank hosts")
-        if not isinstance(self.ssl_required, bool):
-            raise ValueError("ssl_required must be boolean")
+        if self.ssl_required is not True:
+            raise ValueError("ssl_required must be True")
         if not _positive_finite(self.max_staleness_hours):
             raise ValueError("max_staleness_hours must be positive and finite")
         _validate_url(self.send_url, self, configuration=True)
@@ -195,35 +195,33 @@ def _safe_xml_root(xml: str | bytes, max_bytes: int) -> ET.Element:
         raise FlexMalformedStatementError("Unsafe XML declarations are not allowed")
     try:
         return ET.fromstring(raw)
-    except (ET.ParseError, UnicodeError) as exc:
-        raise FlexMalformedStatementError("Malformed IBKR Flex XML") from exc
+    except (ET.ParseError, UnicodeError):
+        raise FlexMalformedStatementError("Malformed IBKR Flex XML") from None
 
 
 def _validate_url(url: str, config: FlexConfig, *, configuration: bool = False) -> str:
     try:
         parsed = urlsplit(url)
         port = parsed.port
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError):
         if configuration:
-            raise ValueError("Flex endpoint must be a valid URL") from exc
-        raise FlexUnsafeResponseURLError("IBKR returned an unsafe statement URL") from exc
+            raise ValueError("Flex endpoint must be a valid URL") from None
+        raise FlexUnsafeResponseURLError("IBKR returned an unsafe statement URL") from None
     allowed_hosts = {host.strip().lower() for host in config.allowed_statement_hosts}
     invalid = (
-        (config.ssl_required and parsed.scheme.lower() != "https")
-        or parsed.scheme.lower() not in {"https", "http"}
+        parsed.scheme.lower() != "https"
         or parsed.hostname is None
         or parsed.hostname.lower() not in allowed_hosts
         or parsed.username is not None
         or parsed.password is not None
-        or port is not None
+        or port not in {None, 443}
         or bool(parsed.fragment)
         or bool(parsed.query)
         or not parsed.path
     )
     if invalid:
         if configuration:
-            requirement = "HTTPS " if config.ssl_required else ""
-            raise ValueError(f"Flex endpoint must be an allowed {requirement}URL")
+            raise ValueError("Flex endpoint must be an allowed HTTPS URL")
         raise FlexUnsafeResponseURLError("IBKR returned an unsafe statement URL")
     return url
 
@@ -244,8 +242,8 @@ def _parse_timestamp(value: str, field_name: str) -> datetime:
             continue
     try:
         parsed = datetime.fromisoformat(stripped.replace("Z", "+00:00"))
-    except ValueError as exc:
-        raise FlexMalformedStatementError(f"Invalid {field_name} timestamp") from exc
+    except ValueError:
+        raise FlexMalformedStatementError(f"Invalid {field_name} timestamp") from None
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         raise FlexMalformedStatementError(f"{field_name} timestamp must include a timezone")
     return parsed.astimezone(timezone.utc)
@@ -257,8 +255,8 @@ def _required_decimal(element: ET.Element, names: tuple[str, ...], label: str) -
         raise FlexMalformedStatementError(f"Missing required {label}")
     try:
         value = Decimal(raw.strip())
-    except InvalidOperation as exc:
-        raise FlexMalformedStatementError(f"Invalid decimal for {label}") from exc
+    except InvalidOperation:
+        raise FlexMalformedStatementError(f"Invalid decimal for {label}") from None
     if not value.is_finite():
         raise FlexMalformedStatementError(f"{label} must be finite")
     return value
@@ -449,9 +447,12 @@ class FlexClient:
                 params=params,
                 headers={"User-Agent": self.config.user_agent},
                 timeout=self.config.request_timeout_seconds,
+                allow_redirects=False,
             )
-        except requests.RequestException as exc:
-            raise FlexTransportError("IBKR Flex HTTPS request failed") from exc
+        except requests.RequestException:
+            raise FlexTransportError("IBKR Flex HTTPS request failed") from None
+        if 300 <= response.status_code < 400:
+            raise FlexTransportError("IBKR Flex redirects are not allowed")
         if not 200 <= response.status_code < 300:
             raise FlexTransportError(
                 f"IBKR Flex HTTP response status {response.status_code}"
@@ -474,8 +475,8 @@ class FlexClient:
         if send_error:
             try:
                 raise FlexError.from_code(int(send_error))
-            except ValueError as exc:
-                raise FlexMalformedStatementError("Invalid Flex error code") from exc
+            except ValueError:
+                raise FlexMalformedStatementError("Invalid Flex error code") from None
         if (_direct_text(send_root, "Status") or "").lower() != "success":
             raise FlexMalformedStatementError("SendRequest did not return success")
         reference_code = _direct_text(send_root, "ReferenceCode")
@@ -502,8 +503,8 @@ class FlexClient:
                 raise FlexMalformedStatementError("GetStatement error response is incomplete")
             try:
                 error = FlexError.from_code(int(error_code))
-            except ValueError as exc:
-                raise FlexMalformedStatementError("Invalid Flex error code") from exc
+            except ValueError:
+                raise FlexMalformedStatementError("Invalid Flex error code") from None
             if not isinstance(error, FlexNotReadyError):
                 raise error
             if attempt + 1 == self.config.max_polls:

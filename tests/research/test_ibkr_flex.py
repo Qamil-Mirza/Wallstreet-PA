@@ -1,6 +1,8 @@
 """Read-only IBKR Flex transport, parsing, and persistence tests."""
 
+import logging
 import sqlite3
+import traceback
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -39,34 +41,48 @@ class _Request:
     params: dict[str, object]
     headers: dict[str, str]
     timeout: float
+    allow_redirects: bool
 
 
 class _Response:
-    def __init__(self, text: str, status_code: int = 200) -> None:
+    def __init__(
+        self, text: str, status_code: int = 200, headers: dict[str, str] | None = None
+    ) -> None:
         self.content = text.encode("utf-8")
         self.status_code = status_code
+        self.headers = headers or {}
 
 
 class _Session:
     def __init__(self, adapter: "_RequestsMock") -> None:
         self.adapter = adapter
 
-    def get(self, url, *, params, headers, timeout):
-        return self.adapter.request(url, params=params, headers=headers, timeout=timeout)
+    def get(self, url, *, params, headers, timeout, allow_redirects=True):
+        return self.adapter.request(
+            url,
+            params=params,
+            headers=headers,
+            timeout=timeout,
+            allow_redirects=allow_redirects,
+        )
 
 
 class _RequestsMock:
     def __init__(self) -> None:
-        self._registered: dict[str, list[tuple[str, int] | BaseException]] = {}
+        self._registered: dict[
+            str, list[tuple[str, int, dict[str, str]] | BaseException]
+        ] = {}
         self.request_history: list[_Request] = []
 
-    def get(self, url, *, text="", status_code=200, exc=None):
-        response = exc if exc is not None else (text, status_code)
+    def get(self, url, *, text="", status_code=200, headers=None, exc=None):
+        response = exc if exc is not None else (text, status_code, headers or {})
         self._registered.setdefault(url, []).append(response)
 
-    def request(self, url, *, params, headers, timeout):
+    def request(self, url, *, params, headers, timeout, allow_redirects):
         self.request_history.append(
-            _Request("GET", url, dict(params), dict(headers), timeout)
+            _Request(
+                "GET", url, dict(params), dict(headers), timeout, allow_redirects
+            )
         )
         registered = self._registered.get(url, [])
         if not registered:
@@ -74,8 +90,8 @@ class _RequestsMock:
         response = registered.pop(0)
         if isinstance(response, BaseException):
             raise response
-        text, status_code = response
-        return _Response(text, status_code)
+        text, status_code, response_headers = response
+        return _Response(text, status_code, response_headers)
 
 
 @pytest.fixture
@@ -106,6 +122,21 @@ def _send_xml(url: str) -> str:
         "<ReferenceCode>REF-1</ReferenceCode>"
         f"<Url>{url}</Url></FlexStatementResponse>"
     )
+
+
+def _assert_exception_redacted(error, markers, caplog):
+    rendered = str(error) + repr(error)
+    rendered += "".join(
+        traceback.format_exception(type(error), error, error.__traceback__)
+    )
+    caplog.clear()
+    logging.getLogger("tests.ibkr.redaction").error(
+        "sanitized Flex failure",
+        exc_info=(type(error), error, error.__traceback__),
+    )
+    rendered += caplog.text
+    for marker in markers:
+        assert marker not in rendered
 
 
 def test_sync_uses_reference_code_and_never_logs_token(
@@ -150,6 +181,36 @@ def test_flex_config_hides_sensitive_fields_and_validates_limits(flex_config):
         replace(flex_config, send_url="http://ndcdyn.interactivebrokers.com/send")
 
 
+def test_https_requirement_cannot_be_disabled(flex_config):
+    with pytest.raises(ValueError, match="ssl_required.*True"):
+        replace(flex_config, ssl_required=False)
+
+
+@pytest.mark.parametrize("field", ["send_url", "statement_url"])
+def test_configured_http_endpoints_are_rejected_without_transport(
+    requests_mock, flex_config, field
+):
+    with pytest.raises(ValueError, match="HTTPS"):
+        replace(
+            flex_config,
+            **{field: "http://ndcdyn.interactivebrokers.com/FlexWebService"},
+        )
+    assert requests_mock.request_history == []
+
+
+def test_default_https_port_is_allowed_but_other_ports_are_rejected(flex_config):
+    replace(
+        flex_config,
+        send_url="https://ndcdyn.interactivebrokers.com:443/SendRequest",
+        statement_url="https://ndcdyn.interactivebrokers.com:443/GetStatement",
+    )
+    with pytest.raises(ValueError, match="allowed HTTPS URL"):
+        replace(
+            flex_config,
+            statement_url="https://ndcdyn.interactivebrokers.com:8443/GetStatement",
+        )
+
+
 def test_send_and_poll_use_get_params_headers_and_timeout(requests_mock, flex_config):
     requests_mock.get(flex_config.send_url, text=fixture("ibkr_send_success.xml"))
     requests_mock.get(flex_config.statement_url, text=fixture("ibkr_statement.xml"))
@@ -163,7 +224,65 @@ def test_send_and_poll_use_get_params_headers_and_timeout(requests_mock, flex_co
     assert send.headers["User-Agent"] == flex_config.user_agent
     assert statement.headers["User-Agent"] == flex_config.user_agent
     assert send.timeout == statement.timeout == flex_config.request_timeout_seconds
+    assert send.allow_redirects is False
+    assert statement.allow_redirects is False
     assert TOKEN not in send.url and TOKEN not in statement.url
+
+
+@pytest.mark.parametrize(
+    ("status", "target"),
+    [
+        (301, "https://evil.test/steal"),
+        (302, "http://127.0.0.1/private"),
+    ],
+)
+def test_send_redirect_is_not_followed_or_leaked(
+    requests_mock, caplog, flex_config, status, target
+):
+    requests_mock.get(
+        flex_config.send_url,
+        status_code=status,
+        headers={"Location": target},
+    )
+
+    with pytest.raises(FlexTransportError) as captured:
+        FlexClient(flex_config).sync()
+
+    assert len(requests_mock.request_history) == 1
+    request = requests_mock.request_history[0]
+    assert request.url == flex_config.send_url
+    assert request.allow_redirects is False
+    _assert_exception_redacted(
+        captured.value, (TOKEN, QUERY_ID, ACCOUNT_ID, target), caplog
+    )
+
+
+@pytest.mark.parametrize(
+    ("status", "target"),
+    [
+        (301, "https://evil.test/steal"),
+        (302, "http://127.0.0.1/private"),
+    ],
+)
+def test_statement_redirect_is_not_followed_or_leaked(
+    requests_mock, caplog, flex_config, status, target
+):
+    requests_mock.get(flex_config.send_url, text=fixture("ibkr_send_success.xml"))
+    requests_mock.get(
+        flex_config.statement_url,
+        status_code=status,
+        headers={"Location": target},
+    )
+
+    with pytest.raises(FlexTransportError) as captured:
+        FlexClient(flex_config).sync()
+
+    assert len(requests_mock.request_history) == 2
+    assert requests_mock.request_history[-1].url == flex_config.statement_url
+    assert all(not request.allow_redirects for request in requests_mock.request_history)
+    _assert_exception_redacted(
+        captured.value, (TOKEN, QUERY_ID, ACCOUNT_ID, target), caplog
+    )
 
 
 def test_1019_retries_with_capped_exponential_delay(requests_mock, flex_config):
@@ -263,6 +382,19 @@ def test_unsafe_statement_url_is_rejected_before_token_is_sent_there(
     assert [item.url for item in requests_mock.request_history] == [flex_config.send_url]
 
 
+def test_explicit_default_port_in_returned_url_is_allowed(requests_mock, flex_config):
+    statement_url = (
+        "https://ndcdyn.interactivebrokers.com:443/AccountManagement/"
+        "FlexWebService/GetStatement"
+    )
+    requests_mock.get(flex_config.send_url, text=_send_xml(statement_url))
+    requests_mock.get(statement_url, text=fixture("ibkr_statement.xml"))
+
+    result = FlexClient(flex_config).sync()
+
+    assert result.snapshot.base_currency == "USD"
+
+
 @pytest.mark.parametrize(
     ("response_text", "status", "exception", "error_type"),
     [
@@ -290,6 +422,61 @@ def test_transport_and_xml_errors_are_typed_and_redacted(
     assert ACCOUNT_ID not in rendered
     if response_text:
         assert response_text not in rendered
+
+
+def test_request_exception_chain_is_fully_redacted(requests_mock, caplog, flex_config):
+    marker = "request-secret-marker"
+    requests_mock.get(
+        flex_config.send_url,
+        exc=requests.Timeout(f"{marker} {TOKEN} {QUERY_ID} {ACCOUNT_ID}"),
+    )
+
+    with pytest.raises(FlexTransportError) as captured:
+        FlexClient(flex_config).sync()
+
+    _assert_exception_redacted(
+        captured.value, (marker, TOKEN, QUERY_ID, ACCOUNT_ID), caplog
+    )
+
+
+def test_malicious_url_exception_chain_is_fully_redacted(
+    requests_mock, caplog, flex_config
+):
+    marker = "url-secret-marker"
+    bad_url = f"https://ndcdyn.interactivebrokers.com:{marker}/GetStatement"
+    requests_mock.get(flex_config.send_url, text=_send_xml(bad_url))
+
+    with pytest.raises(FlexUnsafeResponseURLError) as captured:
+        FlexClient(flex_config).sync()
+
+    _assert_exception_redacted(captured.value, (marker, TOKEN, QUERY_ID), caplog)
+
+
+def test_malformed_xml_exception_chain_does_not_retain_body(
+    requests_mock, caplog, flex_config
+):
+    marker = "xml-secret-marker"
+    body = f"<FlexStatementResponse><{marker}></FlexStatementResponse>"
+    requests_mock.get(flex_config.send_url, text=body)
+
+    with pytest.raises(FlexMalformedStatementError) as captured:
+        FlexClient(flex_config).sync()
+
+    assert captured.value.__cause__ is None
+    _assert_exception_redacted(captured.value, (marker, TOKEN, QUERY_ID), caplog)
+
+
+def test_invalid_decimal_exception_chain_does_not_retain_value(caplog):
+    marker = "decimal-secret-marker"
+    xml = fixture("ibkr_statement.xml").replace(
+        'total="4725.50"', f'total="{marker}"'
+    )
+
+    with pytest.raises(FlexMalformedStatementError) as captured:
+        parse_statement(xml, account_salt="salt")
+
+    assert captured.value.__cause__ is None
+    _assert_exception_redacted(captured.value, (marker, ACCOUNT_ID), caplog)
 
 
 def test_oversized_response_is_rejected_without_body_in_error(requests_mock, flex_config):
