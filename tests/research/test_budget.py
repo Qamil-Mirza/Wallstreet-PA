@@ -173,6 +173,36 @@ def test_reservation_record_rejects_invalid_exact_values_and_times(
         )
 
 
+def test_reservation_record_normalizes_aware_timestamps_to_utc():
+    plus_five_thirty = timezone(timedelta(hours=5, minutes=30))
+
+    reservation = Reservation(
+        id="reservation-1",
+        owner_key="run-1",
+        amount=Decimal("1"),
+        state="reserved",
+        created_at=datetime(2026, 8, 1, 5, 30, tzinfo=plus_five_thirty),
+        updated_at=datetime(2026, 8, 1, 6, 30, tzinfo=plus_five_thirty),
+    )
+
+    assert reservation.created_at == utc(2026, 8, 1)
+    assert reservation.updated_at == utc(2026, 8, 1, 1)
+    assert reservation.created_at.tzinfo is timezone.utc
+    assert reservation.updated_at.tzinfo is timezone.utc
+
+
+def test_reservation_record_rejects_updated_at_before_created_at():
+    with pytest.raises(InvalidBudgetValue, match="updated_at"):
+        Reservation(
+            id="reservation-1",
+            owner_key="run-1",
+            amount=Decimal("1"),
+            state="reserved",
+            created_at=utc(2026, 8, 1, 2),
+            updated_at=utc(2026, 8, 1, 1),
+        )
+
+
 def test_price_table_rejects_non_price_entries():
     with pytest.raises(InvalidBudgetValue):
         PriceTable(
@@ -216,6 +246,21 @@ def test_reservation_that_reaches_soft_limit_is_allowed(migrated_store):
 
     ledger.reserve("run-1", Decimal("4"), now=utc(2026, 8, 1))
 
+    assert ledger.month_total(2026, 8) == Decimal("4")
+
+
+@pytest.mark.parametrize("role", [None, AgentRole.FUNDAMENTAL_ANALYST])
+def test_zero_cost_reservation_at_exact_soft_limit_is_allowed(
+    migrated_store, role
+):
+    ledger = BudgetLedger(migrated_store, Decimal("4"), Decimal("5"))
+    ledger.reserve("run-1", Decimal("4"), now=utc(2026, 8, 1))
+
+    reservation = ledger.reserve(
+        "run-2", Decimal("0"), now=utc(2026, 8, 1), role=role
+    )
+
+    assert reservation.amount == Decimal("0")
     assert ledger.month_total(2026, 8) == Decimal("4")
 
 

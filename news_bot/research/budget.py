@@ -82,8 +82,12 @@ class Reservation:
         if not isinstance(self.owner_key, str) or not self.owner_key.strip():
             raise InvalidBudgetValue("owner_key must be a non-empty string")
         _require_amount("amount", self.amount)
-        _require_utc("created_at", self.created_at)
-        _require_utc("updated_at", self.updated_at)
+        created_at = _require_utc("created_at", self.created_at)
+        updated_at = _require_utc("updated_at", self.updated_at)
+        if updated_at < created_at:
+            raise InvalidBudgetValue("updated_at must not precede created_at")
+        object.__setattr__(self, "created_at", created_at)
+        object.__setattr__(self, "updated_at", updated_at)
 
 
 class PriceTable:
@@ -183,7 +187,7 @@ class BudgetLedger:
                 )
             if (
                 role not in _CRITICAL_ROLES
-                and (current >= self.soft_limit or projected > self.soft_limit)
+                and projected > self.soft_limit
             ):
                 raise SoftBudgetExceeded(
                     f"monthly soft limit {self.soft_limit} requires a critical role"
