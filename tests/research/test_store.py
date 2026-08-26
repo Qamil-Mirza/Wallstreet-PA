@@ -13,10 +13,11 @@ from sqlite3 import IntegrityError
 
 import pytest
 
+from news_bot.research.ibkr_flex import parse_statement
 from news_bot.research.models import SourceDocument
 from news_bot.research.store import ResearchStore
 
-from .conftest import make_claim, make_migrated_store, utc
+from .conftest import fixture, make_claim, make_migrated_store, utc
 
 
 REQUIRED_TABLES = {
@@ -89,9 +90,125 @@ def test_migration_is_idempotent_and_recorded_once(tmp_path):
         rows = connection.execute(
             "SELECT version, name, applied_at FROM schema_migrations"
         ).fetchall()
-    assert len(rows) == 1
+    assert len(rows) == 2
     assert rows[0][0:2] == (1, "001_initial.sql")
-    assert rows[0][2].endswith("Z")
+    assert rows[1][0:2] == (2, "002_nullable_portfolio_freshness.sql")
+    assert all(row[2].endswith("Z") for row in rows)
+
+
+def test_existing_v1_database_upgrades_nullable_freshness_without_data_loss(
+    tmp_path, monkeypatch
+):
+    database_path = tmp_path / "research.db"
+    v1_migration = tmp_path / "001_initial.sql"
+    packaged_v1 = (
+        Path(__file__).resolve().parents[2]
+        / "news_bot/research/migrations/001_initial.sql"
+    )
+    shutil.copyfile(packaged_v1, v1_migration)
+    v1_store = ResearchStore(database_path)
+    monkeypatch.setattr(v1_store, "_migration_files", lambda: (v1_migration,))
+    v1_store.migrate()
+
+    snapshot_row = (
+        "snapshot_existing_v1",
+        "2026-08-23T00:00:00.000000Z",
+        "USD",
+        "4725.50",
+        "525.50",
+        0,
+        "acct_111111111111111111111111",
+        '{"source":"v1"}',
+        "2026-08-24T12:00:00.000000Z",
+    )
+    security_row = (
+        "security_existing_v1",
+        None,
+        "NVDA",
+        "STK",
+        "NASDAQ",
+        "USD",
+        '{"conid":"4815747","isin":"US67066G1040"}',
+        '{"source":"v1"}',
+        "2026-08-24T12:00:00.000000Z",
+    )
+    position_row = (
+        "position_existing_v1",
+        "snapshot_existing_v1",
+        "NVDA",
+        "10",
+        "1200.00",
+        "USD",
+        "900.00",
+        "security_existing_v1",
+        '{"source":"v1"}',
+    )
+    with v1_store.transaction() as connection:
+        connection.execute(
+            "INSERT INTO portfolio_snapshots VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            snapshot_row,
+        )
+        connection.execute(
+            "INSERT INTO securities VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            security_row,
+        )
+        connection.execute(
+            "INSERT INTO positions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            position_row,
+        )
+
+    upgraded = ResearchStore(database_path)
+    upgraded.migrate()
+    upgraded.migrate()
+
+    current = parse_statement(
+        fixture("ibkr_statement.xml"),
+        account_salt="local-test-salt-strong",
+    )
+    upgraded.insert_portfolio_snapshot(
+        current.snapshot, current.positions, current.account_ref
+    )
+
+    with upgraded.connect() as connection:
+        versions = connection.execute(
+            "SELECT version FROM schema_migrations ORDER BY version"
+        ).fetchall()
+        stored_snapshot = connection.execute(
+            "SELECT * FROM portfolio_snapshots WHERE snapshot_id = ?",
+            (snapshot_row[0],),
+        ).fetchone()
+        stored_security = connection.execute(
+            "SELECT * FROM securities WHERE security_id = ?", (security_row[0],)
+        ).fetchone()
+        stored_position = connection.execute(
+            "SELECT * FROM positions WHERE position_id = ?", (position_row[0],)
+        ).fetchone()
+        nullable = {
+            row[1]: row[3]
+            for row in connection.execute("PRAGMA table_info(portfolio_snapshots)")
+        }
+        current_staleness = connection.execute(
+            "SELECT is_stale FROM portfolio_snapshots WHERE snapshot_id = ?",
+            (current.snapshot.snapshot_id,),
+        ).fetchone()
+        foreign_key_errors = connection.execute("PRAGMA foreign_key_check").fetchall()
+        position_indexes = connection.execute(
+            "SELECT name, tbl_name FROM sqlite_master "
+            "WHERE type = 'index' AND name LIKE 'idx_positions_%' ORDER BY name"
+        ).fetchall()
+
+    assert versions == [(1,), (2,)]
+    assert stored_snapshot == snapshot_row
+    assert stored_security == security_row
+    assert stored_position == position_row
+    assert nullable["is_stale"] == 0
+    assert current_staleness == (None,)
+    assert foreign_key_errors == []
+    assert position_indexes == [
+        ("idx_positions_security_id", "positions"),
+        ("idx_positions_snapshot_id", "positions"),
+        ("idx_positions_symbol", "positions"),
+    ]
 
 
 def test_store_fails_closed_when_no_migrations_are_available(tmp_path, monkeypatch):
@@ -104,7 +221,7 @@ def test_store_fails_closed_when_no_migrations_are_available(tmp_path, monkeypat
     assert not store.database_path.exists()
 
 
-def test_built_wheel_contains_discoverable_initial_migration(tmp_path):
+def test_built_wheel_contains_and_applies_all_migrations(tmp_path):
     project_root = Path(__file__).resolve().parents[2]
     source_copy = tmp_path / "source"
     wheel_dir = tmp_path / "wheelhouse"
@@ -138,16 +255,26 @@ def test_built_wheel_contains_discoverable_initial_migration(tmp_path):
     wheels = list(wheel_dir.glob("*.whl"))
     assert len(wheels) == 1
     wheel = wheels[0]
-    migration_name = "news_bot/research/migrations/001_initial.sql"
+    migration_names = {
+        "news_bot/research/migrations/001_initial.sql",
+        "news_bot/research/migrations/002_nullable_portfolio_freshness.sql",
+    }
     with zipfile.ZipFile(wheel) as archive:
-        assert migration_name in archive.namelist()
+        assert migration_names <= set(archive.namelist())
 
     resource_probe = (
-        "import sys; from importlib import resources; "
+        "import sqlite3, sys, tempfile; from importlib import resources; "
+        "from pathlib import Path; "
         f"sys.path.insert(0, {str(wheel)!r}); "
-        "migration = resources.files('news_bot.research').joinpath("
-        "'migrations', '001_initial.sql'); "
-        "assert 'CREATE TABLE portfolio_snapshots' in migration.read_text('utf-8')"
+        "migration_dir = resources.files('news_bot.research').joinpath('migrations'); "
+        "assert {p.name for p in migration_dir.iterdir()} >= "
+        "{'001_initial.sql', '002_nullable_portfolio_freshness.sql'}; "
+        "from news_bot.research.store import ResearchStore; "
+        "db = Path(tempfile.mkdtemp()) / 'research.db'; "
+        "store = ResearchStore(db); store.migrate(); "
+        "connection = sqlite3.connect(db); "
+        "assert connection.execute('SELECT version FROM schema_migrations "
+        "ORDER BY version').fetchall() == [(1,), (2,)]; connection.close()"
     )
     subprocess.run(
         [sys.executable, "-I", "-c", resource_probe],
@@ -160,7 +287,7 @@ def test_built_wheel_contains_discoverable_initial_migration(tmp_path):
 
 def test_failed_multi_statement_migration_is_atomic(tmp_path, monkeypatch):
     store = make_migrated_store(tmp_path)
-    bad_migration = tmp_path / "002_broken.sql"
+    bad_migration = tmp_path / "003_broken.sql"
     bad_migration.write_text(
         "CREATE TABLE should_roll_back (id INTEGER);\n"
         "INSERT INTO missing_table (id) VALUES (1);\n",
@@ -179,7 +306,7 @@ def test_failed_multi_statement_migration_is_atomic(tmp_path, monkeypatch):
         versions = connection.execute(
             "SELECT version FROM schema_migrations ORDER BY version"
         ).fetchall()
-    assert versions == [(1,)]
+    assert versions == [(1,), (2,)]
 
 
 def test_migrations_are_sorted_by_numeric_version(tmp_path, monkeypatch):

@@ -16,7 +16,7 @@ CREATE TABLE portfolio_snapshots (
     base_currency TEXT NOT NULL,
     nav TEXT NOT NULL CHECK (typeof(nav) = 'text'),
     cash TEXT NOT NULL CHECK (typeof(cash) = 'text'),
-    is_stale INTEGER CHECK (is_stale IS NULL OR is_stale IN (0, 1)),
+    is_stale INTEGER NOT NULL CHECK (is_stale IN (0, 1)),
     account_ref TEXT,
     metadata_json TEXT,
     created_at TEXT NOT NULL
