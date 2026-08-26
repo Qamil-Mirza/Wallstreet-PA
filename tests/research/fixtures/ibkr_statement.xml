@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<FlexQueryResponse queryName="Portfolio Snapshot" type="AF">
+  <FlexStatements count="1">
+    <FlexStatement accountId="U1234567" fromDate="20260824" toDate="20260824"
+                   period="LastBusinessDay" whenGenerated="20260824;120000">
+      <AccountInformation accountId="U1234567" currency="USD"
+                          accountType="INDIVIDUAL" tradingPermissions="Stocks,Bonds" />
+      <EquitySummaryInBase>
+        <EquitySummaryByReportDateInBase reportDate="20260824"
+                                         total="4725.50" cash="525.50" />
+      </EquitySummaryInBase>
+      <OpenPositions>
+        <OpenPosition accountId="U1234567" assetCategory="STK" currency="USD"
+                      symbol="NVDA" description="NVIDIA CORP" conid="4815747"
+                      isin="US67066G1040" listingExchange="NASDAQ"
+                      position="10" markPrice="120.00" positionValue="1200.00"
+                      costBasisMoney="900.00" />
+        <OpenPosition accountId="U1234567" assetCategory="BOND" currency="USD"
+                      symbol="US-TNOTE" description="US TREASURY NOTE" conid="987654321"
+                      cusip="91282CJL6" position="3" markPrice="1000.00"
+                      positionValue="3000.00" costBasisMoney="2985.25" />
+      </OpenPositions>
+    </FlexStatement>
+  </FlexStatements>
+</FlexQueryResponse>

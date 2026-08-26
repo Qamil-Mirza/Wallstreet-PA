@@ -13,7 +13,13 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 
-from .models import ClaimKind, EvidenceClaim, SourceDocument
+from .models import (
+    ClaimKind,
+    EvidenceClaim,
+    PortfolioSnapshot,
+    Position,
+    SourceDocument,
+)
 
 
 _MIGRATION_NAME = re.compile(r"^(?P<version>[0-9]+)_.+\.sql$")
@@ -207,6 +213,83 @@ class ResearchStore:
             return {row[0] for row in rows}
         finally:
             connection.close()
+
+    def insert_portfolio_snapshot(
+        self,
+        snapshot: PortfolioSnapshot,
+        positions: Sequence[Position],
+        account_ref: str,
+    ) -> None:
+        """Atomically insert an idempotent snapshot and all of its positions."""
+        position_records = tuple(positions)
+        if not isinstance(account_ref, str) or re.fullmatch(
+            r"acct_[0-9a-f]{24}", account_ref
+        ) is None:
+            raise ValueError("account_ref must be a hashed local reference")
+        if any(position.snapshot_id != snapshot.snapshot_id for position in position_records):
+            raise sqlite3.IntegrityError("position snapshot_id does not match snapshot")
+        position_ids = [position.position_id for position in position_records]
+        if len(position_ids) != len(set(position_ids)):
+            raise sqlite3.IntegrityError("duplicate position IDs are not allowed")
+
+        snapshot_values = (
+            snapshot.snapshot_id,
+            _utc_text(snapshot.as_of, "PortfolioSnapshot.as_of"),
+            snapshot.base_currency,
+            _decimal_text(snapshot.nav),
+            _decimal_text(snapshot.cash),
+            int(snapshot.is_stale),
+            account_ref,
+        )
+        expected_positions = tuple(
+            sorted(
+                (
+                    position.position_id,
+                    position.snapshot_id,
+                    position.symbol,
+                    _decimal_text(position.quantity),
+                    _decimal_text(position.market_value),
+                    position.currency,
+                    (
+                        _decimal_text(position.cost_basis)
+                        if position.cost_basis is not None
+                        else None
+                    ),
+                )
+                for position in position_records
+            )
+        )
+
+        with self.transaction() as connection:
+            existing = connection.execute(
+                "SELECT snapshot_id, as_of, base_currency, nav, cash, is_stale, "
+                "account_ref FROM portfolio_snapshots WHERE snapshot_id = ?",
+                (snapshot.snapshot_id,),
+            ).fetchone()
+            if existing is not None:
+                stored_positions = tuple(
+                    connection.execute(
+                        "SELECT position_id, snapshot_id, symbol, quantity, "
+                        "market_value, currency, cost_basis FROM positions "
+                        "WHERE snapshot_id = ? ORDER BY position_id",
+                        (snapshot.snapshot_id,),
+                    ).fetchall()
+                )
+                if tuple(existing) == snapshot_values and stored_positions == expected_positions:
+                    return
+                raise sqlite3.IntegrityError("conflicting snapshot already exists")
+
+            connection.execute(
+                "INSERT INTO portfolio_snapshots ("
+                "snapshot_id, as_of, base_currency, nav, cash, is_stale, "
+                "account_ref, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (*snapshot_values, _utc_text(datetime.now(timezone.utc))),
+            )
+            connection.executemany(
+                "INSERT INTO positions (position_id, snapshot_id, symbol, quantity, "
+                "market_value, currency, cost_basis) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                expected_positions,
+            )
 
     def insert_source_document(self, document: SourceDocument) -> None:
         """Insert source metadata needed to seed evidence integration tests."""
