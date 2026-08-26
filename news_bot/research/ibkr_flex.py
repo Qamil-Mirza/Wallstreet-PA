@@ -127,6 +127,7 @@ class FlexConfig:
             value = getattr(self, name)
             if not isinstance(value, str) or not value.strip():
                 raise ValueError(f"{name} must be nonblank")
+            _utf8_bytes(value, name)
         if not isinstance(self.max_polls, int) or isinstance(self.max_polls, bool) or self.max_polls <= 0:
             raise ValueError("max_polls must be a positive integer")
         if not _positive_finite(self.request_timeout_seconds):
@@ -135,15 +136,22 @@ class FlexConfig:
             raise ValueError("max_response_bytes must be a positive integer")
         if not isinstance(self.user_agent, str) or not self.user_agent.strip():
             raise ValueError("user_agent must be nonblank")
+        _utf8_bytes(self.user_agent, "user_agent")
         if not self.allowed_statement_hosts or any(
             not isinstance(host, str) or not host.strip()
             for host in self.allowed_statement_hosts
         ):
             raise ValueError("allowed_statement_hosts must contain nonblank hosts")
+        for host in self.allowed_statement_hosts:
+            _utf8_bytes(host, "allowed_statement_hosts")
         if self.ssl_required is not True:
             raise ValueError("ssl_required must be True")
         if not _positive_finite(self.max_staleness_hours):
             raise ValueError("max_staleness_hours must be positive and finite")
+        for name in ("send_url", "statement_url"):
+            value = getattr(self, name)
+            if isinstance(value, str):
+                _utf8_bytes(value, name)
         _validate_url(self.send_url, self, configuration=True)
         _validate_url(self.statement_url, self, configuration=True)
 
@@ -155,6 +163,18 @@ class PortfolioSyncResult:
     snapshot: PortfolioSnapshot
     positions: tuple[Position, ...]
     account_ref: str
+
+
+def _utf8_bytes(
+    value: str,
+    field_name: str,
+    error_type: type[Exception] = ValueError,
+) -> bytes:
+    """Encode trusted text or raise a fixed-message error without a raw cause."""
+    try:
+        return value.encode("utf-8")
+    except UnicodeEncodeError:
+        raise error_type(f"{field_name} must contain valid UTF-8 text") from None
 
 
 def _positive_finite(value: object) -> bool:
@@ -183,7 +203,7 @@ def _direct_text(root: ET.Element, name: str) -> str | None:
 
 def _safe_xml_root(xml: str | bytes, max_bytes: int) -> ET.Element:
     if isinstance(xml, str):
-        raw = xml.encode("utf-8")
+        raw = _utf8_bytes(xml, "Flex XML", FlexMalformedStatementError)
     elif isinstance(xml, bytes):
         raw = xml
     else:
@@ -299,6 +319,9 @@ def parse_statement(
     """Normalize one complete FlexQueryResponse without retaining account IDs."""
     if not isinstance(account_salt, str) or not account_salt.strip():
         raise ValueError("account_salt must be nonblank")
+    account_salt_bytes = _utf8_bytes(
+        account_salt, "account_salt", FlexMalformedStatementError
+    )
     root = _safe_xml_root(xml, max_bytes)
     if _local_name(root.tag) != "FlexQueryResponse":
         raise FlexMalformedStatementError("Expected a FlexQueryResponse statement")
@@ -355,7 +378,7 @@ def parse_statement(
         raise FlexMalformedStatementError("Missing required statement as-of timestamp")
     as_of = _parse_timestamp(generated, "statement as-of")
     account_ref = "acct_" + hmac.new(
-        account_salt.encode("utf-8"), account_id.encode("utf-8"), hashlib.sha256
+        account_salt_bytes, account_id.encode("utf-8"), hashlib.sha256
     ).hexdigest()[:24]
     snapshot_digest = hashlib.sha256(
         f"{account_ref}|{as_of.isoformat()}".encode("utf-8")

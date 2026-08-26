@@ -137,6 +137,7 @@ def _assert_exception_redacted(error, markers, caplog):
     rendered += caplog.text
     for marker in markers:
         assert marker not in rendered
+    return rendered
 
 
 def test_sync_uses_reference_code_and_never_logs_token(
@@ -168,6 +169,51 @@ def test_flex_config_rejects_blank_sensitive_values(field):
     values[field] = "  "
     with pytest.raises(ValueError, match=field):
         FlexConfig(**values)
+
+
+@pytest.mark.parametrize("field", ["token", "query_id", "account_salt"])
+@pytest.mark.parametrize(
+    ("surrogate", "escaped"),
+    [("\ud800", "\\ud800"), ("\udfff", "\\udfff")],
+)
+def test_flex_config_rejects_surrogates_in_sensitive_fields(
+    caplog, flex_config, field, surrogate, escaped
+):
+    marker = f"{field}-unicode-secret-marker{surrogate}"
+
+    with pytest.raises(ValueError, match=f"{field} must contain valid UTF-8 text") as captured:
+        replace(flex_config, **{field: marker})
+
+    assert captured.value.__cause__ is None
+    _assert_exception_redacted(
+        captured.value,
+        (marker, "unicode-secret-marker", surrogate, escaped, "UnicodeEncodeError"),
+        caplog,
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("user_agent", "safe-prefix-unicode-secret-marker\ud800"),
+        (
+            "send_url",
+            "https://ndcdyn.interactivebrokers.com/unicode-secret-marker\udfff",
+        ),
+    ],
+)
+def test_flex_config_rejects_surrogates_at_request_string_boundaries(
+    caplog, flex_config, field, value
+):
+    with pytest.raises(ValueError, match=f"{field} must contain valid UTF-8 text") as captured:
+        replace(flex_config, **{field: value})
+
+    assert captured.value.__cause__ is None
+    _assert_exception_redacted(
+        captured.value,
+        ("unicode-secret-marker", "\\ud800", "\\udfff", "UnicodeEncodeError"),
+        caplog,
+    )
 
 
 def test_flex_config_hides_sensitive_fields_and_validates_limits(flex_config):
@@ -477,6 +523,41 @@ def test_invalid_decimal_exception_chain_does_not_retain_value(caplog):
 
     assert captured.value.__cause__ is None
     _assert_exception_redacted(captured.value, (marker, ACCOUNT_ID), caplog)
+
+
+@pytest.mark.parametrize(
+    ("surrogate", "escaped"),
+    [("\ud800", "\\ud800"), ("\udfff", "\\udfff")],
+)
+def test_statement_xml_surrogates_raise_redacted_typed_error(
+    caplog, surrogate, escaped
+):
+    marker = f"xml-unicode-secret-marker{surrogate}"
+    xml = f"<FlexQueryResponse>{marker}</FlexQueryResponse>"
+
+    with pytest.raises(FlexMalformedStatementError) as captured:
+        parse_statement(xml, account_salt="safe-salt")
+
+    assert captured.value.__cause__ is None
+    _assert_exception_redacted(
+        captured.value,
+        (marker, "unicode-secret-marker", surrogate, escaped, "UnicodeEncodeError"),
+        caplog,
+    )
+
+
+def test_direct_parser_rejects_surrogate_account_salt_without_leak(caplog):
+    marker = "salt-unicode-secret-marker\ud800"
+
+    with pytest.raises(FlexMalformedStatementError, match="account_salt") as captured:
+        parse_statement(fixture("ibkr_statement.xml"), account_salt=marker)
+
+    assert captured.value.__cause__ is None
+    _assert_exception_redacted(
+        captured.value,
+        (marker, "unicode-secret-marker", "\\ud800", "UnicodeEncodeError"),
+        caplog,
+    )
 
 
 def test_oversized_response_is_rejected_without_body_in_error(requests_mock, flex_config):
