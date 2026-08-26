@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import logging
 import math
+import re
 import time
 import xml.etree.ElementTree as ET
 from collections.abc import Callable
@@ -35,6 +37,11 @@ DEFAULT_ALLOWED_HOSTS = (
     "gdcdyn.interactivebrokers.com",
 )
 _FUTURE_CLOCK_TOLERANCE = timedelta(minutes=5)
+_XML_DECLARATION = re.compile(
+    r"\s*<\?xml[^>]*\bencoding\s*=\s*['\"]([^'\"]+)['\"]",
+    re.IGNORECASE,
+)
+_QUERY_SECRET = re.compile(r"([?&](?:t|q)=)[^&#\s\"']*")
 
 
 class FlexError(RuntimeError):
@@ -117,7 +124,7 @@ class FlexConfig:
     max_polls: int = 5
     request_timeout_seconds: float = 30.0
     max_response_bytes: int = 5 * 1024 * 1024
-    user_agent: str = "news-bot-research/1.0"
+    user_agent: str = "Java"
     allowed_statement_hosts: tuple[str, ...] = DEFAULT_ALLOWED_HOSTS
     ssl_required: bool = True
     max_staleness_hours: float = 24.0
@@ -127,7 +134,9 @@ class FlexConfig:
             value = getattr(self, name)
             if not isinstance(value, str) or not value.strip():
                 raise ValueError(f"{name} must be nonblank")
-            _utf8_bytes(value, name)
+            encoded = _utf8_bytes(value, name)
+            if name == "account_salt" and len(encoded) < 16:
+                raise ValueError("account_salt must be at least 16 UTF-8 bytes")
         if not isinstance(self.max_polls, int) or isinstance(self.max_polls, bool) or self.max_polls <= 0:
             raise ValueError("max_polls must be a positive integer")
         if not _positive_finite(self.request_timeout_seconds):
@@ -163,6 +172,7 @@ class PortfolioSyncResult:
     snapshot: PortfolioSnapshot
     positions: tuple[Position, ...]
     account_ref: str
+    generated_at: datetime
 
 
 def _utf8_bytes(
@@ -201,6 +211,17 @@ def _direct_text(root: ET.Element, name: str) -> str | None:
     return values[0] if values else None
 
 
+def _direct_text_aliases(root: ET.Element, names: tuple[str, ...]) -> str | None:
+    values = [
+        (child.text or "").strip()
+        for child in root
+        if _local_name(child.tag) in names
+    ]
+    if len(set(values)) > 1:
+        raise FlexMalformedStatementError("Ambiguous statement URL in Flex response")
+    return values[0] if values else None
+
+
 def _safe_xml_root(xml: str | bytes, max_bytes: int) -> ET.Element:
     if isinstance(xml, str):
         raw = _utf8_bytes(xml, "Flex XML", FlexMalformedStatementError)
@@ -210,11 +231,31 @@ def _safe_xml_root(xml: str | bytes, max_bytes: int) -> ET.Element:
         raise TypeError("Flex XML must be str or bytes")
     if len(raw) > max_bytes:
         raise FlexTransportError("IBKR Flex response exceeded the configured size limit")
-    upper = raw.upper()
-    if b"<!DOCTYPE" in upper or b"<!ENTITY" in upper:
+    unsupported_boms = (
+        b"\xff\xfe",
+        b"\xfe\xff",
+        b"\x00\x00\xfe\xff",
+        b"\xff\xfe\x00\x00",
+    )
+    if raw.startswith(unsupported_boms) or b"\x00" in raw:
+        raise FlexMalformedStatementError("Flex XML must use UTF-8 encoding")
+    try:
+        normalized = raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        raise FlexMalformedStatementError("Flex XML must use UTF-8 encoding") from None
+    declaration = _XML_DECLARATION.match(normalized)
+    if declaration is not None and declaration.group(1).lower() not in {
+        "utf-8",
+        "utf8",
+        "us-ascii",
+        "ascii",
+    }:
+        raise FlexMalformedStatementError("Flex XML must use UTF-8 encoding")
+    folded = normalized.casefold()
+    if "<!doctype" in folded or "<!entity" in folded:
         raise FlexMalformedStatementError("Unsafe XML declarations are not allowed")
     try:
-        return ET.fromstring(raw)
+        return ET.fromstring(normalized.encode("utf-8"))
     except (ET.ParseError, UnicodeError):
         raise FlexMalformedStatementError("Malformed IBKR Flex XML") from None
 
@@ -288,6 +329,47 @@ def _optional_decimal(element: ET.Element, names: tuple[str, ...], label: str) -
     return _required_decimal(element, names, label)
 
 
+def _attribute(element: ET.Element, names: tuple[str, ...]) -> str | None:
+    """Return one normalized attribute value across documented casing variants."""
+    values = {
+        element.get(name, "").strip()
+        for name in names
+        if element.get(name) is not None and element.get(name, "").strip()
+    }
+    if len(values) > 1:
+        raise FlexMalformedStatementError("Ambiguous security identifier")
+    return next(iter(values), None)
+
+
+def _stable_security_identity(
+    *,
+    conid: str | None,
+    isin: str | None,
+    cusip: str | None,
+    figi: str | None,
+    external_security_id: str | None,
+    security_id_type: str | None,
+    asset_class: str,
+    symbol: str,
+    currency: str,
+) -> str:
+    if conid:
+        identity = f"conid:{conid}"
+    elif isin:
+        identity = f"isin:{isin}"
+    elif cusip:
+        identity = f"cusip:{cusip}"
+    elif figi:
+        identity = f"figi:{figi}"
+    elif external_security_id:
+        identity = (
+            f"security_id:{security_id_type or 'UNKNOWN'}:{external_security_id}"
+        )
+    else:
+        identity = f"fallback:{asset_class}|{symbol.upper()}|{currency}"
+    return "security_" + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
+
+
 def portfolio_is_stale(
     snapshot_as_of: datetime,
     now: datetime,
@@ -316,12 +398,16 @@ def parse_statement(
     max_staleness_hours: int | float | Decimal | None = None,
     max_bytes: int = 5 * 1024 * 1024,
 ) -> PortfolioSyncResult:
-    """Normalize one complete FlexQueryResponse without retaining account IDs."""
+    """Normalize one account; date-only report dates mean start-of-day UTC."""
     if not isinstance(account_salt, str) or not account_salt.strip():
         raise ValueError("account_salt must be nonblank")
     account_salt_bytes = _utf8_bytes(
         account_salt, "account_salt", FlexMalformedStatementError
     )
+    if len(account_salt_bytes) < 16:
+        raise FlexMalformedStatementError(
+            "account_salt must be at least 16 UTF-8 bytes"
+        )
     root = _safe_xml_root(xml, max_bytes)
     if _local_name(root.tag) != "FlexQueryResponse":
         raise FlexMalformedStatementError("Expected a FlexQueryResponse statement")
@@ -376,7 +462,8 @@ def parse_statement(
     generated = statement.get("whenGenerated") or statement.get("dateTime")
     if not generated:
         raise FlexMalformedStatementError("Missing required statement as-of timestamp")
-    as_of = _parse_timestamp(generated, "statement as-of")
+    generated_at = _parse_timestamp(generated, "statement generation")
+    as_of = latest_date
     account_ref = "acct_" + hmac.new(
         account_salt_bytes, account_id.encode("utf-8"), hashlib.sha256
     ).hexdigest()[:24]
@@ -385,9 +472,29 @@ def parse_statement(
     ).hexdigest()[:24]
     snapshot_id = f"snapshot_{snapshot_digest}"
 
+    dated_positions: list[tuple[datetime | None, ET.Element]] = []
+    for node in open_positions:
+        raw_report_date = node.get("reportDate")
+        dated_positions.append(
+            (
+                _parse_timestamp(raw_report_date, "position reportDate")
+                if raw_report_date
+                else None,
+                node,
+            )
+        )
+    if any(report_date is not None for report_date, _ in dated_positions):
+        if any(report_date is None for report_date, _ in dated_positions):
+            raise FlexMalformedStatementError("OpenPosition report dates are incomplete")
+        selected_positions = [
+            node for report_date, node in dated_positions if report_date == latest_date
+        ]
+    else:
+        selected_positions = open_positions
+
     positions: list[Position] = []
     position_ids: set[str] = set()
-    for node in open_positions:
+    for node in selected_positions:
         symbol = (node.get("symbol") or "").strip()
         currency = (node.get("currency") or base_currency).strip().upper()
         if not symbol or not currency:
@@ -399,16 +506,37 @@ def parse_statement(
         cost_basis = _optional_decimal(
             node, ("costBasisMoney", "costBasis"), "position cost basis"
         )
-        identifiers = tuple(
-            f"{name}:{node.get(name).strip()}"
-            for name in ("conid", "isin", "cusip")
-            if node.get(name) is not None and node.get(name).strip()
+        asset_class = (node.get("assetCategory") or "UNKNOWN").strip().upper()
+        conid = _attribute(node, ("conid", "Conid"))
+        isin = _attribute(node, ("isin", "ISIN"))
+        cusip = _attribute(node, ("cusip", "CUSIP"))
+        figi = _attribute(node, ("figi", "FIGI"))
+        external_security_id = _attribute(
+            node, ("securityID", "securityId", "SecurityID")
         )
-        identity = "|".join(identifiers) or "|".join(
-            ((node.get("assetCategory") or "").strip(), symbol, currency)
+        security_id_type = _attribute(
+            node, ("securityIDType", "securityIdType", "SecurityIDType")
+        )
+        isin = isin.upper() if isin else None
+        cusip = cusip.upper() if cusip else None
+        figi = figi.upper() if figi else None
+        external_security_id = (
+            external_security_id.upper() if external_security_id else None
+        )
+        security_id_type = security_id_type.upper() if security_id_type else None
+        security_id = _stable_security_identity(
+            conid=conid,
+            isin=isin,
+            cusip=cusip,
+            figi=figi,
+            external_security_id=external_security_id,
+            security_id_type=security_id_type,
+            asset_class=asset_class,
+            symbol=symbol,
+            currency=currency,
         )
         position_id = "position_" + hashlib.sha256(
-            f"{snapshot_id}|{identity}".encode("utf-8")
+            f"{snapshot_id}|{security_id}".encode("utf-8")
         ).hexdigest()[:24]
         if position_id in position_ids:
             raise FlexMalformedStatementError("Duplicate or ambiguous OpenPosition")
@@ -422,33 +550,67 @@ def parse_statement(
                 market_value=market_value,
                 currency=currency,
                 cost_basis=cost_basis,
+                security_id=security_id,
+                asset_class=asset_class,
+                conid=conid,
+                isin=isin,
+                cusip=cusip,
+                figi=figi,
+                external_security_id=external_security_id,
+                security_id_type=security_id_type,
             )
         )
 
     if (now is None) != (max_staleness_hours is None):
         raise ValueError("now and max_staleness_hours must be provided together")
-    is_stale = (
-        portfolio_is_stale(as_of, now, max_staleness_hours)
-        if now is not None and max_staleness_hours is not None
-        else False
-    )
     snapshot = PortfolioSnapshot(
         snapshot_id=snapshot_id,
         as_of=as_of,
         base_currency=base_currency,
         nav=nav,
         cash=cash,
-        is_stale=is_stale,
+        is_stale=False,
     )
-    return PortfolioSyncResult(snapshot, tuple(positions), account_ref)
+    return PortfolioSyncResult(snapshot, tuple(positions), account_ref, generated_at)
 
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _redact_log_value(value: object) -> object:
+    if isinstance(value, str):
+        return _QUERY_SECRET.sub(r"\1[REDACTED]", value)
+    if isinstance(value, tuple):
+        return tuple(_redact_log_value(item) for item in value)
+    if isinstance(value, dict):
+        return {key: _redact_log_value(item) for key, item in value.items()}
+    return value
+
+
+class _FlexQueryLogFilter(logging.Filter):
+    """Redact Flex protocol query values from HTTP-library debug records."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.msg = _redact_log_value(record.msg)
+        record.args = _redact_log_value(record.args)
+        return True
+
+
+def _install_http_log_redaction() -> None:
+    for logger_name in (
+        "urllib3.connectionpool",
+        "urllib3",
+        "requests.packages.urllib3.connectionpool",
+        "requests",
+    ):
+        logger = logging.getLogger(logger_name)
+        if not any(isinstance(item, _FlexQueryLogFilter) for item in logger.filters):
+            logger.addFilter(_FlexQueryLogFilter())
+
+
 class FlexClient:
-    """GET-only client for retrieving and normalizing one configured Flex query."""
+    """GET-only client; an injected Session remains owned by its caller."""
 
     def __init__(
         self,
@@ -459,11 +621,27 @@ class FlexClient:
         clock: Callable[[], datetime] = _utc_now,
     ) -> None:
         self.config = config
+        self._owns_session = session is None
         self.session = session if session is not None else requests.Session()
+        if self._owns_session:
+            self.session.trust_env = False
         self.sleeper = sleeper
         self.clock = clock
+        _install_http_log_redaction()
+
+    def close(self) -> None:
+        """Close only an internally-created HTTP session."""
+        if self._owns_session:
+            self.session.close()
+
+    def __enter__(self) -> "FlexClient":
+        return self
+
+    def __exit__(self, *_exc_info: object) -> None:
+        self.close()
 
     def _get(self, url: str, params: dict[str, str]) -> bytes:
+        response: requests.Response | None = None
         try:
             response = self.session.get(
                 url,
@@ -471,19 +649,47 @@ class FlexClient:
                 headers={"User-Agent": self.config.user_agent},
                 timeout=self.config.request_timeout_seconds,
                 allow_redirects=False,
+                stream=True,
             )
+            if 300 <= response.status_code < 400:
+                raise FlexTransportError("IBKR Flex redirects are not allowed")
+            if not 200 <= response.status_code < 300:
+                raise FlexTransportError(
+                    f"IBKR Flex HTTP response status {response.status_code}"
+                )
+            content_length = response.headers.get("Content-Length")
+            if content_length is not None:
+                try:
+                    declared_size = int(content_length)
+                except (TypeError, ValueError):
+                    raise FlexTransportError(
+                        "IBKR Flex Content-Length is invalid"
+                    ) from None
+                if declared_size < 0:
+                    raise FlexTransportError("IBKR Flex Content-Length is invalid")
+                if declared_size > self.config.max_response_bytes:
+                    raise FlexTransportError(
+                        "IBKR Flex response exceeded the configured size limit"
+                    )
+
+            body = bytearray()
+            chunk_size = min(64 * 1024, self.config.max_response_bytes + 1)
+            for chunk in response.iter_content(chunk_size=chunk_size):
+                if not chunk:
+                    continue
+                body.extend(chunk)
+                if len(body) > self.config.max_response_bytes:
+                    raise FlexTransportError(
+                        "IBKR Flex response exceeded the configured size limit"
+                    )
+            return bytes(body)
+        except FlexError:
+            raise
         except requests.RequestException:
             raise FlexTransportError("IBKR Flex HTTPS request failed") from None
-        if 300 <= response.status_code < 400:
-            raise FlexTransportError("IBKR Flex redirects are not allowed")
-        if not 200 <= response.status_code < 300:
-            raise FlexTransportError(
-                f"IBKR Flex HTTP response status {response.status_code}"
-            )
-        content = response.content
-        if len(content) > self.config.max_response_bytes:
-            raise FlexTransportError("IBKR Flex response exceeded the configured size limit")
-        return content
+        finally:
+            if response is not None:
+                response.close()
 
     def sync(self, store: ResearchStore | None = None) -> PortfolioSyncResult:
         """Retrieve, parse, and optionally atomically persist one statement."""
@@ -503,7 +709,7 @@ class FlexClient:
         if (_direct_text(send_root, "Status") or "").lower() != "success":
             raise FlexMalformedStatementError("SendRequest did not return success")
         reference_code = _direct_text(send_root, "ReferenceCode")
-        statement_url = _direct_text(send_root, "Url")
+        statement_url = _direct_text_aliases(send_root, ("url", "Url"))
         if not reference_code or not statement_url:
             raise FlexMalformedStatementError("SendRequest response is incomplete")
         statement_url = _validate_url(statement_url, self.config)
@@ -542,8 +748,6 @@ class FlexClient:
         result = parse_statement(
             statement_body,
             account_salt=self.config.account_salt,
-            now=self.clock(),
-            max_staleness_hours=self.config.max_staleness_hours,
             max_bytes=self.config.max_response_bytes,
         )
         if store is not None:

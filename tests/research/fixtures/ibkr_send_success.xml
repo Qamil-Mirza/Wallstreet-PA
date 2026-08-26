@@ -2,5 +2,5 @@
 <FlexStatementResponse timestamp="20260824;120000">
   <Status>Success</Status>
   <ReferenceCode>REF-20260824-001</ReferenceCode>
-  <Url>https://ndcdyn.interactivebrokers.com/AccountManagement/FlexWebService/GetStatement</Url>
+  <url>https://ndcdyn.interactivebrokers.com/AccountManagement/FlexWebService/GetStatement</url>
 </FlexStatementResponse>

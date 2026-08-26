@@ -11,11 +11,15 @@
       </EquitySummaryInBase>
       <OpenPositions>
         <OpenPosition accountId="U1234567" assetCategory="STK" currency="USD"
+                      reportDate="20260824"
                       symbol="NVDA" description="NVIDIA CORP" conid="4815747"
-                      isin="US67066G1040" listingExchange="NASDAQ"
+                      isin="US67066G1040" figi="BBG000BBJQV0"
+                      securityID="67066G104" securityIDType="CUSIP"
+                      listingExchange="NASDAQ"
                       position="10" markPrice="120.00" positionValue="1200.00"
                       costBasisMoney="900.00" />
         <OpenPosition accountId="U1234567" assetCategory="BOND" currency="USD"
+                      reportDate="20260824"
                       symbol="US-TNOTE" description="US TREASURY NOTE" conid="987654321"
                       cusip="91282CJL6" position="3" markPrice="1000.00"
                       positionValue="3000.00" costBasisMoney="2985.25" />

@@ -70,6 +70,22 @@ def _require_decimal(
             raise ValueError(f"{record_name}.{field_name} must be finite")
 
 
+def _require_optional_text(
+    record_name: str, field_name: str, value: str | None
+) -> None:
+    """Validate normalized optional identifier fields at their domain boundary."""
+    if value is None:
+        return
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{record_name}.{field_name} must be nonblank text")
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        raise ValueError(
+            f"{record_name}.{field_name} must contain valid UTF-8 text"
+        ) from None
+
+
 @dataclass(frozen=True)
 class PortfolioSnapshot:
     """Point-in-time portfolio value summary."""
@@ -98,11 +114,32 @@ class Position:
     market_value: Decimal
     currency: str
     cost_basis: Decimal | None = None
+    security_id: str | None = None
+    asset_class: str | None = None
+    conid: str | None = None
+    isin: str | None = None
+    cusip: str | None = None
+    figi: str | None = None
+    external_security_id: str | None = None
+    security_id_type: str | None = None
 
     def __post_init__(self) -> None:
         _require_decimal(type(self).__name__, "quantity", self.quantity)
         _require_decimal(type(self).__name__, "market_value", self.market_value)
         _require_decimal(type(self).__name__, "cost_basis", self.cost_basis)
+        for field_name in (
+            "security_id",
+            "asset_class",
+            "conid",
+            "isin",
+            "cusip",
+            "figi",
+            "external_security_id",
+            "security_id_type",
+        ):
+            _require_optional_text(
+                type(self).__name__, field_name, getattr(self, field_name)
+            )
 
 
 @dataclass(frozen=True)

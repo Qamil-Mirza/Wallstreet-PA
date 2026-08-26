@@ -228,6 +228,8 @@ class ResearchStore:
             raise ValueError("account_ref must be a hashed local reference")
         if any(position.snapshot_id != snapshot.snapshot_id for position in position_records):
             raise sqlite3.IntegrityError("position snapshot_id does not match snapshot")
+        if any(position.security_id is None for position in position_records):
+            raise sqlite3.IntegrityError("position security_id is required")
         position_ids = [position.position_id for position in position_records]
         if len(position_ids) != len(set(position_ids)):
             raise sqlite3.IntegrityError("duplicate position IDs are not allowed")
@@ -240,6 +242,35 @@ class ResearchStore:
             _decimal_text(snapshot.cash),
             int(snapshot.is_stale),
             account_ref,
+        )
+        security_records = tuple(
+            sorted(
+                (
+                    position.security_id,
+                    position.symbol,
+                    position.asset_class or "UNKNOWN",
+                    None,
+                    position.currency,
+                    _canonical_json(
+                        {
+                            key: value
+                            for key, value in (
+                                ("conid", position.conid),
+                                ("isin", position.isin),
+                                ("cusip", position.cusip),
+                                ("figi", position.figi),
+                                (
+                                    "external_security_id",
+                                    position.external_security_id,
+                                ),
+                                ("security_id_type", position.security_id_type),
+                            )
+                            if value is not None
+                        }
+                    ),
+                )
+                for position in position_records
+            )
         )
         expected_positions = tuple(
             sorted(
@@ -255,12 +286,33 @@ class ResearchStore:
                         if position.cost_basis is not None
                         else None
                     ),
+                    position.security_id,
                 )
                 for position in position_records
             )
         )
 
         with self.transaction() as connection:
+            created_at = _utc_text(datetime.now(timezone.utc))
+            for security in security_records:
+                existing_security = connection.execute(
+                    "SELECT security_id, symbol, security_type, exchange, currency, "
+                    "identifiers_json FROM securities WHERE security_id = ?",
+                    (security[0],),
+                ).fetchone()
+                if existing_security is None:
+                    connection.execute(
+                        "INSERT INTO securities (security_id, entity_id, symbol, "
+                        "security_type, exchange, currency, identifiers_json, "
+                        "metadata_json, created_at) VALUES (?, NULL, ?, ?, ?, ?, ?, "
+                        "NULL, ?)",
+                        (*security, created_at),
+                    )
+                elif tuple(existing_security) != security:
+                    raise sqlite3.IntegrityError(
+                        "conflicting security identity already exists"
+                    )
+
             existing = connection.execute(
                 "SELECT snapshot_id, as_of, base_currency, nav, cash, is_stale, "
                 "account_ref FROM portfolio_snapshots WHERE snapshot_id = ?",
@@ -270,7 +322,7 @@ class ResearchStore:
                 stored_positions = tuple(
                     connection.execute(
                         "SELECT position_id, snapshot_id, symbol, quantity, "
-                        "market_value, currency, cost_basis FROM positions "
+                        "market_value, currency, cost_basis, security_id FROM positions "
                         "WHERE snapshot_id = ? ORDER BY position_id",
                         (snapshot.snapshot_id,),
                     ).fetchall()
@@ -283,11 +335,12 @@ class ResearchStore:
                 "INSERT INTO portfolio_snapshots ("
                 "snapshot_id, as_of, base_currency, nav, cash, is_stale, "
                 "account_ref, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (*snapshot_values, _utc_text(datetime.now(timezone.utc))),
+                (*snapshot_values, created_at),
             )
             connection.executemany(
                 "INSERT INTO positions (position_id, snapshot_id, symbol, quantity, "
-                "market_value, currency, cost_basis) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "market_value, currency, cost_basis, security_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 expected_positions,
             )
 

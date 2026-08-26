@@ -1,11 +1,14 @@
 """Read-only IBKR Flex transport, parsing, and persistence tests."""
 
 import logging
+import json
 import sqlite3
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from threading import Barrier
 
 import pytest
 import requests
@@ -32,6 +35,7 @@ from .conftest import fixture, make_migrated_store, utc
 TOKEN = "test-token-never-log"
 QUERY_ID = "query-12345"
 ACCOUNT_ID = "U1234567"
+ACCOUNT_SALT = "local-test-salt-strong"
 
 
 @dataclass(frozen=True)
@@ -42,46 +46,110 @@ class _Request:
     headers: dict[str, str]
     timeout: float
     allow_redirects: bool
+    stream: bool
 
 
 class _Response:
     def __init__(
-        self, text: str, status_code: int = 200, headers: dict[str, str] | None = None
+        self,
+        text: str,
+        status_code: int = 200,
+        headers: dict[str, str] | None = None,
+        chunks: list[bytes] | None = None,
+        iteration_error: BaseException | None = None,
     ) -> None:
-        self.content = text.encode("utf-8")
+        self._chunks = chunks if chunks is not None else [text.encode("utf-8")]
+        self.iteration_error = iteration_error
         self.status_code = status_code
         self.headers = headers or {}
+        self.iteration_count = 0
+        self.yield_count = 0
+        self.closed = False
+
+    @property
+    def content(self):
+        raise AssertionError("Flex transport must not access response.content")
+
+    def iter_content(self, chunk_size):
+        self.iteration_count += 1
+        for chunk in self._chunks:
+            self.yield_count += 1
+            yield chunk
+        if self.iteration_error is not None:
+            raise self.iteration_error
+
+    def close(self):
+        self.closed = True
 
 
 class _Session:
     def __init__(self, adapter: "_RequestsMock") -> None:
         self.adapter = adapter
+        self.trust_env = True
+        self.closed = False
 
-    def get(self, url, *, params, headers, timeout, allow_redirects=True):
+    def get(
+        self, url, *, params, headers, timeout, allow_redirects=True, stream=False
+    ):
         return self.adapter.request(
             url,
             params=params,
             headers=headers,
             timeout=timeout,
             allow_redirects=allow_redirects,
+            stream=stream,
         )
+
+    def close(self):
+        self.closed = True
 
 
 class _RequestsMock:
     def __init__(self) -> None:
         self._registered: dict[
-            str, list[tuple[str, int, dict[str, str]] | BaseException]
+            str,
+            list[
+                tuple[
+                    str,
+                    int,
+                    dict[str, str],
+                    list[bytes] | None,
+                    BaseException | None,
+                ]
+                | BaseException
+            ],
         ] = {}
         self.request_history: list[_Request] = []
+        self.responses: list[_Response] = []
 
-    def get(self, url, *, text="", status_code=200, headers=None, exc=None):
-        response = exc if exc is not None else (text, status_code, headers or {})
+    def get(
+        self,
+        url,
+        *,
+        text="",
+        status_code=200,
+        headers=None,
+        chunks=None,
+        iteration_error=None,
+        exc=None,
+    ):
+        response = (
+            exc
+            if exc is not None
+            else (text, status_code, headers or {}, chunks, iteration_error)
+        )
         self._registered.setdefault(url, []).append(response)
 
-    def request(self, url, *, params, headers, timeout, allow_redirects):
+    def request(self, url, *, params, headers, timeout, allow_redirects, stream):
         self.request_history.append(
             _Request(
-                "GET", url, dict(params), dict(headers), timeout, allow_redirects
+                "GET",
+                url,
+                dict(params),
+                dict(headers),
+                timeout,
+                allow_redirects,
+                stream,
             )
         )
         registered = self._registered.get(url, [])
@@ -90,8 +158,16 @@ class _RequestsMock:
         response = registered.pop(0)
         if isinstance(response, BaseException):
             raise response
-        text, status_code, response_headers = response
-        return _Response(text, status_code, response_headers)
+        text, status_code, response_headers, chunks, iteration_error = response
+        result = _Response(
+            text,
+            status_code,
+            response_headers,
+            chunks,
+            iteration_error,
+        )
+        self.responses.append(result)
+        return result
 
 
 @pytest.fixture
@@ -105,7 +181,7 @@ def requests_mock(monkeypatch):
 
 @pytest.fixture
 def flex_config():
-    return FlexConfig(token=TOKEN, query_id=QUERY_ID, account_salt="local-test-salt")
+    return FlexConfig(token=TOKEN, query_id=QUERY_ID, account_salt=ACCOUNT_SALT)
 
 
 def _error_xml(code: int) -> str:
@@ -151,9 +227,35 @@ def test_sync_uses_reference_code_and_never_logs_token(
     assert flex_config.token not in caplog.text
 
 
+def test_official_lowercase_url_and_java_user_agent_are_used(
+    requests_mock, flex_config
+):
+    assert flex_config.user_agent == "Java"
+    requests_mock.get(flex_config.send_url, text=fixture("ibkr_send_success.xml"))
+    requests_mock.get(flex_config.statement_url, text=fixture("ibkr_statement.xml"))
+
+    FlexClient(flex_config).sync()
+
+    assert requests_mock.request_history[0].headers["User-Agent"] == "Java"
+
+
+def test_conflicting_lowercase_and_legacy_statement_urls_are_rejected(
+    requests_mock, flex_config
+):
+    send_xml = fixture("ibkr_send_success.xml").replace(
+        "</FlexStatementResponse>",
+        "<Url>https://gdcdyn.interactivebrokers.com/GetStatement</Url>"
+        "</FlexStatementResponse>",
+    )
+    requests_mock.get(flex_config.send_url, text=send_xml)
+
+    with pytest.raises(FlexMalformedStatementError, match="Ambiguous"):
+        FlexClient(flex_config).sync()
+
+
 def test_account_id_is_replaced_by_stable_local_hash(flex_config):
     result = parse_statement(
-        fixture("ibkr_statement.xml"), account_salt="local-test-salt"
+        fixture("ibkr_statement.xml"), account_salt=ACCOUNT_SALT
     )
     assert result.account_ref.startswith("acct_")
     assert "U1234567" not in result.account_ref
@@ -220,7 +322,7 @@ def test_flex_config_hides_sensitive_fields_and_validates_limits(flex_config):
     rendered = repr(flex_config)
     assert TOKEN not in rendered
     assert QUERY_ID not in rendered
-    assert "local-test-salt" not in rendered
+    assert ACCOUNT_SALT not in rendered
     with pytest.raises(ValueError, match="max_polls"):
         replace(flex_config, max_polls=0)
     with pytest.raises(ValueError, match="HTTPS"):
@@ -272,7 +374,124 @@ def test_send_and_poll_use_get_params_headers_and_timeout(requests_mock, flex_co
     assert send.timeout == statement.timeout == flex_config.request_timeout_seconds
     assert send.allow_redirects is False
     assert statement.allow_redirects is False
+    assert send.stream is True
+    assert statement.stream is True
+    assert all(response.closed for response in requests_mock.responses)
     assert TOKEN not in send.url and TOKEN not in statement.url
+
+
+@pytest.mark.parametrize("content_length", ["-1", "not-an-integer", "999"])
+def test_content_length_is_validated_before_body_iteration(
+    requests_mock, flex_config, content_length
+):
+    config = replace(flex_config, max_response_bytes=64)
+    requests_mock.get(
+        config.send_url,
+        headers={"Content-Length": content_length},
+        chunks=[b"body-secret-marker"],
+    )
+
+    with pytest.raises(FlexTransportError) as captured:
+        FlexClient(config).sync()
+
+    response = requests_mock.responses[0]
+    assert response.iteration_count == 0
+    assert response.closed
+    assert "body-secret-marker" not in str(captured.value)
+
+
+def test_chunked_overflow_stops_early_and_closes_response(requests_mock, flex_config):
+    config = replace(flex_config, max_response_bytes=10)
+    requests_mock.get(
+        config.send_url,
+        chunks=[b"123456", b"secret7", b"must-not-be-read"],
+    )
+
+    with pytest.raises(FlexTransportError) as captured:
+        FlexClient(config).sync()
+
+    response = requests_mock.responses[0]
+    assert response.yield_count == 2
+    assert response.closed
+    assert "secret7" not in str(captured.value)
+
+
+def test_stream_iteration_error_is_redacted_and_response_closed(
+    requests_mock, caplog, flex_config
+):
+    marker = "stream-iteration-secret-marker"
+    requests_mock.get(
+        flex_config.send_url,
+        chunks=[b"partial"],
+        iteration_error=requests.ConnectionError(f"{marker} {TOKEN} {QUERY_ID}"),
+    )
+
+    with pytest.raises(FlexTransportError) as captured:
+        FlexClient(flex_config).sync()
+
+    assert requests_mock.responses[0].closed
+    _assert_exception_redacted(captured.value, (marker, TOKEN, QUERY_ID), caplog)
+
+
+def test_redirect_and_http_error_responses_are_always_closed(
+    requests_mock, flex_config
+):
+    requests_mock.get(
+        flex_config.send_url,
+        status_code=302,
+        headers={"Location": "https://evil.test/secret"},
+    )
+    with pytest.raises(FlexTransportError):
+        FlexClient(flex_config).sync()
+    assert requests_mock.responses[0].closed
+
+
+def test_internal_session_disables_environment_proxies_and_is_owned(
+    requests_mock, flex_config
+):
+    client = FlexClient(flex_config)
+    assert client.session.trust_env is False
+    client.close()
+    assert client.session.closed
+
+
+def test_injected_session_remains_caller_owned(flex_config):
+    adapter = _RequestsMock()
+    session = _Session(adapter)
+    client = FlexClient(flex_config, session=session)
+    client.close()
+    assert session.trust_env is True
+    assert not session.closed
+
+
+def test_http_library_debug_logs_redact_flex_query_values(caplog, flex_config):
+    FlexClient(flex_config)
+    token_marker = "logging-secret%2Ftoken"
+    query_marker = "logging-secret-query"
+    prepared = requests.Request(
+        "GET",
+        flex_config.send_url,
+        params={"t": token_marker, "q": query_marker, "v": "3"},
+    ).prepare()
+    path_url = prepared.path_url
+
+    with caplog.at_level(logging.DEBUG, logger="urllib3.connectionpool"):
+        logging.getLogger("urllib3.connectionpool").debug(
+            '%s://%s:%s "%s %s HTTP/%s" %s %s',
+            "https",
+            "ndcdyn.interactivebrokers.com",
+            443,
+            "GET",
+            path_url,
+            "1.1",
+            200,
+            123,
+        )
+
+    assert token_marker not in caplog.text
+    assert "logging-secret%252Ftoken" not in caplog.text
+    assert query_marker not in caplog.text
+    assert "t=%5BREDACTED%5D" in caplog.text or "t=[REDACTED]" in caplog.text
 
 
 @pytest.mark.parametrize(
@@ -519,7 +738,7 @@ def test_invalid_decimal_exception_chain_does_not_retain_value(caplog):
     )
 
     with pytest.raises(FlexMalformedStatementError) as captured:
-        parse_statement(xml, account_salt="salt")
+        parse_statement(xml, account_salt=ACCOUNT_SALT)
 
     assert captured.value.__cause__ is None
     _assert_exception_redacted(captured.value, (marker, ACCOUNT_ID), caplog)
@@ -536,7 +755,7 @@ def test_statement_xml_surrogates_raise_redacted_typed_error(
     xml = f"<FlexQueryResponse>{marker}</FlexQueryResponse>"
 
     with pytest.raises(FlexMalformedStatementError) as captured:
-        parse_statement(xml, account_salt="safe-salt")
+        parse_statement(xml, account_salt=ACCOUNT_SALT)
 
     assert captured.value.__cause__ is None
     _assert_exception_redacted(
@@ -560,6 +779,62 @@ def test_direct_parser_rejects_surrogate_account_salt_without_leak(caplog):
     )
 
 
+@pytest.mark.parametrize(
+    ("encoding", "with_bom"),
+    [
+        ("utf-16-le", False),
+        ("utf-16-be", False),
+        ("utf-32-le", False),
+        ("utf-32-be", False),
+        ("utf-16", True),
+        ("utf-32", True),
+    ],
+)
+def test_non_utf8_xml_encodings_are_rejected_before_entity_processing(
+    caplog, encoding, with_bom
+):
+    marker = "encoded-entity-secret-marker"
+    text = (
+        '<!DoCtYpE FlexQueryResponse [<!EnTiTy x "'
+        f'{marker}">]><FlexQueryResponse>&x;</FlexQueryResponse>'
+    )
+    payload = text.encode(encoding)
+
+    with pytest.raises(FlexMalformedStatementError, match="UTF-8") as captured:
+        parse_statement(payload, account_salt=ACCOUNT_SALT)
+
+    assert captured.value.__cause__ is None
+    _assert_exception_redacted(captured.value, (marker,), caplog)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b'<?xml version="1.0" encoding="ISO-8859-1"?><FlexQueryResponse/>',
+        b"<FlexQuery\x00Response/>",
+    ],
+)
+def test_unsupported_declaration_and_nul_xml_are_rejected(payload):
+    with pytest.raises(FlexMalformedStatementError, match="UTF-8"):
+        parse_statement(payload, account_salt=ACCOUNT_SALT)
+
+
+def test_mixed_case_doctype_and_entity_are_rejected_without_expansion():
+    xml = (
+        '<!DoCtYpE FlexQueryResponse [<!EnTiTy x "entity-secret-marker">]>'
+        "<FlexQueryResponse>&x;</FlexQueryResponse>"
+    )
+    with pytest.raises(FlexMalformedStatementError, match="declarations") as captured:
+        parse_statement(xml, account_salt=ACCOUNT_SALT)
+    assert "entity-secret-marker" not in str(captured.value)
+
+
+def test_utf8_bom_statement_is_supported():
+    payload = b"\xef\xbb\xbf" + fixture("ibkr_statement.xml").encode("utf-8")
+    result = parse_statement(payload, account_salt=ACCOUNT_SALT)
+    assert result.snapshot.base_currency == "USD"
+
+
 def test_oversized_response_is_rejected_without_body_in_error(requests_mock, flex_config):
     config = replace(flex_config, max_response_bytes=32)
     body = "x" * 33
@@ -570,9 +845,10 @@ def test_oversized_response_is_rejected_without_body_in_error(requests_mock, fle
 
 
 def test_statement_parses_exact_decimals_dates_and_positions():
-    result = parse_statement(fixture("ibkr_statement.xml"), account_salt="salt")
+    result = parse_statement(fixture("ibkr_statement.xml"), account_salt=ACCOUNT_SALT)
 
-    assert result.snapshot.as_of == datetime(2026, 8, 24, 12, tzinfo=timezone.utc)
+    assert result.snapshot.as_of == datetime(2026, 8, 24, tzinfo=timezone.utc)
+    assert result.generated_at == datetime(2026, 8, 24, 12, tzinfo=timezone.utc)
     assert result.snapshot.nav == Decimal("4725.50")
     assert result.snapshot.cash == Decimal("525.50")
     assert result.positions[0].quantity == Decimal("10")
@@ -581,12 +857,165 @@ def test_statement_parses_exact_decimals_dates_and_positions():
     assert len(result.positions) == 2
 
 
+def test_report_date_drives_source_freshness_not_generation_time():
+    xml = fixture("ibkr_statement.xml").replace(
+        'whenGenerated="20260824;120000"',
+        'whenGenerated="20260826;120000"',
+    )
+
+    result = parse_statement(xml, account_salt=ACCOUNT_SALT)
+
+    assert result.snapshot.as_of == utc(2026, 8, 24)
+    assert result.generated_at == datetime(2026, 8, 26, 12, tzinfo=timezone.utc)
+    assert portfolio_is_stale(result.snapshot.as_of, utc(2026, 8, 26), max_hours=24)
+
+
+def test_evaluation_clock_does_not_change_snapshot_or_persistence(tmp_path):
+    xml = fixture("ibkr_statement.xml")
+    before = parse_statement(
+        xml,
+        account_salt=ACCOUNT_SALT,
+        now=utc(2026, 8, 24),
+        max_staleness_hours=24,
+    )
+    after = parse_statement(
+        xml,
+        account_salt=ACCOUNT_SALT,
+        now=utc(2026, 8, 30),
+        max_staleness_hours=24,
+    )
+    assert before == after
+    assert before.snapshot.is_stale is False
+
+    store = make_migrated_store(tmp_path)
+    store.insert_portfolio_snapshot(before.snapshot, before.positions, before.account_ref)
+    store.insert_portfolio_snapshot(after.snapshot, after.positions, after.account_ref)
+
+
+def test_multiple_report_dates_select_latest_summary_and_holdings():
+    xml = fixture("ibkr_statement.xml")
+    earlier_summary = (
+        '<EquitySummaryByReportDateInBase reportDate="20260823" '
+        'total="4700.00" cash="500.00" />'
+    )
+    xml = xml.replace(
+        "      <EquitySummaryInBase>",
+        "      <EquitySummaryInBase>" + earlier_summary,
+    )
+    earlier_position = (
+        '<OpenPosition accountId="U1234567" reportDate="20260823" '
+        'assetCategory="STK" currency="USD" symbol="OLD" conid="111" '
+        'position="1" positionValue="1.00" />'
+    )
+    xml = xml.replace("      <OpenPositions>", "      <OpenPositions>" + earlier_position)
+
+    result = parse_statement(xml, account_salt=ACCOUNT_SALT)
+
+    assert result.snapshot.nav == Decimal("4725.50")
+    assert {position.symbol for position in result.positions} == {"NVDA", "US-TNOTE"}
+
+
+def test_position_preserves_stable_security_identity_and_identifiers():
+    result = parse_statement(fixture("ibkr_statement.xml"), account_salt=ACCOUNT_SALT)
+    nvda = result.positions[0]
+    assert nvda.security_id.startswith("security_")
+    assert nvda.asset_class == "STK"
+    assert nvda.conid == "4815747"
+    assert nvda.isin == "US67066G1040"
+    assert nvda.figi == "BBG000BBJQV0"
+    assert nvda.external_security_id == "67066G104"
+    assert nvda.security_id_type == "CUSIP"
+
+
+def test_cross_snapshot_security_identity_and_database_round_trip(tmp_path):
+    first = parse_statement(fixture("ibkr_statement.xml"), account_salt=ACCOUNT_SALT)
+    second_xml = fixture("ibkr_statement.xml").replace("20260824", "20260825")
+    second = parse_statement(second_xml, account_salt=ACCOUNT_SALT)
+    first_nvda = first.positions[0]
+    second_nvda = second.positions[0]
+    assert first_nvda.security_id == second_nvda.security_id
+    assert first_nvda.position_id != second_nvda.position_id
+
+    store = make_migrated_store(tmp_path)
+    store.insert_portfolio_snapshot(first.snapshot, first.positions, first.account_ref)
+    store.insert_portfolio_snapshot(second.snapshot, second.positions, second.account_ref)
+    with store.connect() as connection:
+        position_security_ids = connection.execute(
+            "SELECT security_id FROM positions WHERE symbol = 'NVDA' ORDER BY snapshot_id"
+        ).fetchall()
+        row = connection.execute(
+            "SELECT identifiers_json FROM securities WHERE security_id = ?",
+            (first_nvda.security_id,),
+        ).fetchone()
+    assert position_security_ids == [
+        (first_nvda.security_id,),
+        (first_nvda.security_id,),
+    ]
+    assert json.loads(row[0]) == {
+        "conid": "4815747",
+        "external_security_id": "67066G104",
+        "figi": "BBG000BBJQV0",
+        "isin": "US67066G1040",
+        "security_id_type": "CUSIP",
+    }
+
+
+def test_identifier_conflict_rolls_back_snapshot_and_security_changes(tmp_path):
+    result = parse_statement(fixture("ibkr_statement.xml"), account_salt=ACCOUNT_SALT)
+    store = make_migrated_store(tmp_path)
+    store.insert_portfolio_snapshot(result.snapshot, result.positions, result.account_ref)
+    conflicting_snapshot = replace(
+        result.snapshot,
+        snapshot_id="snapshot_000000000000000000000000",
+        as_of=utc(2026, 8, 25),
+    )
+    conflicting_position = replace(
+        result.positions[0],
+        position_id="position_000000000000000000000000",
+        snapshot_id=conflicting_snapshot.snapshot_id,
+        symbol="CONFLICT",
+    )
+
+    with pytest.raises(sqlite3.IntegrityError, match="security"):
+        store.insert_portfolio_snapshot(
+            conflicting_snapshot, (conflicting_position,), result.account_ref
+        )
+
+    with store.connect() as connection:
+        assert connection.execute("SELECT count(*) FROM portfolio_snapshots").fetchone()[0] == 1
+        assert connection.execute("SELECT symbol FROM securities WHERE security_id = ?", (result.positions[0].security_id,)).fetchone()[0] == "NVDA"
+
+
+def test_security_identity_falls_back_to_asset_symbol_and_currency():
+    xml = fixture("ibkr_statement.xml")
+    for attribute in (
+        ' conid="4815747"',
+        ' isin="US67066G1040"',
+        ' figi="BBG000BBJQV0"',
+        ' securityID="67066G104"',
+        ' securityIDType="CUSIP"',
+    ):
+        xml = xml.replace(attribute, "", 1)
+    first = parse_statement(xml, account_salt=ACCOUNT_SALT)
+    second = parse_statement(xml.replace("20260824", "20260825"), account_salt=ACCOUNT_SALT)
+    assert first.positions[0].security_id == second.positions[0].security_id
+    assert first.positions[0].position_id != second.positions[0].position_id
+
+
+def test_weak_account_salt_is_rejected_before_hashing(flex_config):
+    with pytest.raises(ValueError, match="at least 16 UTF-8 bytes"):
+        replace(flex_config, account_salt="too-short")
+    with pytest.raises(FlexMalformedStatementError, match="at least 16 UTF-8 bytes"):
+        parse_statement(fixture("ibkr_statement.xml"), account_salt="too-short")
+
+
 def test_statement_accepts_documented_iso_timestamp_variant():
     xml = fixture("ibkr_statement.xml").replace(
         "20260824;120000", "2026-08-24T12:00:00Z"
     )
-    result = parse_statement(xml, account_salt="salt")
-    assert result.snapshot.as_of == datetime(2026, 8, 24, 12, tzinfo=timezone.utc)
+    result = parse_statement(xml, account_salt=ACCOUNT_SALT)
+    assert result.snapshot.as_of == utc(2026, 8, 24)
+    assert result.generated_at == datetime(2026, 8, 24, 12, tzinfo=timezone.utc)
 
 
 def test_statement_accepts_documented_dashed_flex_timestamp_variant():
@@ -594,8 +1023,9 @@ def test_statement_accepts_documented_dashed_flex_timestamp_variant():
         'whenGenerated="20260824;120000"',
         'whenGenerated="2026-08-24;12:00:00"',
     )
-    result = parse_statement(xml, account_salt="salt")
-    assert result.snapshot.as_of == datetime(2026, 8, 24, 12, tzinfo=timezone.utc)
+    result = parse_statement(xml, account_salt=ACCOUNT_SALT)
+    assert result.snapshot.as_of == utc(2026, 8, 24)
+    assert result.generated_at == datetime(2026, 8, 24, 12, tzinfo=timezone.utc)
 
 
 def test_statement_allows_all_cash_and_negative_quantities():
@@ -603,36 +1033,36 @@ def test_statement_allows_all_cash_and_negative_quantities():
     positions_start = xml.index("      <OpenPositions>")
     positions_end = xml.index("      </OpenPositions>") + len("      </OpenPositions>\n")
     all_cash = xml[:positions_start] + xml[positions_end:]
-    assert parse_statement(all_cash, account_salt="salt").positions == ()
+    assert parse_statement(all_cash, account_salt=ACCOUNT_SALT).positions == ()
 
     short_xml = xml.replace('position="10"', 'position="-10"', 1)
-    assert parse_statement(short_xml, account_salt="salt").positions[0].quantity == Decimal("-10")
+    assert parse_statement(short_xml, account_salt=ACCOUNT_SALT).positions[0].quantity == Decimal("-10")
 
 
 @pytest.mark.parametrize("bad_total", ["NaN", "Infinity", "-Infinity"])
 def test_statement_rejects_nonfinite_numbers(bad_total):
     xml = fixture("ibkr_statement.xml").replace('total="4725.50"', f'total="{bad_total}"')
     with pytest.raises(FlexMalformedStatementError, match="finite"):
-        parse_statement(xml, account_salt="salt")
+        parse_statement(xml, account_salt=ACCOUNT_SALT)
 
 
 def test_statement_rejects_missing_or_ambiguous_account_data():
     missing_nav = fixture("ibkr_statement.xml").replace(' total="4725.50"', "")
     with pytest.raises(FlexMalformedStatementError, match="NAV"):
-        parse_statement(missing_nav, account_salt="salt")
+        parse_statement(missing_nav, account_salt=ACCOUNT_SALT)
 
     duplicate = fixture("ibkr_statement.xml").replace(
         "    </FlexStatement>\n", "    </FlexStatement>\n    <FlexStatement accountId=\"OTHER\" whenGenerated=\"20260824;120000\" />\n"
     )
     with pytest.raises(FlexMalformedStatementError, match="exactly one"):
-        parse_statement(duplicate, account_salt="salt")
+        parse_statement(duplicate, account_salt=ACCOUNT_SALT)
 
 
 def test_account_hash_and_snapshot_ids_are_stable_and_salted():
     xml = fixture("ibkr_statement.xml")
-    first = parse_statement(xml, account_salt="salt-a")
-    repeat = parse_statement(xml, account_salt="salt-a")
-    other = parse_statement(xml, account_salt="salt-b")
+    first = parse_statement(xml, account_salt="salt-a-0123456789")
+    repeat = parse_statement(xml, account_salt="salt-a-0123456789")
+    other = parse_statement(xml, account_salt="salt-b-0123456789")
     assert first.account_ref == repeat.account_ref
     assert first.snapshot.snapshot_id == repeat.snapshot.snapshot_id
     assert first.account_ref != other.account_ref
@@ -675,7 +1105,7 @@ def test_sync_persists_atomically_and_never_stores_raw_credentials(
 
 def test_portfolio_persistence_is_idempotent_and_conflicts_do_not_overwrite(tmp_path):
     store = make_migrated_store(tmp_path)
-    result = parse_statement(fixture("ibkr_statement.xml"), account_salt="salt")
+    result = parse_statement(fixture("ibkr_statement.xml"), account_salt=ACCOUNT_SALT)
     store.insert_portfolio_snapshot(result.snapshot, result.positions, result.account_ref)
     store.insert_portfolio_snapshot(result.snapshot, result.positions, result.account_ref)
 
@@ -693,7 +1123,7 @@ def test_portfolio_persistence_is_idempotent_and_conflicts_do_not_overwrite(tmp_
 
 def test_invalid_positions_roll_back_entire_snapshot(tmp_path):
     store = make_migrated_store(tmp_path)
-    result = parse_statement(fixture("ibkr_statement.xml"), account_salt="salt")
+    result = parse_statement(fixture("ibkr_statement.xml"), account_salt=ACCOUNT_SALT)
 
     with pytest.raises(sqlite3.IntegrityError, match="duplicate position"):
         store.insert_portfolio_snapshot(
@@ -707,10 +1137,65 @@ def test_invalid_positions_roll_back_entire_snapshot(tmp_path):
 
 def test_store_rejects_raw_account_identifier(tmp_path):
     store = make_migrated_store(tmp_path)
-    result = parse_statement(fixture("ibkr_statement.xml"), account_salt="salt")
+    result = parse_statement(fixture("ibkr_statement.xml"), account_salt=ACCOUNT_SALT)
 
     with pytest.raises(ValueError, match="hashed local reference"):
         store.insert_portfolio_snapshot(result.snapshot, result.positions, ACCOUNT_ID)
 
     with store.connect() as connection:
         assert connection.execute("SELECT count(*) FROM portfolio_snapshots").fetchone()[0] == 0
+
+
+def test_concurrent_identical_snapshot_writers_are_idempotent(tmp_path):
+    database_path = tmp_path / "research.db"
+    first_store = make_migrated_store(tmp_path)
+    second_store = type(first_store)(database_path)
+    result = parse_statement(fixture("ibkr_statement.xml"), account_salt=ACCOUNT_SALT)
+    barrier = Barrier(2)
+
+    def write(store):
+        barrier.wait()
+        store.insert_portfolio_snapshot(result.snapshot, result.positions, result.account_ref)
+        return "ok"
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        outcomes = list(executor.map(write, (first_store, second_store)))
+
+    assert outcomes == ["ok", "ok"]
+    with first_store.connect() as connection:
+        assert connection.execute("SELECT count(*) FROM portfolio_snapshots").fetchone()[0] == 1
+        assert connection.execute("SELECT count(*) FROM positions").fetchone()[0] == 2
+        assert connection.execute("SELECT count(*) FROM securities").fetchone()[0] == 2
+
+
+def test_concurrent_conflicting_snapshot_writers_leave_consistent_winner(tmp_path):
+    database_path = tmp_path / "research.db"
+    first_store = make_migrated_store(tmp_path)
+    second_store = type(first_store)(database_path)
+    result = parse_statement(fixture("ibkr_statement.xml"), account_salt=ACCOUNT_SALT)
+    conflict = replace(result.snapshot, nav=Decimal("4000.00"))
+    barrier = Barrier(2)
+
+    def write(store, snapshot):
+        barrier.wait()
+        try:
+            store.insert_portfolio_snapshot(snapshot, result.positions, result.account_ref)
+        except sqlite3.IntegrityError:
+            return "conflict"
+        return "ok"
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = (
+            executor.submit(write, first_store, result.snapshot),
+            executor.submit(write, second_store, conflict),
+        )
+        outcomes = [future.result() for future in futures]
+
+    assert sorted(outcomes) == ["conflict", "ok"]
+    with first_store.connect() as connection:
+        nav = connection.execute("SELECT nav FROM portfolio_snapshots").fetchone()[0]
+        position_count = connection.execute("SELECT count(*) FROM positions").fetchone()[0]
+        security_count = connection.execute("SELECT count(*) FROM securities").fetchone()[0]
+    assert nav in {"4725.50", "4000.00"}
+    assert position_count == 2
+    assert security_count == 2
