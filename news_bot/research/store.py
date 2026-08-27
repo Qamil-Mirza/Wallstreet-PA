@@ -653,7 +653,7 @@ class ResearchStore:
         try:
             row = connection.execute(
                 "SELECT claim_id, entity_id, kind, text, as_of, confidence, status "
-                "FROM claims WHERE claim_id = ?",
+                "FROM claims WHERE claim_id = ? AND lineage_sealed = 1",
                 (claim_id,),
             ).fetchone()
         finally:
@@ -679,7 +679,9 @@ class ResearchStore:
                 "p.ordinal, p.text, p.content_hash, p.locator_json "
                 "FROM claim_evidence AS ce "
                 "JOIN document_passages AS p ON p.passage_id = ce.passage_id "
-                "WHERE ce.claim_id = ? ORDER BY p.document_id, p.ordinal, ce.stance",
+                "JOIN claims AS c ON c.claim_id = ce.claim_id "
+                "WHERE ce.claim_id = ? AND c.lineage_sealed = 1 "
+                "ORDER BY p.document_id, p.ordinal, ce.stance",
                 (claim_id,),
             ).fetchall()
         finally:
@@ -709,8 +711,10 @@ class ResearchStore:
         connection = self.connect()
         try:
             rows = connection.execute(
-                "SELECT supporting_claim_id FROM claim_dependencies "
-                "WHERE claim_id = ? ORDER BY supporting_claim_id",
+                "SELECT dependency.supporting_claim_id FROM claim_dependencies "
+                "AS dependency JOIN claims AS c ON c.claim_id = dependency.claim_id "
+                "WHERE dependency.claim_id = ? AND c.lineage_sealed = 1 "
+                "ORDER BY dependency.supporting_claim_id",
                 (claim_id,),
             ).fetchall()
         finally:
@@ -726,7 +730,8 @@ class ResearchStore:
             )
         with self.transaction() as connection:
             cursor = connection.execute(
-                "UPDATE claims SET status = ? WHERE claim_id = ?",
+                "UPDATE claims SET status = ? "
+                "WHERE claim_id = ? AND lineage_sealed = 1",
                 (status, claim_id),
             )
             if cursor.rowcount != 1:

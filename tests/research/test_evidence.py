@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+import news_bot.research.evidence as evidence_module
 from news_bot.research.evidence import (
     ClaimLineage,
     DocumentInput,
@@ -199,6 +200,111 @@ def test_concurrent_ingestion_is_idempotent_and_leaves_no_temp_files(
     assert {path.name for path in ingestor.cache_dir.iterdir()} == {
         hashlib.sha256(b"Revenue grew.").hexdigest()
     }
+
+
+def test_cache_publication_fsyncs_directory_after_link(
+    migrated_store, tmp_path, monkeypatch
+):
+    events = []
+    real_link = evidence_module.os.link
+    real_fsync = evidence_module.os.fsync
+
+    def recording_link(source, target):
+        events.append("link")
+        return real_link(source, target)
+
+    def recording_fsync(descriptor):
+        events.append("fsync")
+        return real_fsync(descriptor)
+
+    monkeypatch.setattr(evidence_module.os, "link", recording_link)
+    monkeypatch.setattr(evidence_module.os, "fsync", recording_fsync)
+
+    EvidenceIngestor(migrated_store, tmp_path / "cache").ingest(
+        make_document("https://issuer.test/release", "Revenue grew.")
+    )
+
+    link_index = events.index("link")
+    assert "fsync" in events[link_index + 1 :]
+
+
+def test_cache_directory_fsync_failure_prevents_database_insert(
+    migrated_store, tmp_path, monkeypatch
+):
+    real_fsync = evidence_module.os.fsync
+    calls = 0
+
+    def fail_directory_fsync(descriptor):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("private durability path")
+        return real_fsync(descriptor)
+
+    monkeypatch.setattr(evidence_module.os, "fsync", fail_directory_fsync)
+    content = "Private revenue grew."
+    digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+    with pytest.raises(EvidenceCacheError) as error:
+        EvidenceIngestor(migrated_store, tmp_path / "cache").ingest(
+            make_document("https://private.test/secret", content)
+        )
+
+    assert migrated_store.get_document_by_content_hash(digest) is None
+    assert not (tmp_path / "cache" / digest).exists()
+    assert "Private revenue" not in str(error.value)
+    assert "private.test" not in str(error.value)
+
+
+def test_claim_identity_hashes_structured_lineage_roles_without_collisions():
+    support_and_dependency = EvidenceIngestor._claim_id(
+        ClaimKind.INFERENCE,
+        "Capacity may tighten.",
+        ("passage_a",),
+        ("claim_b",),
+        (),
+    )
+    flattened_support = EvidenceIngestor._claim_id(
+        ClaimKind.INFERENCE,
+        "Capacity may tighten.",
+        ("claim_b", "passage_a"),
+        (),
+        (),
+    )
+    support_and_contradiction = EvidenceIngestor._claim_id(
+        ClaimKind.INFERENCE,
+        "Capacity may tighten.",
+        ("passage_a",),
+        (),
+        ("claim_b",),
+    )
+    reordered = EvidenceIngestor._claim_id(
+        ClaimKind.INFERENCE,
+        "Capacity may tighten.",
+        ("passage_a",),
+        ("claim_b",),
+        (),
+    )
+    multi_role = EvidenceIngestor._claim_id(
+        ClaimKind.INFERENCE,
+        "Capacity may tighten.",
+        ("passage_z", "passage_a"),
+        ("claim_z", "claim_a"),
+        ("contradiction_z", "contradiction_a"),
+    )
+    multi_role_reordered = EvidenceIngestor._claim_id(
+        ClaimKind.INFERENCE,
+        "Capacity may tighten.",
+        ("passage_a", "passage_z"),
+        ("claim_a", "claim_z"),
+        ("contradiction_a", "contradiction_z"),
+    )
+
+    assert len(
+        {support_and_dependency, flattened_support, support_and_contradiction}
+    ) == 3
+    assert reordered == support_and_dependency
+    assert multi_role_reordered == multi_role
 
 
 def test_passages_have_stable_ids_and_exact_canonical_offsets(migrated_store):

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import ipaddress
+import json
 import os
 import re
 import sqlite3
@@ -335,6 +336,7 @@ class EvidenceIngestor:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         target = self.cache_dir / content_hash
         if target.exists() or target.is_symlink():
+            self._fsync_cache_directory()
             return self._verify_cached(target, content)
         descriptor, temporary_name = tempfile.mkstemp(
             prefix=".evidence-", dir=self.cache_dir
@@ -348,10 +350,25 @@ class EvidenceIngestor:
             try:
                 os.link(temporary, target)
             except FileExistsError:
+                self._fsync_cache_directory()
                 return self._verify_cached(target, content)
+            try:
+                self._fsync_cache_directory()
+            except OSError:
+                target.unlink(missing_ok=True)
+                raise
             return self._verify_cached(target, content)
         finally:
             temporary.unlink(missing_ok=True)
+
+    def _fsync_cache_directory(self) -> None:
+        """Durably publish cache directory entries before evidence persistence."""
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        descriptor = os.open(self.cache_dir, flags)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
 
     @staticmethod
     def _verify_cached(target: Path, expected: bytes) -> Path:
@@ -492,17 +509,20 @@ class EvidenceIngestor:
         supporting_claim_ids: Sequence[str],
         contradicting_passage_ids: Sequence[str],
     ) -> str:
-        identity = hashlib.sha256(
-            "\x1f".join(
-                (
-                    kind.value,
-                    text,
-                    *sorted(passage_ids),
-                    *sorted(supporting_claim_ids),
-                    *sorted(contradicting_passage_ids),
-                )
-            ).encode("utf-8")
-        ).hexdigest()
+        identity_payload = json.dumps(
+            {
+                "contradicting_passage_ids": sorted(contradicting_passage_ids),
+                "kind": kind.value,
+                "passage_ids": sorted(passage_ids),
+                "supporting_claim_ids": sorted(supporting_claim_ids),
+                "text": text,
+                "version": 1,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        identity = hashlib.sha256(identity_payload).hexdigest()
         return f"claim_{identity}"
 
     def lineage(self, claim_id: str) -> tuple[ClaimLineage, ...]:

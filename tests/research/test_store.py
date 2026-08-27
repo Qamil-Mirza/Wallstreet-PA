@@ -260,17 +260,27 @@ def test_existing_v2_claims_upgrade_with_lineage_anchor_without_data_loss(
             "SELECT version FROM schema_migrations ORDER BY version"
         ).fetchall()
         primary_anchor = connection.execute(
-            "SELECT primary_passage_id, primary_supporting_claim_id "
+            "SELECT primary_passage_id, primary_supporting_claim_id, lineage_sealed "
             "FROM claims WHERE claim_id = ?",
             (claim.claim_id,),
         ).fetchone()
+        retained_evidence = connection.execute(
+            "SELECT passage_id, stance FROM claim_evidence WHERE claim_id = ?",
+            (claim.claim_id,),
+        ).fetchall()
         foreign_key_errors = connection.execute("PRAGMA foreign_key_check").fetchall()
     assert versions == [(1,), (2,), (3,)]
-    assert upgraded.get_claim(claim.claim_id) == claim
-    lineage = upgraded.list_claim_lineage(claim.claim_id)[0]
-    assert lineage.passage.passage_id == "passage-1"
-    assert lineage.stance == stance
-    assert primary_anchor == ("passage-1", None)
+    assert retained_evidence == [("passage-1", stance)]
+    if stance == "supports":
+        assert upgraded.get_claim(claim.claim_id) == claim
+        lineage = upgraded.list_claim_lineage(claim.claim_id)[0]
+        assert lineage.passage.passage_id == "passage-1"
+        assert lineage.stance == stance
+        assert primary_anchor == ("passage-1", None, 1)
+    else:
+        assert upgraded.get_claim(claim.claim_id) is None
+        assert upgraded.list_claim_lineage(claim.claim_id) == ()
+        assert primary_anchor == ("passage-1", None, 0)
     assert foreign_key_errors == []
 
 
@@ -676,6 +686,192 @@ def test_database_rejects_claim_without_required_lineage_anchor(tmp_path, kind):
                     "2026-08-24T00:00:00.000000Z",
                 ),
             )
+
+
+def test_direct_claim_rows_must_begin_unsealed(tmp_path):
+    store = make_migrated_store(tmp_path)
+    seed_passage(store)
+    values = (
+        "claim-direct",
+        "fact",
+        "Direct claim.",
+        "2026-08-24T00:00:00.000000Z",
+        "0.5",
+        "active",
+        "passage-1",
+        "2026-08-24T00:00:00.000000Z",
+    )
+
+    with store.transaction() as connection:
+        connection.execute(
+            "INSERT INTO claims (claim_id, kind, text, as_of, confidence, status, "
+            "primary_passage_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            values,
+        )
+
+    with store.connect() as connection:
+        sealed = connection.execute(
+            "SELECT lineage_sealed FROM claims WHERE claim_id = ?",
+            ("claim-direct",),
+        ).fetchone()
+    assert sealed == (0,)
+    assert store.get_claim("claim-direct") is None
+    assert store.list_claim_lineage("claim-direct") == ()
+
+
+def test_direct_claim_insert_cannot_start_sealed(tmp_path):
+    store = make_migrated_store(tmp_path)
+    seed_passage(store)
+
+    with pytest.raises(IntegrityError, match="begin unsealed"):
+        with store.transaction() as connection:
+            connection.execute(
+                "INSERT INTO claims (claim_id, kind, text, as_of, confidence, status, "
+                "primary_passage_id, lineage_sealed, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "claim-direct",
+                    "fact",
+                    "Direct claim.",
+                    "2026-08-24T00:00:00.000000Z",
+                    "0.5",
+                    "active",
+                    "passage-1",
+                    1,
+                    "2026-08-24T00:00:00.000000Z",
+                ),
+            )
+
+
+def test_claim_seal_requires_matching_supporting_passage_link(tmp_path):
+    store = make_migrated_store(tmp_path)
+    seed_passage(store)
+    with store.transaction() as connection:
+        connection.execute(
+            "INSERT INTO claims (claim_id, kind, text, as_of, confidence, status, "
+            "primary_passage_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "claim-direct",
+                "fact",
+                "Direct claim.",
+                "2026-08-24T00:00:00.000000Z",
+                "0.5",
+                "active",
+                "passage-1",
+                "2026-08-24T00:00:00.000000Z",
+            ),
+        )
+        connection.execute(
+            "INSERT INTO claim_evidence (claim_id, passage_id, stance) "
+            "VALUES (?, ?, ?)",
+            ("claim-direct", "passage-1", "contradicts"),
+        )
+
+    with pytest.raises(IntegrityError, match="matching supporting lineage"):
+        with store.transaction() as connection:
+            connection.execute(
+                "UPDATE claims SET lineage_sealed = 1 WHERE claim_id = ?",
+                ("claim-direct",),
+            )
+
+    assert store.get_claim("claim-direct") is None
+    assert store.list_claim_lineage("claim-direct") == ()
+
+
+def test_inference_seal_requires_matching_claim_dependency(tmp_path):
+    store = make_migrated_store(tmp_path)
+    seed_claim_with_evidence(store)
+    with store.transaction() as connection:
+        connection.execute(
+            "INSERT INTO claims (claim_id, kind, text, as_of, confidence, status, "
+            "primary_supporting_claim_id, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "inference-direct",
+                "inference",
+                "Capacity may tighten.",
+                "2026-08-24T00:00:00.000000Z",
+                "0.5",
+                "active",
+                "claim-1",
+                "2026-08-24T00:00:00.000000Z",
+            ),
+        )
+
+    with pytest.raises(IntegrityError, match="matching supporting lineage"):
+        with store.transaction() as connection:
+            connection.execute(
+                "UPDATE claims SET lineage_sealed = 1 WHERE claim_id = ?",
+                ("inference-direct",),
+            )
+
+    with store.transaction() as connection:
+        connection.execute(
+            "INSERT INTO claim_dependencies (claim_id, supporting_claim_id) "
+            "VALUES (?, ?)",
+            ("inference-direct", "claim-1"),
+        )
+        connection.execute(
+            "UPDATE claims SET lineage_sealed = 1 WHERE claim_id = ?",
+            ("inference-direct",),
+        )
+
+    assert store.get_claim("inference-direct") is not None
+    assert store.list_supporting_claim_ids("inference-direct") == ("claim-1",)
+
+
+def test_inference_cannot_seal_against_quarantined_supporting_claim(tmp_path):
+    store = make_migrated_store(tmp_path)
+    seed_passage(store)
+    with store.transaction() as connection:
+        connection.execute(
+            "INSERT INTO claims (claim_id, kind, text, as_of, confidence, status, "
+            "primary_passage_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "claim-quarantined",
+                "fact",
+                "Quarantined claim.",
+                "2026-08-24T00:00:00.000000Z",
+                "0.5",
+                "active",
+                "passage-1",
+                "2026-08-24T00:00:00.000000Z",
+            ),
+        )
+        connection.execute(
+            "INSERT INTO claim_evidence (claim_id, passage_id, stance) "
+            "VALUES (?, ?, ?)",
+            ("claim-quarantined", "passage-1", "contradicts"),
+        )
+        connection.execute(
+            "INSERT INTO claims (claim_id, kind, text, as_of, confidence, status, "
+            "primary_supporting_claim_id, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "inference-direct",
+                "inference",
+                "Capacity may tighten.",
+                "2026-08-24T00:00:00.000000Z",
+                "0.5",
+                "active",
+                "claim-quarantined",
+                "2026-08-24T00:00:00.000000Z",
+            ),
+        )
+        connection.execute(
+            "INSERT INTO claim_dependencies (claim_id, supporting_claim_id) "
+            "VALUES (?, ?)",
+            ("inference-direct", "claim-quarantined"),
+        )
+
+    with pytest.raises(IntegrityError, match="matching supporting lineage"):
+        with store.transaction() as connection:
+            connection.execute(
+                "UPDATE claims SET lineage_sealed = 1 WHERE claim_id = ?",
+                ("inference-direct",),
+            )
+
+    assert store.get_claim("inference-direct") is None
 
 
 def test_claim_missing_passage_is_atomic(tmp_path):

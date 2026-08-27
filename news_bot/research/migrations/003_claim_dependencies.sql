@@ -25,7 +25,7 @@ CREATE TABLE claims (
     status TEXT NOT NULL CHECK (status IN ('active', 'contradicted', 'superseded')),
     primary_passage_id TEXT,
     primary_supporting_claim_id TEXT,
-    lineage_sealed INTEGER NOT NULL DEFAULT 1 CHECK (lineage_sealed IN (0, 1)),
+    lineage_sealed INTEGER NOT NULL DEFAULT 0 CHECK (lineage_sealed IN (0, 1)),
     created_at TEXT NOT NULL,
     CHECK (
         (kind IN ('fact', 'guidance', 'estimate') AND primary_passage_id IS NOT NULL)
@@ -76,7 +76,12 @@ SELECT
         LIMIT 1
     ),
     NULL,
-    1,
+    CASE WHEN EXISTS (
+        SELECT 1
+        FROM claim_evidence_v2_old AS supporting_evidence
+        WHERE supporting_evidence.claim_id = old.claim_id
+            AND supporting_evidence.stance = 'supports'
+    ) THEN 1 ELSE 0 END,
     old.created_at
 FROM claims_v2_old AS old;
 
@@ -104,11 +109,64 @@ BEGIN
     SELECT RAISE(ABORT, 'claims cannot be deleted');
 END;
 
+CREATE TRIGGER claims_must_begin_unsealed
+BEFORE INSERT ON claims
+WHEN NEW.lineage_sealed <> 0
+BEGIN
+    SELECT RAISE(ABORT, 'claims must begin unsealed');
+END;
+
 CREATE TRIGGER claims_lineage_seal_one_way
 BEFORE UPDATE OF lineage_sealed ON claims
 WHEN NOT (OLD.lineage_sealed = 0 AND NEW.lineage_sealed = 1)
 BEGIN
     SELECT RAISE(ABORT, 'claim lineage seal is immutable');
+END;
+
+CREATE TRIGGER claims_lineage_seal_requires_support
+BEFORE UPDATE OF lineage_sealed ON claims
+WHEN NEW.lineage_sealed = 1 AND (
+    (
+        NEW.kind IN ('fact', 'guidance', 'estimate')
+        AND NOT EXISTS (
+            SELECT 1 FROM claim_evidence AS evidence
+            WHERE evidence.claim_id = NEW.claim_id
+                AND evidence.passage_id = NEW.primary_passage_id
+                AND evidence.stance = 'supports'
+        )
+    )
+    OR
+    (
+        NEW.kind = 'inference'
+        AND NOT (
+            (
+                NEW.primary_passage_id IS NOT NULL
+                AND EXISTS (
+                    SELECT 1 FROM claim_evidence AS evidence
+                    WHERE evidence.claim_id = NEW.claim_id
+                        AND evidence.passage_id = NEW.primary_passage_id
+                        AND evidence.stance = 'supports'
+                )
+            )
+            OR
+            (
+                NEW.primary_supporting_claim_id IS NOT NULL
+                AND EXISTS (
+                    SELECT 1
+                    FROM claim_dependencies AS dependency
+                    JOIN claims AS supporting_claim
+                        ON supporting_claim.claim_id = dependency.supporting_claim_id
+                    WHERE dependency.claim_id = NEW.claim_id
+                        AND dependency.supporting_claim_id =
+                            NEW.primary_supporting_claim_id
+                        AND supporting_claim.lineage_sealed = 1
+                )
+            )
+        )
+    )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'claim seal requires matching supporting lineage');
 END;
 
 CREATE TRIGGER claim_evidence_no_insert_after_seal
