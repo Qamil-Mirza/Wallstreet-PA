@@ -1,0 +1,13 @@
+{
+  "cik": "1045810",
+  "name": "NVIDIA CORP",
+  "filings": {
+    "recent": {
+      "accessionNumber": ["0001045810-26-000123", "0001045810-26-000099"],
+      "filingDate": ["2026-08-20", "2026-08-01"],
+      "reportDate": ["2026-07-26", "2026-07-01"],
+      "form": ["10-Q", "4"],
+      "primaryDocument": ["nvda-20260726.htm", "ownership.xml"]
+    }
+  }
+}

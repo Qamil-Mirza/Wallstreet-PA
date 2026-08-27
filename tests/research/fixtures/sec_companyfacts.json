@@ -1,0 +1,26 @@
+{
+  "cik": 1045810,
+  "entityName": "NVIDIA CORP",
+  "facts": {
+    "us-gaap": {
+      "RevenueFromContractWithCustomerExcludingAssessedTax": {
+        "label": "Revenue",
+        "description": "Revenue recognized from contracts with customers.",
+        "units": {
+          "USD": [
+            {
+              "start": "2026-04-27",
+              "end": "2026-07-26",
+              "val": 30000000000,
+              "accn": "0001045810-26-000123",
+              "fy": 2027,
+              "fp": "Q2",
+              "form": "10-Q",
+              "filed": "2026-08-20"
+            }
+          ]
+        }
+      }
+    }
+  }
+}
