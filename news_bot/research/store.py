@@ -713,7 +713,10 @@ class ResearchStore:
             rows = connection.execute(
                 "SELECT dependency.supporting_claim_id FROM claim_dependencies "
                 "AS dependency JOIN claims AS c ON c.claim_id = dependency.claim_id "
+                "JOIN claims AS supporting_claim ON supporting_claim.claim_id = "
+                "dependency.supporting_claim_id "
                 "WHERE dependency.claim_id = ? AND c.lineage_sealed = 1 "
+                "AND supporting_claim.lineage_sealed = 1 "
                 "ORDER BY dependency.supporting_claim_id",
                 (claim_id,),
             ).fetchall()

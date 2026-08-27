@@ -858,20 +858,180 @@ def test_inference_cannot_seal_against_quarantined_supporting_claim(tmp_path):
                 "2026-08-24T00:00:00.000000Z",
             ),
         )
-        connection.execute(
-            "INSERT INTO claim_dependencies (claim_id, supporting_claim_id) "
-            "VALUES (?, ?)",
-            ("inference-direct", "claim-quarantined"),
-        )
-
-    with pytest.raises(IntegrityError, match="matching supporting lineage"):
+    with pytest.raises(IntegrityError, match="supporting claim must be sealed"):
         with store.transaction() as connection:
             connection.execute(
-                "UPDATE claims SET lineage_sealed = 1 WHERE claim_id = ?",
-                ("inference-direct",),
+                "INSERT INTO claim_dependencies (claim_id, supporting_claim_id) "
+                "VALUES (?, ?)",
+                ("inference-direct", "claim-quarantined"),
             )
 
     assert store.get_claim("inference-direct") is None
+
+
+def test_public_inference_with_mixed_dependency_validity_is_atomic(tmp_path):
+    store = make_migrated_store(tmp_path)
+    seed_claim_with_evidence(store)
+    with store.transaction() as connection:
+        connection.execute(
+            "INSERT INTO claims (claim_id, kind, text, as_of, confidence, status, "
+            "primary_passage_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "claim-quarantined",
+                "fact",
+                "Quarantined claim.",
+                "2026-08-24T00:00:00.000000Z",
+                "0.5",
+                "active",
+                "passage-1",
+                "2026-08-24T00:00:00.000000Z",
+            ),
+        )
+        connection.execute(
+            "INSERT INTO claim_evidence (claim_id, passage_id, stance) "
+            "VALUES (?, ?, ?)",
+            ("claim-quarantined", "passage-1", "contradicts"),
+        )
+    inference = replace(
+        make_claim("inference-mixed"),
+        kind=ClaimKind.INFERENCE,
+        text="Capacity may tighten.",
+    )
+
+    with pytest.raises(IntegrityError, match="supporting claim must be sealed"):
+        store.insert_claim_with_lineage(
+            inference,
+            passage_links=(),
+            supporting_claim_ids=("claim-1", "claim-quarantined"),
+        )
+
+    assert store.get_claim("inference-mixed") is None
+    with store.connect() as connection:
+        raw_claim = connection.execute(
+            "SELECT claim_id FROM claims WHERE claim_id = ?", ("inference-mixed",)
+        ).fetchone()
+        raw_links = connection.execute(
+            "SELECT supporting_claim_id FROM claim_dependencies WHERE claim_id = ?",
+            ("inference-mixed",),
+        ).fetchall()
+    assert raw_claim is None
+    assert raw_links == []
+
+
+def test_direct_dependency_to_quarantined_target_is_rejected(tmp_path):
+    store = make_migrated_store(tmp_path)
+    seed_claim_with_evidence(store)
+    with store.transaction() as connection:
+        connection.execute(
+            "INSERT INTO claims (claim_id, kind, text, as_of, confidence, status, "
+            "primary_passage_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "claim-quarantined",
+                "fact",
+                "Quarantined claim.",
+                "2026-08-24T00:00:00.000000Z",
+                "0.5",
+                "active",
+                "passage-1",
+                "2026-08-24T00:00:00.000000Z",
+            ),
+        )
+        connection.execute(
+            "INSERT INTO claims (claim_id, kind, text, as_of, confidence, status, "
+            "primary_supporting_claim_id, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "inference-direct",
+                "inference",
+                "Capacity may tighten.",
+                "2026-08-24T00:00:00.000000Z",
+                "0.5",
+                "active",
+                "claim-1",
+                "2026-08-24T00:00:00.000000Z",
+            ),
+        )
+
+    with pytest.raises(IntegrityError, match="supporting claim must be sealed"):
+        with store.transaction() as connection:
+            connection.execute(
+                "INSERT INTO claim_dependencies (claim_id, supporting_claim_id) "
+                "VALUES (?, ?)",
+                ("inference-direct", "claim-quarantined"),
+            )
+
+
+def test_supporting_claim_reads_filter_quarantined_targets_defensively(tmp_path):
+    store = make_migrated_store(tmp_path)
+    seed_claim_with_evidence(store)
+    inference = replace(
+        make_claim("inference-sealed"),
+        kind=ClaimKind.INFERENCE,
+        text="Capacity may tighten.",
+    )
+    store.insert_claim_with_lineage(
+        inference,
+        passage_links=(),
+        supporting_claim_ids=("claim-1",),
+    )
+    with store.transaction() as connection:
+        connection.execute(
+            "INSERT INTO claims (claim_id, kind, text, as_of, confidence, status, "
+            "primary_passage_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "claim-quarantined",
+                "fact",
+                "Quarantined claim.",
+                "2026-08-24T00:00:00.000000Z",
+                "0.5",
+                "active",
+                "passage-1",
+                "2026-08-24T00:00:00.000000Z",
+            ),
+        )
+        connection.execute("DROP TRIGGER claim_dependencies_no_insert_after_seal")
+        connection.execute(
+            "DROP TRIGGER IF EXISTS claim_dependencies_require_sealed_target"
+        )
+        connection.execute(
+            "INSERT INTO claim_dependencies (claim_id, supporting_claim_id) "
+            "VALUES (?, ?)",
+            ("inference-sealed", "claim-quarantined"),
+        )
+
+    assert store.list_supporting_claim_ids("inference-sealed") == ("claim-1",)
+
+
+def test_inference_accepts_multiple_sealed_dependencies(tmp_path):
+    store = make_migrated_store(tmp_path)
+    seed_claim_with_evidence(store)
+    store.insert_source_document(
+        make_document("document-2", content_hash="sha256:document-2")
+    )
+    store.insert_document_passage(
+        passage_id="passage-2",
+        document_id="document-2",
+        ordinal=0,
+        text="A second source passage.",
+    )
+    store.insert_claim(make_claim("claim-2"), evidence_ids=("passage-2",))
+    inference = replace(
+        make_claim("inference-multiple"),
+        kind=ClaimKind.INFERENCE,
+        text="Capacity may tighten.",
+    )
+
+    store.insert_claim_with_lineage(
+        inference,
+        passage_links=(),
+        supporting_claim_ids=("claim-2", "claim-1"),
+    )
+
+    assert store.get_claim("inference-multiple") == inference
+    assert store.list_supporting_claim_ids("inference-multiple") == (
+        "claim-1",
+        "claim-2",
+    )
 
 
 def test_claim_missing_passage_is_atomic(tmp_path):

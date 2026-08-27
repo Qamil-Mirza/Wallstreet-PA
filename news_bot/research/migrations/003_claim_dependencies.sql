@@ -214,6 +214,17 @@ BEGIN
     SELECT RAISE(ABORT, 'claim dependency links are immutable');
 END;
 
+CREATE TRIGGER claim_dependencies_require_sealed_target
+BEFORE INSERT ON claim_dependencies
+WHEN NOT EXISTS (
+    SELECT 1 FROM claims AS supporting_claim
+    WHERE supporting_claim.claim_id = NEW.supporting_claim_id
+        AND supporting_claim.lineage_sealed = 1
+)
+BEGIN
+    SELECT RAISE(ABORT, 'supporting claim must be sealed');
+END;
+
 CREATE TRIGGER claim_dependencies_no_delete
 BEFORE DELETE ON claim_dependencies
 BEGIN
