@@ -30,8 +30,8 @@ _SYMBOL = re.compile(r"[A-Z0-9][A-Z0-9.-]{0,15}")
 _SECRET_ASSIGNMENT = re.compile(
     r"(?i)(\b(?:api[_-]?key|apikey|x-api-key)\b['\"]?\s*[:=]\s*['\"]?)([^'\"&,\s}\]]+)"
 )
-_BEARER = re.compile(
-    r"(?i)(\bauthorization\b['\"]?\s*[:=]\s*['\"]?bearer\s+)([^'\",\s}\]]+)"
+_AUTHORIZATION_CREDENTIAL = re.compile(
+    r"(?i)(\bauthorization\b['\"]?\s*[:=]\s*['\"]?(?:bearer|basic)\s+)([^'\",\s}\]]+)"
 )
 _REDACTED = "[REDACTED]"
 _LOG_FACTORY_LOCK = threading.RLock()
@@ -41,7 +41,7 @@ _CONFIGURED_SECRETS: set[str] = set()
 
 def _redact_text(value: str) -> str:
     redacted = _SECRET_ASSIGNMENT.sub(rf"\1{_REDACTED}", value)
-    redacted = _BEARER.sub(rf"\1{_REDACTED}", redacted)
+    redacted = _AUTHORIZATION_CREDENTIAL.sub(rf"\1{_REDACTED}", redacted)
     for secret in sorted(
         (item for item in _CONFIGURED_SECRETS if len(item) >= 8),
         key=len,
@@ -150,6 +150,8 @@ class FMPConfig:
             not isinstance(self.api_key, str) or not self.api_key.strip()
         ):
             raise ValueError("FMP api_key must be nonblank when configured")
+        if self.api_key is not None and len(self.api_key) < 8:
+            raise ValueError("FMP api_key must contain at least 8 characters")
         if not isinstance(self.base_url, str) or not self.base_url.strip():
             raise ValueError("FMP base_url must be nonblank text")
         if not isinstance(self.timeout_seconds, (int, float)) or self.timeout_seconds <= 0:
@@ -342,6 +344,7 @@ class FMPConnector:
         payload,
         *,
         expected_symbol: str | None = None,
+        allow_missing_symbol: bool = False,
     ) -> tuple[Mapping[str, Any], ...]:
         if isinstance(payload, Mapping):
             lowered = {str(key).strip().lower() for key in payload}
@@ -373,8 +376,12 @@ class FMPConnector:
                 )
             if normalized_expected is not None:
                 try:
-                    received = _normalized_symbol(str(item["symbol"]))
-                except (KeyError, TypeError, ValueError):
+                    raw_symbol = item.get("symbol")
+                    if raw_symbol is None and allow_missing_symbol:
+                        rows.append(item)
+                        continue
+                    received = _normalized_symbol(str(raw_symbol))
+                except (TypeError, ValueError):
                     raise ConnectorError(
                         self.name, retryable=False, diagnostic_code="invalid_identity"
                     ) from None
@@ -394,7 +401,9 @@ class FMPConnector:
     def fetch_income_statement(self, symbol: str):
         normalized = _normalized_symbol(symbol)
         return self._validated_rows(
-            self._request("income-statement", normalized), expected_symbol=normalized
+            self._request("income-statement", normalized),
+            expected_symbol=normalized,
+            allow_missing_symbol=True,
         )
 
     def _resolve_symbol(self, value: str | None = None) -> str:
@@ -461,6 +470,7 @@ class FMPConnector:
             packet = self.parse(
                 quote=self.fetch_quote(normalized),
                 statements=self.fetch_income_statement(normalized),
+                expected_symbol=normalized,
             )
         except ConnectorError:
             return self._apply_sec_fallback(normalized, "provider_unavailable")
@@ -530,9 +540,46 @@ class FMPConnector:
         *,
         quote,
         statements,
+        expected_symbol: str | None = None,
     ) -> FundamentalPacket:
         quote = self._validated_rows(quote)
         statements = self._validated_rows(statements)
+        identity = (
+            _normalized_symbol(expected_symbol) if expected_symbol is not None else None
+        )
+        for row in quote:
+            try:
+                row_symbol = _normalized_symbol(str(row["symbol"]))
+            except (KeyError, TypeError, ValueError):
+                raise ConnectorError(
+                    self.name, retryable=False, diagnostic_code="invalid_identity"
+                ) from None
+            if identity is None:
+                identity = row_symbol
+            elif row_symbol != identity:
+                raise ConnectorError(
+                    self.name, retryable=False, diagnostic_code="identity_mismatch"
+                )
+        for row in statements:
+            raw_symbol = row.get("symbol")
+            if raw_symbol is None:
+                if identity is None:
+                    raise ConnectorError(
+                        self.name, retryable=False, diagnostic_code="invalid_identity"
+                    )
+                continue
+            try:
+                row_symbol = _normalized_symbol(str(raw_symbol))
+            except (TypeError, ValueError):
+                raise ConnectorError(
+                    self.name, retryable=False, diagnostic_code="invalid_identity"
+                ) from None
+            if identity is None:
+                identity = row_symbol
+            elif row_symbol != identity:
+                raise ConnectorError(
+                    self.name, retryable=False, diagnostic_code="identity_mismatch"
+                )
         unavailable: dict[str, str] = {}
         price: DatedPrice | None = None
         statement_values: dict[str, Decimal] = {}

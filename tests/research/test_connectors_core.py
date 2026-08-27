@@ -399,10 +399,10 @@ def test_fmp_request_uses_allowlisted_https_base_and_never_leaks_key():
     assert request["params"] == {"symbol": "NVDA", "apikey": "private-key"}
     assert "private-key" not in repr(connector.config)
     assert FMPConfig(
-        api_key="secret", base_url="http://financialmodelingprep.com/stable"
+        api_key="secret-key", base_url="http://financialmodelingprep.com/stable"
     ).unavailable_reason == "endpoint_disallowed"
     assert FMPConfig(
-        api_key="secret", base_url="https://evil.example/stable"
+        api_key="secret-key", base_url="https://evil.example/stable"
     ).unavailable_reason == "endpoint_disallowed"
 
 

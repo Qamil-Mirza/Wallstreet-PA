@@ -170,13 +170,40 @@ def test_ir_transport_rejects_unapproved_final_url():
     ],
 )
 def test_fmp_parse_rejects_malformed_top_level_schema(quote, statements):
-    connector = FMPConnector(FMPConfig(api_key="private"), session=Session([]))
+    connector = FMPConnector(FMPConfig(api_key="private-key"), session=Session([]))
 
     with pytest.raises(ConnectorError) as error:
         connector.parse(quote=quote, statements=statements)
 
     assert error.value.diagnostic_code in {"provider_error", "invalid_payload"}
     assert "private provider body" not in str(error.value)
+
+
+def test_fmp_public_parse_rejects_cross_symbol_rows():
+    quote = copy.deepcopy(fixture_json("fmp_quote.json"))
+    statement = copy.deepcopy(fixture_json("fmp_income_statement.json"))
+    statement[0]["symbol"] = "AMD"
+    connector = FMPConnector(FMPConfig(api_key="private-key"), session=Session([]))
+
+    with pytest.raises(ConnectorError) as error:
+        connector.parse(quote=quote, statements=statement)
+
+    assert error.value.diagnostic_code == "identity_mismatch"
+    assert "NVDA" not in str(error.value)
+    assert "AMD" not in str(error.value)
+
+
+def test_fmp_public_parse_accepts_statement_without_symbol_when_quote_anchors_identity():
+    quote = copy.deepcopy(fixture_json("fmp_quote.json"))
+    statement = copy.deepcopy(fixture_json("fmp_income_statement.json"))
+    del statement[0]["symbol"]
+    connector = FMPConnector(FMPConfig(api_key="private-key"), session=Session([]))
+
+    packet = connector.parse(quote=quote, statements=statement)
+
+    assert packet.price is not None
+    assert packet.price.symbol == "NVDA"
+    assert packet.financial_period == "2026-Q2"
 
 
 def test_fmp_http_200_provider_error_invokes_explicit_sec_fallback():
@@ -186,7 +213,7 @@ def test_fmp_http_200_provider_error_invokes_explicit_sec_fallback():
     )
     fallback_calls = []
     connector = FMPConnector(
-        FMPConfig(api_key="private"),
+        FMPConfig(api_key="private-key"),
         symbol="NVDA",
         session=Session([response]),
         sec_facts_fallback=lambda symbol: (
@@ -219,7 +246,7 @@ def test_fmp_rejects_provider_symbol_mismatch_and_uses_fallback(mismatch_at):
     ]
     fallback_calls = []
     connector = FMPConnector(
-        FMPConfig(api_key="private"),
+        FMPConfig(api_key="private-key"),
         symbol="NVDA",
         session=Session(responses),
         sec_facts_fallback=lambda symbol: fallback_calls.append(symbol) or {},
@@ -316,7 +343,18 @@ def test_fmp_redaction_keeps_ordinary_authorization_but_masks_configured_secret(
         logger.info("policy=%r", {"authorization": "approved by legal"})
         logger.info("diagnostic=%s", "configured-private-key")
         logger.info("sector=%s", "private markets")
+        logger.info("Authorization: Basic dXNlcjpwYXNz")
 
     assert "approved by legal" in caplog.text
     assert "configured-private-key" not in caplog.text
     assert "private markets" in caplog.text
+    assert "dXNlcjpwYXNz" not in caplog.text
+
+
+def test_fmp_short_api_key_is_rejected_without_echoing_secret():
+    short_secret = "tiny"
+
+    with pytest.raises(ValueError) as error:
+        FMPConfig(api_key=short_secret)
+
+    assert short_secret not in str(error.value)
