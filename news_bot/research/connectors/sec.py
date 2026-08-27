@@ -14,7 +14,12 @@ from urllib.parse import urlsplit
 import requests
 
 from ..evidence import DocumentInput
-from .base import ConnectorCheckpoint, ConnectorError, NormalizedResearchDocument
+from .base import (
+    ConnectorBatch,
+    ConnectorCheckpoint,
+    ConnectorError,
+    NormalizedResearchDocument,
+)
 
 
 _SUPPORTED_FORMS = frozenset(
@@ -113,19 +118,30 @@ class SECConnector:
         self,
         config: SECConfig,
         *,
+        cik: str | None = None,
         session=None,
         clock=time.monotonic,
         sleeper=time.sleep,
     ) -> None:
         if not isinstance(config, SECConfig):
             raise TypeError("config must be SECConfig")
+        if cik is not None:
+            _normalize_cik(cik)
         self.config = config
+        self.cik = _normalize_cik(cik) if cik is not None else None
+        self._owns_session = session is None
         self.session = session or requests.Session()
-        self.session.trust_env = False
+        if self._owns_session:
+            self.session.trust_env = False
         self._clock = clock
         self._sleeper = sleeper
         self._pacing_lock = threading.Lock()
         self._last_request_at: float | None = None
+
+    def close(self) -> None:
+        """Close only a session created and owned by this connector."""
+        if self._owns_session:
+            self.session.close()
 
     @staticmethod
     def submissions_url(cik: str) -> str:
@@ -195,60 +211,89 @@ class SECConnector:
                 self.name, retryable=True, diagnostic_code="transport_error"
             ) from None
 
-        final = urlsplit(getattr(response, "url", ""))
-        if (
-            getattr(response, "history", ())
-            or final.scheme != "https"
-            or final.hostname != "data.sec.gov"
-            or final.port not in (None, 443)
-        ):
-            raise ConnectorError(
-                self.name, retryable=False, diagnostic_code="redirect_rejected"
-            )
-        status = int(response.status_code)
-        next_checkpoint = ConnectorCheckpoint(
-            self.name,
-            cursor=checkpoint.cursor if checkpoint else None,
-            etag=response.headers.get("ETag")
-            or (checkpoint.etag if checkpoint else None),
-            last_modified=response.headers.get("Last-Modified")
-            or (checkpoint.last_modified if checkpoint else None),
-        )
-        if status == 304:
-            return None, next_checkpoint, True
-        if not 200 <= status < 300:
-            raise ConnectorError(
-                self.name,
-                status=status,
-                retryable=status in {408, 425, 429} or 500 <= status <= 599,
-                diagnostic_code=f"http_{status}",
-            )
-        raw = bytearray()
         try:
-            for chunk in response.iter_content(chunk_size=65_536):
-                raw.extend(chunk)
-                if len(raw) > self.config.max_response_bytes:
-                    raise ConnectorError(
-                        self.name,
-                        retryable=False,
-                        diagnostic_code="response_too_large",
-                    )
-            payload = json.loads(bytes(raw).decode("utf-8", errors="strict"))
-        except ConnectorError:
-            raise
-        except (UnicodeError, json.JSONDecodeError):
-            raise ConnectorError(
-                self.name, retryable=False, diagnostic_code="invalid_json"
-            ) from None
-        except Exception:
-            raise ConnectorError(
-                self.name, retryable=True, diagnostic_code="response_read_failed"
-            ) from None
-        if not isinstance(payload, dict):
-            raise ConnectorError(
-                self.name, retryable=False, diagnostic_code="invalid_payload"
+            final = urlsplit(getattr(response, "url", ""))
+            if (
+                getattr(response, "history", ())
+                or final.scheme != "https"
+                or final.hostname != "data.sec.gov"
+                or final.port not in (None, 443)
+            ):
+                raise ConnectorError(
+                    self.name, retryable=False, diagnostic_code="redirect_rejected"
+                )
+            status = int(response.status_code)
+            next_checkpoint = ConnectorCheckpoint(
+                self.name,
+                cursor=checkpoint.cursor if checkpoint else None,
+                etag=response.headers.get("ETag")
+                or (checkpoint.etag if checkpoint else None),
+                last_modified=response.headers.get("Last-Modified")
+                or (checkpoint.last_modified if checkpoint else None),
             )
-        return payload, next_checkpoint, False
+            if status == 304:
+                return None, next_checkpoint, True
+            if not 200 <= status < 300:
+                raise ConnectorError(
+                    self.name,
+                    status=status,
+                    retryable=status in {408, 425, 429} or 500 <= status <= 599,
+                    diagnostic_code=f"http_{status}",
+                )
+            raw = bytearray()
+            try:
+                for chunk in response.iter_content(chunk_size=65_536):
+                    raw.extend(chunk)
+                    if len(raw) > self.config.max_response_bytes:
+                        raise ConnectorError(
+                            self.name,
+                            retryable=False,
+                            diagnostic_code="response_too_large",
+                        )
+                payload = json.loads(bytes(raw).decode("utf-8", errors="strict"))
+            except ConnectorError:
+                raise
+            except (UnicodeError, json.JSONDecodeError):
+                raise ConnectorError(
+                    self.name, retryable=False, diagnostic_code="invalid_json"
+                ) from None
+            except Exception:
+                raise ConnectorError(
+                    self.name, retryable=True, diagnostic_code="response_read_failed"
+                ) from None
+            if not isinstance(payload, dict):
+                raise ConnectorError(
+                    self.name, retryable=False, diagnostic_code="invalid_payload"
+                )
+            return payload, next_checkpoint, False
+        finally:
+            try:
+                response.close()
+            except Exception:
+                pass
+
+    def fetch(self, checkpoint: ConnectorCheckpoint) -> ConnectorBatch:
+        """Fetch one submissions batch for the configured or checkpoint CIK."""
+        if checkpoint.connector != self.name:
+            raise ValueError("checkpoint belongs to another connector")
+        cik = self.cik or (
+            _normalize_cik(checkpoint.cursor) if checkpoint.cursor is not None else None
+        )
+        if cik is None:
+            raise ConnectorError(
+                self.name, retryable=False, diagnostic_code="request_context_missing"
+            )
+        result = self.fetch_submissions(cik, checkpoint=checkpoint)
+        return ConnectorBatch(
+            self.name,
+            result.documents,
+            ConnectorCheckpoint(
+                self.name,
+                cursor=cik,
+                etag=result.checkpoint.etag,
+                last_modified=result.checkpoint.last_modified,
+            ),
+        )
 
     def fetch_submissions(
         self, cik: str, *, checkpoint: ConnectorCheckpoint | None = None

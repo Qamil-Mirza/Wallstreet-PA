@@ -3,21 +3,100 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import re
+import threading
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import date, datetime, timezone
+from datetime import date, datetime, time, timezone
 from decimal import Decimal, InvalidOperation
 from types import MappingProxyType
-from typing import Any, Mapping, Sequence
+from typing import Any
 from urllib.parse import urlsplit
 
 import requests
 
-from .base import ConnectorError
+from ..evidence import DocumentInput
+from .base import (
+    ConnectorBatch,
+    ConnectorCheckpoint,
+    ConnectorError,
+    NormalizedResearchDocument,
+)
 
 
 _SYMBOL = re.compile(r"[A-Z0-9][A-Z0-9.-]{0,15}")
+_SECRET_ASSIGNMENT = re.compile(
+    r"(?i)(\b(?:api[_-]?key|apikey|x-api-key)\b['\"]?\s*[:=]\s*['\"]?)([^'\"&,\s}\]]+)"
+)
+_BEARER = re.compile(
+    r"(?i)(\bauthorization\b['\"]?\s*[:=]\s*['\"]?bearer\s+)([^'\",\s}\]]+)"
+)
+_REDACTED = "[REDACTED]"
+_LOG_FACTORY_LOCK = threading.RLock()
+_FACTORY_MARKER = "_newsletter_fmp_redaction_factory"
+
+
+def _redact_text(value: str) -> str:
+    redacted = _SECRET_ASSIGNMENT.sub(rf"\1{_REDACTED}", value)
+    return _BEARER.sub(rf"\1{_REDACTED}", redacted)
+
+
+def _redact_log_value(value):
+    if isinstance(value, str):
+        return _redact_text(value)
+    if isinstance(value, Mapping):
+        changed = False
+        redacted: dict[object, object] = {}
+        for key, item in value.items():
+            normalized = str(key).lower().replace("_", "-")
+            if normalized in {"apikey", "api-key", "x-api-key", "authorization"}:
+                replacement = _REDACTED
+            else:
+                replacement = _redact_log_value(item)
+            changed = changed or replacement != item
+            redacted[key] = replacement
+        return redacted if changed else value
+    if isinstance(value, tuple):
+        redacted = tuple(_redact_log_value(item) for item in value)
+        return redacted if redacted != value else value
+    if isinstance(value, list):
+        redacted = [_redact_log_value(item) for item in value]
+        return redacted if redacted != value else value
+    return value
+
+
+def install_fmp_log_redaction() -> None:
+    """Chain one process-wide secret-safe LogRecord factory."""
+    with _LOG_FACTORY_LOCK:
+        prior_factory = logging.getLogRecordFactory()
+        if getattr(prior_factory, _FACTORY_MARKER, False):
+            return
+
+        def redacting_factory(*args, **kwargs):
+            record = prior_factory(*args, **kwargs)
+            original_message = record.msg
+            original_args = record.args
+            record.msg = _redact_log_value(record.msg)
+            record.args = _redact_log_value(record.args)
+            if record.exc_text:
+                record.exc_text = _redact_text(record.exc_text)
+            if record.exc_info and record.exc_info[1] is not None:
+                exception = record.exc_info[1]
+                unsafe = str(exception)
+                safe = _redact_text(unsafe)
+                if safe != unsafe:
+                    safe_exception = RuntimeError(safe)
+                    record.exc_info = (RuntimeError, safe_exception, None)
+                    record.exc_text = None
+            if record.msg == original_message and record.args == original_args:
+                record.msg = original_message
+                record.args = original_args
+            return record
+
+        setattr(redacting_factory, _FACTORY_MARKER, True)
+        logging.setLogRecordFactory(redacting_factory)
 
 
 def _decimal(value: object, field_name: str) -> Decimal:
@@ -32,37 +111,62 @@ def _decimal(value: object, field_name: str) -> Decimal:
     return parsed
 
 
+def _normalized_symbol(value: str | None) -> str:
+    normalized = value.strip().upper() if isinstance(value, str) else ""
+    if _SYMBOL.fullmatch(normalized) is None:
+        raise ValueError("FMP symbol is invalid")
+    return normalized
+
+
 @dataclass(frozen=True)
 class FMPConfig:
-    """Restricted personal-use FMP endpoint configuration."""
+    """FMP settings that can safely represent a disabled provider."""
 
     api_key: str | None = field(repr=False)
-    base_url: str = "https://financialmodelingprep.com/stable"
+    base_url: str = field(
+        default="https://financialmodelingprep.com/stable", repr=False
+    )
     timeout_seconds: float = 10.0
     max_response_bytes: int = 2_000_000
 
     def __post_init__(self) -> None:
-        parsed = urlsplit(self.base_url)
-        if (
-            parsed.scheme != "https"
-            or parsed.hostname != "financialmodelingprep.com"
-            or parsed.port not in (None, 443)
-            or parsed.username is not None
-            or parsed.password is not None
-            or parsed.query
-            or parsed.fragment
-            or parsed.path.rstrip("/") != "/stable"
-        ):
-            raise ValueError("FMP base_url must be the allowlisted HTTPS stable API")
         if self.api_key is not None and (
             not isinstance(self.api_key, str) or not self.api_key.strip()
         ):
             raise ValueError("FMP api_key must be nonblank when configured")
+        if not isinstance(self.base_url, str) or not self.base_url.strip():
+            raise ValueError("FMP base_url must be nonblank text")
         if not isinstance(self.timeout_seconds, (int, float)) or self.timeout_seconds <= 0:
             raise ValueError("FMP timeout_seconds must be positive")
         if not isinstance(self.max_response_bytes, int) or self.max_response_bytes <= 0:
             raise ValueError("FMP max_response_bytes must be positive")
-        object.__setattr__(self, "base_url", self.base_url.rstrip("/"))
+        if self.transport_allowed:
+            object.__setattr__(self, "base_url", self.base_url.rstrip("/"))
+
+    @property
+    def transport_allowed(self) -> bool:
+        try:
+            parsed = urlsplit(self.base_url)
+            return (
+                parsed.scheme == "https"
+                and parsed.hostname == "financialmodelingprep.com"
+                and parsed.port in (None, 443)
+                and parsed.username is None
+                and parsed.password is None
+                and not parsed.query
+                and not parsed.fragment
+                and parsed.path.rstrip("/") == "/stable"
+            )
+        except ValueError:
+            return False
+
+    @property
+    def unavailable_reason(self) -> str | None:
+        if self.api_key is None:
+            return "configuration_missing"
+        if not self.transport_allowed:
+            return "endpoint_disallowed"
+        return None
 
 
 @dataclass(frozen=True)
@@ -88,7 +192,7 @@ class DatedPrice:
 
 @dataclass(frozen=True)
 class FundamentalPacket:
-    """Normalized FMP values with explicit field-level availability."""
+    """Normalized values with explicit provider and fallback availability."""
 
     price: DatedPrice | None
     financial_period: str | None
@@ -112,21 +216,47 @@ class FMPConnector:
 
     name = "fmp"
 
-    def __init__(self, config: FMPConfig, *, session=None) -> None:
-        if not isinstance(config, FMPConfig):
-            raise TypeError("config must be FMPConfig")
+    def __init__(
+        self,
+        config: FMPConfig | None,
+        *,
+        symbol: str | None = None,
+        session=None,
+        sec_facts_fallback: Callable[[str], Mapping[str, Decimal]] | None = None,
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
+        if config is not None and not isinstance(config, FMPConfig):
+            raise TypeError("config must be FMPConfig or None")
+        if symbol is not None:
+            _normalized_symbol(symbol)
+        if sec_facts_fallback is not None and not callable(sec_facts_fallback):
+            raise TypeError("sec_facts_fallback must be callable")
+        install_fmp_log_redaction()
         self.config = config
+        self.symbol = symbol.strip().upper() if symbol is not None else None
+        self._sec_facts_fallback = sec_facts_fallback
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._owns_session = session is None
         self.session = session or requests.Session()
-        self.session.trust_env = False
+        if self._owns_session:
+            self.session.trust_env = False
+
+    def close(self) -> None:
+        """Close only a session created and owned by this connector."""
+        if self._owns_session:
+            self.session.close()
+
+    def _availability_reason(self) -> str | None:
+        if self.config is None:
+            return "configuration_missing"
+        return self.config.unavailable_reason
 
     def _request(self, endpoint: str, symbol: str):
-        normalized = symbol.strip().upper() if isinstance(symbol, str) else ""
-        if _SYMBOL.fullmatch(normalized) is None:
-            raise ValueError("FMP symbol is invalid")
-        if self.config.api_key is None:
-            raise ConnectorError(
-                self.name, retryable=False, diagnostic_code="configuration_missing"
-            )
+        normalized = _normalized_symbol(symbol)
+        reason = self._availability_reason()
+        if reason is not None:
+            raise ConnectorError(self.name, retryable=False, diagnostic_code=reason)
+        assert self.config is not None
         url = f"{self.config.base_url}/{endpoint}"
         try:
             response = self.session.get(
@@ -136,64 +266,194 @@ class FMPConnector:
                 allow_redirects=False,
                 stream=True,
             )
-        except requests.RequestException:
-            raise ConnectorError(
-                self.name, retryable=True, diagnostic_code="transport_error"
-            ) from None
         except Exception:
             raise ConnectorError(
                 self.name, retryable=True, diagnostic_code="transport_error"
             ) from None
-        final = urlsplit(getattr(response, "url", ""))
-        if (
-            getattr(response, "history", ())
-            or final.scheme != "https"
-            or final.hostname != "financialmodelingprep.com"
-            or final.port not in (None, 443)
-        ):
-            raise ConnectorError(
-                self.name, retryable=False, diagnostic_code="redirect_rejected"
-            )
-        status = int(response.status_code)
-        if not 200 <= status < 300:
-            raise ConnectorError(
-                self.name,
-                status=status,
-                retryable=status in {408, 425, 429} or 500 <= status <= 599,
-                diagnostic_code=f"http_{status}",
-            )
-        raw = bytearray()
         try:
-            for chunk in response.iter_content(chunk_size=65_536):
-                raw.extend(chunk)
-                if len(raw) > self.config.max_response_bytes:
-                    raise ConnectorError(
-                        self.name,
-                        retryable=False,
-                        diagnostic_code="response_too_large",
-                    )
-            payload = json.loads(bytes(raw).decode("utf-8", errors="strict"))
-        except ConnectorError:
-            raise
-        except (UnicodeError, json.JSONDecodeError):
-            raise ConnectorError(
-                self.name, retryable=False, diagnostic_code="invalid_json"
-            ) from None
-        except Exception:
-            raise ConnectorError(
-                self.name, retryable=True, diagnostic_code="response_read_failed"
-            ) from None
-        if not isinstance(payload, (list, dict)):
-            raise ConnectorError(
-                self.name, retryable=False, diagnostic_code="invalid_payload"
-            )
-        return payload
+            final = urlsplit(getattr(response, "url", ""))
+            if (
+                getattr(response, "history", ())
+                or final.scheme != "https"
+                or final.hostname != "financialmodelingprep.com"
+                or final.port not in (None, 443)
+            ):
+                raise ConnectorError(
+                    self.name, retryable=False, diagnostic_code="redirect_rejected"
+                )
+            status = int(response.status_code)
+            if not 200 <= status < 300:
+                raise ConnectorError(
+                    self.name,
+                    status=status,
+                    retryable=status in {408, 425, 429} or 500 <= status <= 599,
+                    diagnostic_code=f"http_{status}",
+                )
+            raw = bytearray()
+            try:
+                for chunk in response.iter_content(chunk_size=65_536):
+                    raw.extend(chunk)
+                    if len(raw) > self.config.max_response_bytes:
+                        raise ConnectorError(
+                            self.name,
+                            retryable=False,
+                            diagnostic_code="response_too_large",
+                        )
+                payload = json.loads(bytes(raw).decode("utf-8", errors="strict"))
+            except ConnectorError:
+                raise
+            except (UnicodeError, json.JSONDecodeError):
+                raise ConnectorError(
+                    self.name, retryable=False, diagnostic_code="invalid_json"
+                ) from None
+            except Exception:
+                raise ConnectorError(
+                    self.name, retryable=True, diagnostic_code="response_read_failed"
+                ) from None
+            if not isinstance(payload, (list, dict)):
+                raise ConnectorError(
+                    self.name, retryable=False, diagnostic_code="invalid_payload"
+                )
+            return payload
+        finally:
+            try:
+                response.close()
+            except Exception:
+                pass
 
     def fetch_quote(self, symbol: str):
         return self._request("quote", symbol)
 
     def fetch_income_statement(self, symbol: str):
         return self._request("income-statement", symbol)
+
+    def _resolve_symbol(self, value: str | None = None) -> str:
+        return _normalized_symbol(value or self.symbol)
+
+    def _apply_sec_fallback(
+        self,
+        symbol: str,
+        reason: str,
+        packet: FundamentalPacket | None = None,
+    ) -> FundamentalPacket:
+        statements = dict(packet.statements) if packet is not None else {}
+        ratios = dict(packet.ratios) if packet is not None else {}
+        metadata = dict(packet.metadata) if packet is not None else {}
+        unavailable = dict(packet.unavailable) if packet is not None else {
+            "price": "provider_value_missing",
+            "fundamentals": "provider_value_missing",
+        }
+        unavailable["fmp"] = reason
+        if self._sec_facts_fallback is not None:
+            try:
+                facts = self._sec_facts_fallback(symbol)
+                if not isinstance(facts, Mapping):
+                    raise TypeError
+                accepted = False
+                for key, value in facts.items():
+                    if (
+                        isinstance(key, str)
+                        and key.strip()
+                        and isinstance(value, Decimal)
+                        and value.is_finite()
+                    ):
+                        if key not in statements:
+                            statements[key] = value
+                            unavailable.pop(key, None)
+                            accepted = True
+                    else:
+                        raise ValueError
+                if accepted:
+                    metadata["fundamental_source"] = "sec_companyfacts"
+                else:
+                    raise ValueError
+            except Exception:
+                unavailable["sec_fallback"] = "fallback_unavailable"
+        return FundamentalPacket(
+            price=packet.price if packet is not None else None,
+            financial_period=packet.financial_period if packet is not None else None,
+            financial_effective_date=(
+                packet.financial_effective_date if packet is not None else None
+            ),
+            statements=statements,
+            ratios=ratios,
+            metadata=metadata,
+            unavailable=unavailable,
+            use_sec_fallback=True,
+        )
+
+    def fetch_fundamentals(self, symbol: str | None = None) -> FundamentalPacket:
+        normalized = self._resolve_symbol(symbol)
+        reason = self._availability_reason()
+        if reason is not None:
+            return self._apply_sec_fallback(normalized, reason)
+        try:
+            packet = self.parse(
+                quote=self.fetch_quote(normalized),
+                statements=self.fetch_income_statement(normalized),
+            )
+        except ConnectorError:
+            return self._apply_sec_fallback(normalized, "provider_unavailable")
+        if packet.use_sec_fallback:
+            return self._apply_sec_fallback(
+                normalized, "provider_value_unavailable", packet
+            )
+        return packet
+
+    def fetch(self, checkpoint: ConnectorCheckpoint) -> ConnectorBatch:
+        if checkpoint.connector != self.name:
+            raise ValueError("checkpoint belongs to another connector")
+        symbol = self._resolve_symbol(checkpoint.cursor)
+        packet = self.fetch_fundamentals(symbol)
+        retrieved_at = self._clock()
+        effective_date = packet.financial_effective_date or (
+            packet.price.effective_date if packet.price is not None else None
+        )
+        published_at = (
+            datetime.combine(effective_date, time.min, tzinfo=timezone.utc)
+            if effective_date is not None
+            else retrieved_at
+        )
+        payload = {
+            "financial_effective_date": (
+                packet.financial_effective_date.isoformat()
+                if packet.financial_effective_date
+                else None
+            ),
+            "financial_period": packet.financial_period,
+            "metadata": {key: str(value) for key, value in packet.metadata.items()},
+            "price": (
+                {
+                    "effective_date": packet.price.effective_date.isoformat(),
+                    "symbol": packet.price.symbol,
+                    "value": str(packet.price.value),
+                }
+                if packet.price
+                else None
+            ),
+            "ratios": {key: str(value) for key, value in packet.ratios.items()},
+            "statements": {key: str(value) for key, value in packet.statements.items()},
+            "unavailable": dict(packet.unavailable),
+        }
+        document = NormalizedResearchDocument(
+            evidence=DocumentInput(
+                source_type="fmp_fundamentals",
+                url=(
+                    "https://financialmodelingprep.com/stable/quote"
+                    f"?symbol={symbol}"
+                ),
+                publisher="Financial Modeling Prep",
+                published_at=published_at,
+                retrieved_at=retrieved_at,
+                content=json.dumps(payload, sort_keys=True, separators=(",", ":")),
+            ),
+            tags=("FMP", "fundamentals"),
+        )
+        return ConnectorBatch(
+            self.name,
+            (document,),
+            ConnectorCheckpoint(self.name, cursor=symbol),
+        )
 
     def parse(
         self,
@@ -212,9 +472,7 @@ class FMPConnector:
         quote_row = quote[0] if quote else None
         if isinstance(quote_row, Mapping):
             try:
-                symbol = str(quote_row["symbol"]).strip().upper()
-                if _SYMBOL.fullmatch(symbol) is None:
-                    raise ValueError
+                symbol = _normalized_symbol(str(quote_row["symbol"]))
                 raw_timestamp = quote_row["timestamp"]
                 if isinstance(raw_timestamp, bool) or not isinstance(
                     raw_timestamp, (int, float)
@@ -223,7 +481,9 @@ class FMPConnector:
                 effective_date = datetime.fromtimestamp(
                     raw_timestamp, tz=timezone.utc
                 ).date()
-                price = DatedPrice(symbol, _decimal(quote_row["price"], "price"), effective_date)
+                price = DatedPrice(
+                    symbol, _decimal(quote_row["price"], "price"), effective_date
+                )
             except (KeyError, TypeError, ValueError, OSError, OverflowError):
                 unavailable["price"] = "provider_value_invalid"
             name = quote_row.get("name")
@@ -240,9 +500,8 @@ class FMPConnector:
 
         statement = statements[0] if statements else None
         if isinstance(statement, Mapping):
-            raw_statement_date = statement.get("date")
             try:
-                financial_effective_date = date.fromisoformat(raw_statement_date)
+                financial_effective_date = date.fromisoformat(statement.get("date"))
             except (TypeError, ValueError):
                 unavailable["financial_effective_date"] = "provider_value_invalid"
             calendar_year = statement.get("calendarYear")

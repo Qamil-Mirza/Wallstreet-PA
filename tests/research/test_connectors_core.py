@@ -201,7 +201,7 @@ def test_sec_connector_sends_identity_conditionals_and_safe_transport():
     assert request["allow_redirects"] is False
     assert request["stream"] is True
     assert request["timeout"] == 5.0
-    assert session.trust_env is False
+    assert session.trust_env is True
     assert result.checkpoint.etag == '"v2"'
 
 
@@ -389,10 +389,12 @@ def test_fmp_request_uses_allowlisted_https_base_and_never_leaks_key():
     assert url == "https://financialmodelingprep.com/stable/quote"
     assert request["params"] == {"symbol": "NVDA", "apikey": "private-key"}
     assert "private-key" not in repr(connector.config)
-    with pytest.raises(ValueError):
-        FMPConfig(api_key="secret", base_url="http://financialmodelingprep.com/stable")
-    with pytest.raises(ValueError):
-        FMPConfig(api_key="secret", base_url="https://evil.example/stable")
+    assert FMPConfig(
+        api_key="secret", base_url="http://financialmodelingprep.com/stable"
+    ).unavailable_reason == "endpoint_disallowed"
+    assert FMPConfig(
+        api_key="secret", base_url="https://evil.example/stable"
+    ).unavailable_reason == "endpoint_disallowed"
 
 
 def test_fmp_http_error_is_redacted_and_classified():

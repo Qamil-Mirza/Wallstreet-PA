@@ -6,12 +6,19 @@ from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime, timezone
 
 from ...news_client import ArticleMeta, fetch_articles_by_section
-from ..evidence import DocumentInput
+from ..evidence import (
+    DocumentInput,
+    EvidenceIngestor,
+    IngestedDocument,
+    canonicalize_content,
+    canonicalize_url,
+)
 from .base import (
     ConnectorBatch,
     ConnectorCheckpoint,
     ConnectorError,
     NormalizedResearchDocument,
+    commit_connector_batch,
 )
 
 
@@ -25,8 +32,16 @@ class _ArticleConnector:
     name: str
     source_type: str
 
-    def __init__(self, *, now: Callable[[], datetime] | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        now: Callable[[], datetime] | None = None,
+        ingestor: EvidenceIngestor | None = None,
+    ) -> None:
+        if ingestor is not None and not isinstance(ingestor, EvidenceIngestor):
+            raise TypeError("ingestor must be EvidenceIngestor")
         self._now = now or (lambda: datetime.now(timezone.utc))
+        self._ingestor = ingestor
 
     def from_article(
         self, article: ArticleMeta, *, section: str
@@ -38,11 +53,11 @@ class _ArticleConnector:
         return NormalizedResearchDocument(
             evidence=DocumentInput(
                 source_type=self.source_type,
-                url=article.url,
+                url=canonicalize_url(article.url),
                 publisher=publisher,
                 published_at=_aware_utc(article.published_at),
                 retrieved_at=_aware_utc(self._now()),
-                content=content,
+                content=canonicalize_content(content),
             ),
             tags=(section,),
         )
@@ -66,6 +81,23 @@ class _ArticleConnector:
             next_checkpoint=ConnectorCheckpoint(self.name, cursor=cursor),
         )
 
+    def fetch_and_persist(
+        self,
+        checkpoint: ConnectorCheckpoint,
+        *,
+        persist_checkpoint: Callable[[ConnectorCheckpoint], None],
+    ) -> tuple[IngestedDocument, ...]:
+        """Fetch once, ingest canonical evidence, then advance the cursor."""
+        if self._ingestor is None:
+            raise ConnectorError(
+                self.name, retryable=False, diagnostic_code="ingestor_missing"
+            )
+        return commit_connector_batch(
+            self.fetch(checkpoint),
+            ingestor=self._ingestor,
+            persist_checkpoint=persist_checkpoint,
+        )
+
 
 class MarketAuxResearchConnector(_ArticleConnector):
     """Reuse the production sectioned MarketAux client without duplicating it."""
@@ -80,8 +112,9 @@ class MarketAuxResearchConnector(_ArticleConnector):
         section_fetcher: Callable[..., Mapping[str, Sequence[ArticleMeta]]] = fetch_articles_by_section,
         per_section_limit: int = 5,
         now: Callable[[], datetime] | None = None,
+        ingestor: EvidenceIngestor | None = None,
     ) -> None:
-        super().__init__(now=now)
+        super().__init__(now=now, ingestor=ingestor)
         if not isinstance(per_section_limit, int) or per_section_limit <= 0:
             raise ValueError("per_section_limit must be positive")
         self.news_config = news_config
@@ -117,8 +150,9 @@ class RSSResearchConnector(_ArticleConnector):
         article_provider: Callable[[], Mapping[str, Sequence[ArticleMeta]]] | None = None,
         *,
         now: Callable[[], datetime] | None = None,
+        ingestor: EvidenceIngestor | None = None,
     ) -> None:
-        super().__init__(now=now)
+        super().__init__(now=now, ingestor=ingestor)
         self._article_provider = article_provider
 
     def fetch(self, checkpoint: ConnectorCheckpoint) -> ConnectorBatch:

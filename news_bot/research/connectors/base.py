@@ -7,9 +7,14 @@ import unicodedata
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
-from ..evidence import DocumentInput, canonicalize_url
+from ..evidence import (
+    DocumentInput,
+    EvidenceIngestor,
+    IngestedDocument,
+    canonicalize_url,
+)
 
 
 _DIAGNOSTIC_CODE = re.compile(r"[a-z0-9][a-z0-9_.:-]{0,63}")
@@ -101,6 +106,7 @@ class ConnectorBatch:
             raise ValueError("checkpoint must belong to connector batch")
 
 
+@runtime_checkable
 class ResearchConnector(Protocol):
     """Provider-neutral pull contract implemented by source adapters."""
 
@@ -110,8 +116,14 @@ class ResearchConnector(Protocol):
         """Return normalized documents and the proposed durable checkpoint."""
 
 
+@dataclass(frozen=True, init=False)
 class ConnectorError(RuntimeError):
     """A redacted connector failure suitable for persistence and retry policy."""
+
+    connector: str
+    status: int | None
+    retryable: bool
+    diagnostic_code: str
 
     def __init__(
         self,
@@ -130,10 +142,10 @@ class ConnectorError(RuntimeError):
             raise TypeError("retryable must be bool")
         if _DIAGNOSTIC_CODE.fullmatch(diagnostic_code) is None:
             raise ValueError("diagnostic_code must be a safe symbolic value")
-        self.connector = connector
-        self.status = status
-        self.retryable = retryable
-        self.diagnostic_code = diagnostic_code
+        object.__setattr__(self, "connector", connector)
+        object.__setattr__(self, "status", status)
+        object.__setattr__(self, "retryable", retryable)
+        object.__setattr__(self, "diagnostic_code", diagnostic_code)
         details = diagnostic_code
         if status is not None:
             details += f", status={status}"
@@ -144,9 +156,11 @@ class ConnectorError(RuntimeError):
 def commit_connector_batch(
     batch: ConnectorBatch,
     *,
-    persist_documents: Callable[[tuple[NormalizedResearchDocument, ...]], None],
+    persist_documents: Callable[[tuple[NormalizedResearchDocument, ...]], None]
+    | None = None,
+    ingestor: EvidenceIngestor | None = None,
     persist_checkpoint: Callable[[ConnectorCheckpoint], None],
-) -> None:
+) -> tuple[IngestedDocument, ...]:
     """Persist a complete batch before making its proposed checkpoint durable.
 
     ``persist_documents`` is the coordinator's atomic storage boundary. If it
@@ -155,5 +169,13 @@ def commit_connector_batch(
 
     if not isinstance(batch, ConnectorBatch):
         raise TypeError("batch must be ConnectorBatch")
-    persist_documents(batch.documents)
+    if (persist_documents is None) == (ingestor is None):
+        raise ValueError("provide exactly one document persistence boundary")
+    if ingestor is not None:
+        ingested = tuple(ingestor.ingest(document.evidence) for document in batch.documents)
+    else:
+        assert persist_documents is not None
+        persist_documents(batch.documents)
+        ingested = ()
     persist_checkpoint(batch.next_checkpoint)
+    return ingested

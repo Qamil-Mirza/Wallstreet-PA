@@ -10,7 +10,12 @@ from urllib.parse import unquote, urlsplit
 
 from ...article_extractor import _fetch_and_extract
 from ..evidence import DocumentInput, canonicalize_url
-from .base import ConnectorError, NormalizedResearchDocument
+from .base import (
+    ConnectorBatch,
+    ConnectorCheckpoint,
+    ConnectorError,
+    NormalizedResearchDocument,
+)
 
 
 @dataclass(frozen=True)
@@ -56,14 +61,33 @@ class InvestorRelationsConnector:
         self,
         config: InvestorRelationsConfig,
         *,
+        issuer: str | None = None,
+        release_url: str | None = None,
+        published_at: datetime | None = None,
         extractor: Callable[[str], tuple[str | None, bool]] = _fetch_and_extract,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         if not isinstance(config, InvestorRelationsConfig):
             raise TypeError("config must be InvestorRelationsConfig")
+        supplied = (issuer is not None, release_url is not None, published_at is not None)
+        if any(supplied) and not all(supplied):
+            raise ValueError("IR request context must be complete")
+        if published_at is not None and (
+            not isinstance(published_at, datetime)
+            or published_at.tzinfo is None
+            or published_at.utcoffset() is None
+        ):
+            raise ValueError("IR published_at must be timezone-aware")
         self.config = config
         self._extractor = extractor
         self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self.issuer = issuer.strip().upper() if issuer is not None else None
+        self.release_url = (
+            self._approved_url(self.issuer, release_url)
+            if issuer is not None and release_url is not None
+            else None
+        )
+        self.published_at = published_at
 
     def _approved_url(self, issuer: str, url: str) -> str:
         issuer_key = issuer.strip().upper() if isinstance(issuer, str) else ""
@@ -123,4 +147,25 @@ class InvestorRelationsConnector:
                 content=content,
             ),
             tags=("investor-relations", issuer_key),
+        )
+
+    def fetch(self, checkpoint: ConnectorCheckpoint) -> ConnectorBatch:
+        """Fetch the explicitly configured issuer release as one batch."""
+        if checkpoint.connector != self.name:
+            raise ValueError("checkpoint belongs to another connector")
+        if (
+            self.issuer is None
+            or self.release_url is None
+            or self.published_at is None
+        ):
+            raise ConnectorError(
+                self.name, retryable=False, diagnostic_code="request_context_missing"
+            )
+        document = self.fetch_release(
+            self.issuer, self.release_url, published_at=self.published_at
+        )
+        return ConnectorBatch(
+            self.name,
+            (document,),
+            ConnectorCheckpoint(self.name, cursor="complete"),
         )
