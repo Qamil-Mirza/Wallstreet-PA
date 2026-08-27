@@ -14,7 +14,7 @@ from sqlite3 import IntegrityError
 import pytest
 
 from news_bot.research.ibkr_flex import parse_statement
-from news_bot.research.models import SourceDocument
+from news_bot.research.models import ClaimKind, SourceDocument
 from news_bot.research.store import ResearchStore
 
 from .conftest import fixture, make_claim, make_migrated_store, utc
@@ -31,6 +31,7 @@ REQUIRED_TABLES = {
     "document_passages",
     "claims",
     "claim_evidence",
+    "claim_dependencies",
     "industry_theses",
     "scenarios",
     "recommendations",
@@ -90,9 +91,10 @@ def test_migration_is_idempotent_and_recorded_once(tmp_path):
         rows = connection.execute(
             "SELECT version, name, applied_at FROM schema_migrations"
         ).fetchall()
-    assert len(rows) == 2
+    assert len(rows) == 3
     assert rows[0][0:2] == (1, "001_initial.sql")
     assert rows[1][0:2] == (2, "002_nullable_portfolio_freshness.sql")
+    assert rows[2][0:2] == (3, "003_claim_dependencies.sql")
     assert all(row[2].endswith("Z") for row in rows)
 
 
@@ -197,7 +199,7 @@ def test_existing_v1_database_upgrades_nullable_freshness_without_data_loss(
             "WHERE type = 'index' AND name LIKE 'idx_positions_%' ORDER BY name"
         ).fetchall()
 
-    assert versions == [(1,), (2,)]
+    assert versions == [(1,), (2,), (3,)]
     assert stored_snapshot == snapshot_row
     assert stored_security == security_row
     assert stored_position == position_row
@@ -209,6 +211,66 @@ def test_existing_v1_database_upgrades_nullable_freshness_without_data_loss(
         ("idx_positions_snapshot_id", "positions"),
         ("idx_positions_symbol", "positions"),
     ]
+
+
+def test_existing_v2_claims_upgrade_with_lineage_anchor_without_data_loss(
+    tmp_path, monkeypatch
+):
+    database_path = tmp_path / "research.db"
+    migration_root = (
+        Path(__file__).resolve().parents[2] / "news_bot/research/migrations"
+    )
+    v1 = tmp_path / "001_initial.sql"
+    v2 = tmp_path / "002_nullable_portfolio_freshness.sql"
+    shutil.copyfile(migration_root / v1.name, v1)
+    shutil.copyfile(migration_root / v2.name, v2)
+    old_store = ResearchStore(database_path)
+    monkeypatch.setattr(old_store, "_migration_files", lambda: (v1, v2))
+    old_store.migrate()
+    seed_passage(old_store)
+    claim = make_claim("claim-v2")
+    with old_store.transaction() as connection:
+        connection.execute(
+            "INSERT INTO claims ("
+            "claim_id, entity_id, kind, text, as_of, confidence, status, created_at"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                claim.claim_id,
+                claim.entity_id,
+                claim.kind.value,
+                claim.text,
+                "2026-08-24T00:00:00.000000Z",
+                "0.90",
+                claim.status,
+                "2026-08-24T00:00:00.000000Z",
+            ),
+        )
+        connection.execute(
+            "INSERT INTO claim_evidence (claim_id, passage_id, stance) "
+            "VALUES (?, ?, ?)",
+            (claim.claim_id, "passage-1", "supports"),
+        )
+
+    upgraded = ResearchStore(database_path)
+    upgraded.migrate()
+
+    with upgraded.connect() as connection:
+        versions = connection.execute(
+            "SELECT version FROM schema_migrations ORDER BY version"
+        ).fetchall()
+        primary_anchor = connection.execute(
+            "SELECT primary_passage_id, primary_supporting_claim_id "
+            "FROM claims WHERE claim_id = ?",
+            (claim.claim_id,),
+        ).fetchone()
+        foreign_key_errors = connection.execute("PRAGMA foreign_key_check").fetchall()
+    assert versions == [(1,), (2,), (3,)]
+    assert upgraded.get_claim(claim.claim_id) == claim
+    assert upgraded.list_claim_lineage(claim.claim_id)[0].passage.passage_id == (
+        "passage-1"
+    )
+    assert primary_anchor == ("passage-1", None)
+    assert foreign_key_errors == []
 
 
 def test_store_fails_closed_when_no_migrations_are_available(tmp_path, monkeypatch):
@@ -258,6 +320,7 @@ def test_built_wheel_contains_and_applies_all_migrations(tmp_path):
     migration_names = {
         "news_bot/research/migrations/001_initial.sql",
         "news_bot/research/migrations/002_nullable_portfolio_freshness.sql",
+        "news_bot/research/migrations/003_claim_dependencies.sql",
     }
     with zipfile.ZipFile(wheel) as archive:
         assert migration_names <= set(archive.namelist())
@@ -268,13 +331,14 @@ def test_built_wheel_contains_and_applies_all_migrations(tmp_path):
         f"sys.path.insert(0, {str(wheel)!r}); "
         "migration_dir = resources.files('news_bot.research').joinpath('migrations'); "
         "assert {p.name for p in migration_dir.iterdir()} >= "
-        "{'001_initial.sql', '002_nullable_portfolio_freshness.sql'}; "
+        "{'001_initial.sql', '002_nullable_portfolio_freshness.sql', "
+        "'003_claim_dependencies.sql'}; "
         "from news_bot.research.store import ResearchStore; "
         "db = Path(tempfile.mkdtemp()) / 'research.db'; "
         "store = ResearchStore(db); store.migrate(); "
         "connection = sqlite3.connect(db); "
         "assert connection.execute('SELECT version FROM schema_migrations "
-        "ORDER BY version').fetchall() == [(1,), (2,)]; connection.close()"
+        "ORDER BY version').fetchall() == [(1,), (2,), (3,)]; connection.close()"
     )
     subprocess.run(
         [sys.executable, "-I", "-c", resource_probe],
@@ -287,7 +351,7 @@ def test_built_wheel_contains_and_applies_all_migrations(tmp_path):
 
 def test_failed_multi_statement_migration_is_atomic(tmp_path, monkeypatch):
     store = make_migrated_store(tmp_path)
-    bad_migration = tmp_path / "003_broken.sql"
+    bad_migration = tmp_path / "004_broken.sql"
     bad_migration.write_text(
         "CREATE TABLE should_roll_back (id INTEGER);\n"
         "INSERT INTO missing_table (id) VALUES (1);\n",
@@ -306,7 +370,7 @@ def test_failed_multi_statement_migration_is_atomic(tmp_path, monkeypatch):
         versions = connection.execute(
             "SELECT version FROM schema_migrations ORDER BY version"
         ).fetchall()
-    assert versions == [(1,), (2,)]
+    assert versions == [(1,), (2,), (3,)]
 
 
 def test_migrations_are_sorted_by_numeric_version(tmp_path, monkeypatch):
@@ -591,6 +655,28 @@ def test_claim_requires_evidence(tmp_path):
     assert store.get_claim("claim-1") is None
 
 
+@pytest.mark.parametrize("kind", ["fact", "guidance", "estimate", "inference"])
+def test_database_rejects_claim_without_required_lineage_anchor(tmp_path, kind):
+    store = make_migrated_store(tmp_path)
+
+    with pytest.raises(IntegrityError):
+        with store.transaction() as connection:
+            connection.execute(
+                "INSERT INTO claims ("
+                "claim_id, entity_id, kind, text, as_of, confidence, status, created_at"
+                ") VALUES (?, NULL, ?, ?, ?, ?, ?, ?)",
+                (
+                    f"claim-{kind}",
+                    kind,
+                    "Uncited material claim.",
+                    "2026-08-24T00:00:00.000000Z",
+                    "0.5",
+                    "active",
+                    "2026-08-24T00:00:00.000000Z",
+                ),
+            )
+
+
 def test_claim_missing_passage_is_atomic(tmp_path):
     store = make_migrated_store(tmp_path)
 
@@ -598,6 +684,114 @@ def test_claim_missing_passage_is_atomic(tmp_path):
         store.insert_claim(make_claim("claim-1"), evidence_ids=["missing"])
 
     assert store.get_claim("claim-1") is None
+
+
+def test_inference_missing_claim_dependency_is_atomic(tmp_path):
+    store = make_migrated_store(tmp_path)
+    inference = replace(
+        make_claim("inference-1"),
+        kind=ClaimKind.INFERENCE,
+        text="Capacity may tighten.",
+    )
+
+    with pytest.raises(IntegrityError):
+        store.insert_claim_with_lineage(
+            inference,
+            passage_links=(),
+            supporting_claim_ids=("missing",),
+        )
+
+    assert store.get_claim("inference-1") is None
+
+
+def test_self_referential_claim_dependency_is_atomic(tmp_path):
+    store = make_migrated_store(tmp_path)
+    inference = replace(
+        make_claim("inference-1"),
+        kind=ClaimKind.INFERENCE,
+        text="Capacity may tighten.",
+    )
+
+    with pytest.raises(IntegrityError, match="themselves"):
+        store.insert_claim_with_lineage(
+            inference,
+            passage_links=(),
+            supporting_claim_ids=("inference-1",),
+        )
+
+    assert store.get_claim("inference-1") is None
+
+
+def test_claim_dependencies_are_indexed_restrictive_and_immutable(tmp_path):
+    store = make_migrated_store(tmp_path)
+    seed_claim_with_evidence(store)
+    inference = replace(
+        make_claim("inference-1"),
+        kind=ClaimKind.INFERENCE,
+        text="Capacity may tighten.",
+    )
+    store.insert_claim_with_lineage(
+        inference,
+        passage_links=(),
+        supporting_claim_ids=("claim-1",),
+    )
+
+    assert store.list_supporting_claim_ids("inference-1") == ("claim-1",)
+    with store.connect() as connection:
+        indexes = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index'"
+            )
+        }
+    assert "idx_claim_dependencies_supporting_claim_id" in indexes
+
+    with pytest.raises(IntegrityError, match="claim dependency links are immutable"):
+        with store.transaction() as connection:
+            connection.execute(
+                "UPDATE claim_dependencies SET supporting_claim_id = ? "
+                "WHERE claim_id = ?",
+                ("inference-1", "inference-1"),
+            )
+    with pytest.raises(IntegrityError, match="claim dependency links are immutable"):
+        with store.transaction() as connection:
+            connection.execute(
+                "DELETE FROM claim_dependencies WHERE claim_id = ?", ("inference-1",)
+            )
+
+
+@pytest.mark.parametrize(
+    ("statement", "message"),
+    [
+        (
+            "UPDATE source_documents SET publisher = 'changed' "
+            "WHERE document_id = 'document-1'",
+            "source documents are immutable",
+        ),
+        (
+            "DELETE FROM source_documents WHERE document_id = 'document-1'",
+            "source documents are immutable",
+        ),
+        (
+            "UPDATE document_passages SET text = 'changed' "
+            "WHERE passage_id = 'passage-1'",
+            "document passages are immutable",
+        ),
+        (
+            "DELETE FROM document_passages WHERE passage_id = 'passage-1'",
+            "document passages are immutable",
+        ),
+    ],
+)
+def test_source_evidence_is_immutable_at_database_boundary(
+    tmp_path, statement, message
+):
+    store = make_migrated_store(tmp_path)
+    seed_passage(store)
+
+    with pytest.raises(IntegrityError, match=message):
+        with store.transaction() as connection:
+            connection.execute(statement)
 
 
 def test_claim_invalid_stance_is_atomic(tmp_path):

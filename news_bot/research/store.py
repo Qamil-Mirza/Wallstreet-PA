@@ -92,6 +92,28 @@ class ThesisRevision:
     evidence_ids: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class DocumentPassageRecord:
+    """One immutable, source-relative passage persisted for citation."""
+
+    passage_id: str
+    document_id: str
+    ordinal: int
+    text: str
+    content_hash: str
+    start_offset: int
+    end_offset: int
+
+
+@dataclass(frozen=True)
+class ClaimLineageRecord:
+    """One exact passage linked to a claim with an epistemic stance."""
+
+    claim_id: str
+    passage: DocumentPassageRecord
+    stance: str
+
+
 class ResearchStore:
     """Connection-per-operation SQLite research store."""
 
@@ -366,6 +388,145 @@ class ResearchStore:
                 ),
             )
 
+    def insert_document_with_passages(
+        self,
+        document: SourceDocument,
+        passages: Sequence[DocumentPassageRecord],
+    ) -> None:
+        """Atomically persist an idempotent document and all exact passages."""
+        passage_records = tuple(passages)
+        if any(item.document_id != document.document_id for item in passage_records):
+            raise sqlite3.IntegrityError("passage document_id does not match document")
+        expected_ordinals = tuple(range(len(passage_records)))
+        if tuple(item.ordinal for item in passage_records) != expected_ordinals:
+            raise sqlite3.IntegrityError("passage ordinals must be contiguous")
+
+        document_values = (
+            document.document_id,
+            document.source_type,
+            document.canonical_url,
+            document.publisher,
+            _utc_text(document.published_at, "SourceDocument.published_at"),
+            _utc_text(document.retrieved_at, "SourceDocument.retrieved_at"),
+            document.content_hash,
+            document.raw_content_path,
+            document.extraction_status,
+        )
+        passage_values = tuple(
+            (
+                passage.passage_id,
+                passage.document_id,
+                passage.ordinal,
+                passage.text,
+                passage.content_hash,
+                _canonical_json(
+                    {
+                        "end_offset": passage.end_offset,
+                        "start_offset": passage.start_offset,
+                    }
+                ),
+            )
+            for passage in passage_records
+        )
+
+        with self.transaction() as connection:
+            existing = connection.execute(
+                "SELECT document_id, source_type, canonical_url, publisher, "
+                "published_at, retrieved_at, content_hash, raw_content_path, "
+                "extraction_status FROM source_documents WHERE content_hash = ?",
+                (document.content_hash,),
+            ).fetchone()
+            if existing is not None:
+                stored_passages = tuple(
+                    connection.execute(
+                        "SELECT passage_id, document_id, ordinal, text, content_hash, "
+                        "locator_json FROM document_passages WHERE document_id = ? "
+                        "ORDER BY ordinal",
+                        (existing[0],),
+                    ).fetchall()
+                )
+                if (
+                    existing[0] == document.document_id
+                    and stored_passages == passage_values
+                ):
+                    return
+                raise sqlite3.IntegrityError(
+                    "conflicting document content already exists"
+                )
+
+            created_at = _utc_text(datetime.now(timezone.utc))
+            connection.execute(
+                "INSERT INTO source_documents ("
+                "document_id, source_type, canonical_url, publisher, published_at, "
+                "retrieved_at, content_hash, raw_content_path, extraction_status, "
+                "created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (*document_values, created_at),
+            )
+            connection.executemany(
+                "INSERT INTO document_passages ("
+                "passage_id, document_id, ordinal, text, content_hash, locator_json, "
+                "created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                ((*values, created_at) for values in passage_values),
+            )
+
+    def get_document_by_content_hash(
+        self, content_hash: str
+    ) -> SourceDocument | None:
+        """Load the canonical document associated with a content hash."""
+        connection = self.connect()
+        try:
+            row = connection.execute(
+                "SELECT document_id, source_type, canonical_url, publisher, "
+                "published_at, retrieved_at, content_hash, raw_content_path, "
+                "extraction_status FROM source_documents WHERE content_hash = ?",
+                (content_hash,),
+            ).fetchone()
+        finally:
+            connection.close()
+        if row is None:
+            return None
+        return SourceDocument(
+            document_id=row[0],
+            source_type=row[1],
+            canonical_url=row[2],
+            publisher=row[3],
+            published_at=_parse_utc(row[4]),
+            retrieved_at=_parse_utc(row[5]),
+            content_hash=row[6],
+            raw_content_path=row[7],
+            extraction_status=row[8],
+        )
+
+    def list_document_passages(
+        self, document_id: str
+    ) -> tuple[DocumentPassageRecord, ...]:
+        """Load a document's passages in deterministic source order."""
+        connection = self.connect()
+        try:
+            rows = connection.execute(
+                "SELECT passage_id, document_id, ordinal, text, content_hash, "
+                "locator_json FROM document_passages WHERE document_id = ? "
+                "ORDER BY ordinal",
+                (document_id,),
+            ).fetchall()
+        finally:
+            connection.close()
+        records: list[DocumentPassageRecord] = []
+        for row in rows:
+            locator = json.loads(row[5])
+            records.append(
+                DocumentPassageRecord(
+                    passage_id=row[0],
+                    document_id=row[1],
+                    ordinal=row[2],
+                    text=row[3],
+                    content_hash=row[4],
+                    start_offset=locator["start_offset"],
+                    end_offset=locator["end_offset"],
+                )
+            )
+        return tuple(records)
+
     def insert_document_passage(
         self,
         *,
@@ -401,17 +562,56 @@ class ResearchStore:
     ) -> None:
         """Atomically insert a typed claim and its required passage evidence."""
         passage_ids = tuple(evidence_ids)
-        if not passage_ids:
-            raise sqlite3.IntegrityError("claims require at least one evidence passage")
+        self.insert_claim_with_lineage(
+            claim,
+            passage_links=tuple((passage_id, stance) for passage_id in passage_ids),
+            supporting_claim_ids=(),
+        )
+
+    def insert_claim_with_lineage(
+        self,
+        claim: EvidenceClaim,
+        *,
+        passage_links: Sequence[tuple[str, str]],
+        supporting_claim_ids: Sequence[str],
+    ) -> None:
+        """Atomically insert a claim and all passage/claim dependencies."""
+        links = tuple(passage_links)
+        dependency_ids = tuple(supporting_claim_ids)
+        supporting_passages = tuple(
+            passage_id for passage_id, stance in links if stance == "supports"
+        )
+        if claim.kind is ClaimKind.INFERENCE:
+            if not supporting_passages and not dependency_ids:
+                raise sqlite3.IntegrityError(
+                    "inference claims require a supporting claim or passage"
+                )
+        elif not supporting_passages:
+            raise sqlite3.IntegrityError(
+                "fact, guidance, and estimate claims require passage evidence"
+            )
+        if claim.claim_id in dependency_ids:
+            raise sqlite3.IntegrityError("claims cannot depend on themselves")
+        if len(links) != len({passage_id for passage_id, _ in links}):
+            raise sqlite3.IntegrityError("duplicate passage links are not allowed")
+        if len(dependency_ids) != len(set(dependency_ids)):
+            raise sqlite3.IntegrityError("duplicate claim dependencies are not allowed")
         confidence = _decimal_text(claim.confidence)
         if not Decimal("0") <= claim.confidence <= Decimal("1"):
             raise ValueError("claim confidence must be between 0 and 1")
 
         with self.transaction() as connection:
+            primary_passage_id = (
+                supporting_passages[0] if supporting_passages else None
+            )
+            primary_supporting_claim_id = (
+                dependency_ids[0] if dependency_ids else None
+            )
             connection.execute(
                 "INSERT INTO claims ("
-                "claim_id, entity_id, kind, text, as_of, confidence, status, created_at"
-                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "claim_id, entity_id, kind, text, as_of, confidence, status, "
+                "primary_passage_id, primary_supporting_claim_id, created_at"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     claim.claim_id,
                     claim.entity_id,
@@ -420,13 +620,26 @@ class ResearchStore:
                     _utc_text(claim.as_of, "EvidenceClaim.as_of"),
                     confidence,
                     claim.status,
+                    primary_passage_id,
+                    primary_supporting_claim_id,
                     _utc_text(datetime.now(timezone.utc)),
                 ),
             )
             connection.executemany(
                 "INSERT INTO claim_evidence (claim_id, passage_id, stance) "
                 "VALUES (?, ?, ?)",
-                ((claim.claim_id, passage_id, stance) for passage_id in passage_ids),
+                (
+                    (claim.claim_id, passage_id, link_stance)
+                    for passage_id, link_stance in links
+                ),
+            )
+            connection.executemany(
+                "INSERT INTO claim_dependencies (claim_id, supporting_claim_id) "
+                "VALUES (?, ?)",
+                (
+                    (claim.claim_id, supporting_claim_id)
+                    for supporting_claim_id in dependency_ids
+                ),
             )
 
     def get_claim(self, claim_id: str) -> EvidenceClaim | None:
@@ -451,6 +664,53 @@ class ResearchStore:
             confidence=Decimal(row[5]),
             status=row[6],
         )
+
+    def list_claim_lineage(self, claim_id: str) -> tuple[ClaimLineageRecord, ...]:
+        """Return exact passage lineage for one claim without rewriting evidence."""
+        connection = self.connect()
+        try:
+            rows = connection.execute(
+                "SELECT ce.claim_id, ce.stance, p.passage_id, p.document_id, "
+                "p.ordinal, p.text, p.content_hash, p.locator_json "
+                "FROM claim_evidence AS ce "
+                "JOIN document_passages AS p ON p.passage_id = ce.passage_id "
+                "WHERE ce.claim_id = ? ORDER BY p.document_id, p.ordinal, ce.stance",
+                (claim_id,),
+            ).fetchall()
+        finally:
+            connection.close()
+        lineage: list[ClaimLineageRecord] = []
+        for row in rows:
+            locator = json.loads(row[7]) if row[7] is not None else {}
+            lineage.append(
+                ClaimLineageRecord(
+                    claim_id=row[0],
+                    stance=row[1],
+                    passage=DocumentPassageRecord(
+                        passage_id=row[2],
+                        document_id=row[3],
+                        ordinal=row[4],
+                        text=row[5],
+                        content_hash=row[6],
+                        start_offset=locator.get("start_offset", 0),
+                        end_offset=locator.get("end_offset", len(row[5])),
+                    ),
+                )
+            )
+        return tuple(lineage)
+
+    def list_supporting_claim_ids(self, claim_id: str) -> tuple[str, ...]:
+        """List immutable claim-to-claim dependencies deterministically."""
+        connection = self.connect()
+        try:
+            rows = connection.execute(
+                "SELECT supporting_claim_id FROM claim_dependencies "
+                "WHERE claim_id = ? ORDER BY supporting_claim_id",
+                (claim_id,),
+            ).fetchall()
+        finally:
+            connection.close()
+        return tuple(row[0] for row in rows)
 
     def update_claim_status(self, claim_id: str, status: str) -> None:
         """Apply an intentional status transition without rewriting claim content."""
