@@ -25,6 +25,7 @@ CREATE TABLE claims (
     status TEXT NOT NULL CHECK (status IN ('active', 'contradicted', 'superseded')),
     primary_passage_id TEXT,
     primary_supporting_claim_id TEXT,
+    lineage_sealed INTEGER NOT NULL DEFAULT 1 CHECK (lineage_sealed IN (0, 1)),
     created_at TEXT NOT NULL,
     CHECK (
         (kind IN ('fact', 'guidance', 'estimate') AND primary_passage_id IS NOT NULL)
@@ -56,7 +57,7 @@ CREATE TABLE claim_evidence (
 
 INSERT INTO claims (
     claim_id, entity_id, kind, text, as_of, confidence, status,
-    primary_passage_id, primary_supporting_claim_id, created_at
+    primary_passage_id, primary_supporting_claim_id, lineage_sealed, created_at
 )
 SELECT
     old.claim_id,
@@ -69,11 +70,13 @@ SELECT
     (
         SELECT evidence.passage_id
         FROM claim_evidence_v2_old AS evidence
-        WHERE evidence.claim_id = old.claim_id AND evidence.stance = 'supports'
-        ORDER BY evidence.passage_id
+        WHERE evidence.claim_id = old.claim_id
+        ORDER BY CASE evidence.stance WHEN 'supports' THEN 0 ELSE 1 END,
+            evidence.passage_id
         LIMIT 1
     ),
     NULL,
+    1,
     old.created_at
 FROM claims_v2_old AS old;
 
@@ -99,6 +102,20 @@ CREATE TRIGGER claims_no_delete
 BEFORE DELETE ON claims
 BEGIN
     SELECT RAISE(ABORT, 'claims cannot be deleted');
+END;
+
+CREATE TRIGGER claims_lineage_seal_one_way
+BEFORE UPDATE OF lineage_sealed ON claims
+WHEN NOT (OLD.lineage_sealed = 0 AND NEW.lineage_sealed = 1)
+BEGIN
+    SELECT RAISE(ABORT, 'claim lineage seal is immutable');
+END;
+
+CREATE TRIGGER claim_evidence_no_insert_after_seal
+BEFORE INSERT ON claim_evidence
+WHEN (SELECT lineage_sealed FROM claims WHERE claim_id = NEW.claim_id) <> 0
+BEGIN
+    SELECT RAISE(ABORT, 'claim evidence links are immutable');
 END;
 
 CREATE TRIGGER claim_evidence_no_update
@@ -128,6 +145,13 @@ CREATE INDEX idx_claim_dependencies_supporting_claim_id
 
 CREATE TRIGGER claim_dependencies_no_update
 BEFORE UPDATE ON claim_dependencies
+BEGIN
+    SELECT RAISE(ABORT, 'claim dependency links are immutable');
+END;
+
+CREATE TRIGGER claim_dependencies_no_insert_after_seal
+BEFORE INSERT ON claim_dependencies
+WHEN (SELECT lineage_sealed FROM claims WHERE claim_id = NEW.claim_id) <> 0
 BEGIN
     SELECT RAISE(ABORT, 'claim dependency links are immutable');
 END;

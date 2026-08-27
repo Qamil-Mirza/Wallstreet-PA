@@ -213,8 +213,9 @@ def test_existing_v1_database_upgrades_nullable_freshness_without_data_loss(
     ]
 
 
+@pytest.mark.parametrize("stance", ["supports", "contradicts"])
 def test_existing_v2_claims_upgrade_with_lineage_anchor_without_data_loss(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, stance
 ):
     database_path = tmp_path / "research.db"
     migration_root = (
@@ -248,7 +249,7 @@ def test_existing_v2_claims_upgrade_with_lineage_anchor_without_data_loss(
         connection.execute(
             "INSERT INTO claim_evidence (claim_id, passage_id, stance) "
             "VALUES (?, ?, ?)",
-            (claim.claim_id, "passage-1", "supports"),
+            (claim.claim_id, "passage-1", stance),
         )
 
     upgraded = ResearchStore(database_path)
@@ -266,9 +267,9 @@ def test_existing_v2_claims_upgrade_with_lineage_anchor_without_data_loss(
         foreign_key_errors = connection.execute("PRAGMA foreign_key_check").fetchall()
     assert versions == [(1,), (2,), (3,)]
     assert upgraded.get_claim(claim.claim_id) == claim
-    assert upgraded.list_claim_lineage(claim.claim_id)[0].passage.passage_id == (
-        "passage-1"
-    )
+    lineage = upgraded.list_claim_lineage(claim.claim_id)[0]
+    assert lineage.passage.passage_id == "passage-1"
+    assert lineage.stance == stance
     assert primary_anchor == ("passage-1", None)
     assert foreign_key_errors == []
 
@@ -757,6 +758,44 @@ def test_claim_dependencies_are_indexed_restrictive_and_immutable(tmp_path):
         with store.transaction() as connection:
             connection.execute(
                 "DELETE FROM claim_dependencies WHERE claim_id = ?", ("inference-1",)
+            )
+
+
+def test_claim_lineage_rejects_links_appended_after_atomic_creation(tmp_path):
+    store = make_migrated_store(tmp_path)
+    seed_claim_with_evidence(store)
+    store.insert_source_document(
+        make_document("document-2", content_hash="sha256:document-2")
+    )
+    store.insert_document_passage(
+        passage_id="passage-2",
+        document_id="document-2",
+        ordinal=0,
+        text="A second source passage.",
+    )
+    store.insert_claim(make_claim("claim-2"), evidence_ids=("passage-2",))
+
+    with pytest.raises(IntegrityError, match="claim evidence links are immutable"):
+        with store.transaction() as connection:
+            connection.execute(
+                "INSERT INTO claim_evidence (claim_id, passage_id, stance) "
+                "VALUES (?, ?, ?)",
+                ("claim-1", "passage-2", "contradicts"),
+            )
+
+    with pytest.raises(IntegrityError, match="claim dependency links are immutable"):
+        with store.transaction() as connection:
+            connection.execute(
+                "INSERT INTO claim_dependencies (claim_id, supporting_claim_id) "
+                "VALUES (?, ?)",
+                ("claim-1", "claim-2"),
+            )
+
+    with pytest.raises(IntegrityError, match="claim lineage seal is immutable"):
+        with store.transaction() as connection:
+            connection.execute(
+                "UPDATE claims SET lineage_sealed = 0 WHERE claim_id = ?",
+                ("claim-1",),
             )
 
 

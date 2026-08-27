@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import os
 import re
 import sqlite3
@@ -23,6 +24,8 @@ from .store import DocumentPassageRecord, ResearchStore
 _TRACKING_PARAMETERS = {"dclid", "fbclid", "gclid", "mc_cid", "mc_eid"}
 _HORIZONTAL_WHITESPACE = re.compile(r"[^\S\n]+")
 _EXCESS_BLANK_LINES = re.compile(r"\n{3,}")
+_HOST_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
+_MALFORMED_PERCENT_ESCAPE = re.compile(r"%(?![0-9A-Fa-f]{2})")
 
 
 class EvidenceError(RuntimeError):
@@ -63,6 +66,16 @@ def _aware(value: datetime, field_name: str) -> None:
         raise EvidenceValidationError(f"{field_name} must be timezone-aware")
 
 
+def _valid_lineage_identifier(value: str, field_name: str) -> None:
+    _valid_text(value, field_name)
+    if (
+        len(value) > 256
+        or any(character.isspace() for character in value)
+        or any(unicodedata.category(character) == "Cc" for character in value)
+    ):
+        raise EvidenceValidationError("lineage identifier is invalid")
+
+
 @dataclass(frozen=True)
 class DocumentInput:
     """Validated source material accepted at the ingestion trust boundary."""
@@ -99,8 +112,8 @@ class EvidencePassage:
     end_offset: int
 
     def __post_init__(self) -> None:
-        _valid_text(self.passage_id, "passage_id")
-        _valid_text(self.document_id, "document_id")
+        _valid_lineage_identifier(self.passage_id, "passage_id")
+        _valid_lineage_identifier(self.document_id, "document_id")
         _valid_text(self.text, "passage text")
         if not isinstance(self.ordinal, int) or self.ordinal < 0:
             raise EvidenceValidationError("passage ordinal must be non-negative")
@@ -128,8 +141,9 @@ class IngestedDocument:
     passages: tuple[EvidencePassage, ...]
 
     def __post_init__(self) -> None:
-        _valid_text(self.document_id, "document_id")
-        canonicalize_url(self.canonical_url)
+        _valid_lineage_identifier(self.document_id, "document_id")
+        if canonicalize_url(self.canonical_url) != self.canonical_url:
+            raise EvidenceValidationError("canonical_url must already be canonical")
         if re.fullmatch(r"[0-9a-f]{64}", self.content_hash) is None:
             raise EvidenceValidationError("content_hash must be SHA-256")
         if not isinstance(self.raw_content_path, Path):
@@ -153,8 +167,9 @@ class ClaimLineage:
     stance: str
 
     def __post_init__(self) -> None:
-        for field_name in ("claim_id", "passage_id", "document_id", "text"):
-            _valid_text(getattr(self, field_name), field_name)
+        for field_name in ("claim_id", "passage_id", "document_id"):
+            _valid_lineage_identifier(getattr(self, field_name), field_name)
+        _valid_text(self.text, "text")
         if self.stance not in {"supports", "contradicts"}:
             raise EvidenceValidationError("lineage stance is invalid")
         if (
@@ -180,14 +195,38 @@ def _contains_content_control(value: str) -> bool:
 def canonicalize_url(value: str) -> str:
     """Return a stable HTTP(S) URL without credentials or tracking metadata."""
     try:
-        if not isinstance(value, str) or _contains_control(value) or _contains_control(
-            unquote(value, errors="strict")
+        if (
+            not isinstance(value, str)
+            or any(character.isspace() for character in value)
+            or _contains_control(value)
+            or _MALFORMED_PERCENT_ESCAPE.search(value)
+            or _contains_control(unquote(value, errors="strict"))
         ):
             raise ValueError
         parsed = urlsplit(value)
         if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
             raise ValueError
-        hostname = parsed.hostname.encode("idna").decode("ascii").lower().rstrip(".")
+        raw_hostname = parsed.hostname.rstrip(".")
+        if not raw_hostname:
+            raise ValueError
+        try:
+            address = ipaddress.ip_address(raw_hostname)
+        except ValueError:
+            if ":" in raw_hostname:
+                raise ValueError
+            hostname = (
+                raw_hostname.encode("idna").decode("ascii").lower().rstrip(".")
+            )
+            labels = hostname.split(".")
+            if (
+                not hostname
+                or len(hostname) > 253
+                or any(_HOST_LABEL.fullmatch(label) is None for label in labels)
+                or (re.fullmatch(r"[0-9.]+", hostname) and len(labels) > 1)
+            ):
+                raise ValueError
+        else:
+            hostname = address.compressed.lower()
         port = parsed.port
         if port is not None and not 1 <= port <= 65535:
             raise ValueError
@@ -405,6 +444,12 @@ class EvidenceIngestor:
         ids = tuple(passage_ids)
         dependencies = tuple(supporting_claim_ids)
         contradictions = tuple(contradicting_passage_ids)
+        for identifier in ids:
+            _valid_lineage_identifier(identifier, "passage_id")
+        for identifier in dependencies:
+            _valid_lineage_identifier(identifier, "supporting_claim_id")
+        for identifier in contradictions:
+            _valid_lineage_identifier(identifier, "contradicting_passage_id")
         if kind is ClaimKind.INFERENCE:
             if not ids and not dependencies:
                 raise EvidencePolicyError(
@@ -462,6 +507,7 @@ class EvidenceIngestor:
 
     def lineage(self, claim_id: str) -> tuple[ClaimLineage, ...]:
         """Resolve a claim to the exact canonical passages used to create it."""
+        _valid_lineage_identifier(claim_id, "claim_id")
         return tuple(
             ClaimLineage(
                 claim_id=item.claim_id,
@@ -477,4 +523,5 @@ class EvidenceIngestor:
 
     def supporting_claim_ids(self, claim_id: str) -> tuple[str, ...]:
         """Return the immutable claims used to support an inference."""
+        _valid_lineage_identifier(claim_id, "claim_id")
         return self.store.list_supporting_claim_ids(claim_id)

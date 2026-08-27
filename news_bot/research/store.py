@@ -610,8 +610,8 @@ class ResearchStore:
             connection.execute(
                 "INSERT INTO claims ("
                 "claim_id, entity_id, kind, text, as_of, confidence, status, "
-                "primary_passage_id, primary_supporting_claim_id, created_at"
-                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "primary_passage_id, primary_supporting_claim_id, lineage_sealed, "
+                "created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     claim.claim_id,
                     claim.entity_id,
@@ -622,6 +622,7 @@ class ResearchStore:
                     claim.status,
                     primary_passage_id,
                     primary_supporting_claim_id,
+                    0,
                     _utc_text(datetime.now(timezone.utc)),
                 ),
             )
@@ -640,6 +641,10 @@ class ResearchStore:
                     (claim.claim_id, supporting_claim_id)
                     for supporting_claim_id in dependency_ids
                 ),
+            )
+            connection.execute(
+                "UPDATE claims SET lineage_sealed = 1 WHERE claim_id = ?",
+                (claim.claim_id,),
             )
 
     def get_claim(self, claim_id: str) -> EvidenceClaim | None:

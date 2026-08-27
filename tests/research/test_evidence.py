@@ -12,6 +12,7 @@ from news_bot.research.evidence import (
     ClaimLineage,
     DocumentInput,
     EvidenceCacheError,
+    EvidenceError,
     EvidenceIngestor,
     EvidencePassage,
     EvidencePersistenceError,
@@ -86,6 +87,14 @@ def test_url_canonicalization_preserves_business_parameters_and_blanks():
         "file:///private/report",
         "https://./report",
         "https://issuer.test:70000/report",
+        "https://bad_host.test/report",
+        "https://bad host.test/report",
+        "https://-leading.test/report",
+        "https://trailing-.test/report",
+        "https://empty..label.test/report",
+        "https://issuer.test/report%",
+        "https://issuer.test/report%2",
+        "https://issuer.test/report%GG",
         "https://issuer.test/report%0Ainjected",
         "https://issuer.test/report?q=%00unsafe",
     ],
@@ -314,6 +323,36 @@ def test_contradicting_passage_remains_linked_without_replacing_support(
 def test_evidence_domain_records_are_frozen(record):
     with pytest.raises(dataclasses.FrozenInstanceError):
         record.__setattr__(next(iter(record.__dataclass_fields__)), "changed")
+
+
+def test_ingested_document_rejects_noncanonical_url():
+    with pytest.raises(EvidenceValidationError, match="canonical"):
+        IngestedDocument(
+            "d",
+            "HTTPS://ISSUER.TEST:443/a?utm_source=email",
+            "a" * 64,
+            Path(__file__),
+            (),
+        )
+
+
+@pytest.mark.parametrize("invalid_id", ["", "bad id", "private\ud800"])
+def test_claim_lineage_ids_fail_with_typed_redacted_error(
+    migrated_store, invalid_id
+):
+    ingestor = EvidenceIngestor(migrated_store)
+
+    with pytest.raises(EvidenceError) as add_error:
+        ingestor.add_claim("Revenue grew.", ClaimKind.FACT, [invalid_id])
+    with pytest.raises(EvidenceError) as lookup_error:
+        ingestor.lineage(invalid_id)
+    with pytest.raises(EvidenceError) as dependency_error:
+        ingestor.supporting_claim_ids(invalid_id)
+
+    for error in (add_error, lookup_error, dependency_error):
+        assert "Revenue grew" not in str(error.value)
+        assert "bad id" not in str(error.value)
+        assert "private" not in str(error.value)
 
 
 def test_evidence_passage_rejects_inconsistent_offsets():
