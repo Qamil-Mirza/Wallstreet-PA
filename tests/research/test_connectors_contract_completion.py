@@ -296,6 +296,11 @@ def test_sec_fetch_uses_validated_constructor_context():
 
 
 def test_ir_fetch_uses_validated_release_context():
+    response = ClosingResponse(
+        {},
+        url="https://investor.nvidia.com/news/release-1",
+        headers={"Content-Type": "text/html"},
+    )
     connector = InvestorRelationsConnector(
         InvestorRelationsConfig(
             allowed_prefixes={"NVDA": ("https://investor.nvidia.com/news/",)}
@@ -303,7 +308,8 @@ def test_ir_fetch_uses_validated_release_context():
         issuer="NVDA",
         release_url="https://investor.nvidia.com/news/release-1",
         published_at=NOW,
-        extractor=lambda url: ("Revenue grew.", False),
+        session=RecordingSession([response]),
+        extractor=lambda html, url: "Revenue grew.",
         clock=lambda: NOW,
     )
 

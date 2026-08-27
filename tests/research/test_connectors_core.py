@@ -303,7 +303,16 @@ def test_investor_relations_enforces_issuer_host_and_path_allowlist():
     )
     connector = InvestorRelationsConnector(
         config,
-        extractor=lambda url: ("Quarterly revenue increased.", False),
+        session=FakeSession(
+            [
+                FakeResponse(
+                    {},
+                    url="https://investor.nvidia.com/news/release-1",
+                    headers={"Content-Type": "text/html"},
+                )
+            ]
+        ),
+        extractor=lambda html, url: "Quarterly revenue increased.",
         clock=lambda: NOW,
     )
 

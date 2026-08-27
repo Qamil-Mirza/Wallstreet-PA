@@ -116,7 +116,6 @@ class ResearchConnector(Protocol):
         """Return normalized documents and the proposed durable checkpoint."""
 
 
-@dataclass(frozen=True, init=False)
 class ConnectorError(RuntimeError):
     """A redacted connector failure suitable for persistence and retry policy."""
 
@@ -124,6 +123,17 @@ class ConnectorError(RuntimeError):
     status: int | None
     retryable: bool
     diagnostic_code: str
+
+    _EXCEPTION_INTERNALS = frozenset(
+        {"__traceback__", "__cause__", "__context__", "__suppress_context__"}
+    )
+
+    def __setattr__(self, name: str, value) -> None:
+        if name not in self._EXCEPTION_INTERNALS:
+            from dataclasses import FrozenInstanceError
+
+            raise FrozenInstanceError(f"cannot assign to field {name!r}")
+        RuntimeError.__setattr__(self, name, value)
 
     def __init__(
         self,

@@ -7,7 +7,7 @@ import logging
 import math
 import re
 import threading
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timezone
 from decimal import Decimal, InvalidOperation
@@ -36,22 +36,36 @@ _BEARER = re.compile(
 _REDACTED = "[REDACTED]"
 _LOG_FACTORY_LOCK = threading.RLock()
 _FACTORY_MARKER = "_newsletter_fmp_redaction_factory"
+_CONFIGURED_SECRETS: set[str] = set()
 
 
 def _redact_text(value: str) -> str:
     redacted = _SECRET_ASSIGNMENT.sub(rf"\1{_REDACTED}", value)
-    return _BEARER.sub(rf"\1{_REDACTED}", redacted)
+    redacted = _BEARER.sub(rf"\1{_REDACTED}", redacted)
+    for secret in sorted(
+        (item for item in _CONFIGURED_SECRETS if len(item) >= 8),
+        key=len,
+        reverse=True,
+    ):
+        redacted = redacted.replace(secret, _REDACTED)
+    return redacted
 
 
 def _redact_log_value(value):
     if isinstance(value, str):
+        if value in _CONFIGURED_SECRETS:
+            return _REDACTED
         return _redact_text(value)
     if isinstance(value, Mapping):
         changed = False
         redacted: dict[object, object] = {}
         for key, item in value.items():
             normalized = str(key).lower().replace("_", "-")
-            if normalized in {"apikey", "api-key", "x-api-key", "authorization"}:
+            if normalized in {"apikey", "api-key", "x-api-key"}:
+                replacement = _REDACTED
+            elif normalized == "authorization" and isinstance(item, str) and re.match(
+                r"(?i)^\s*(?:bearer|basic)\s+\S+", item
+            ):
                 replacement = _REDACTED
             else:
                 replacement = _redact_log_value(item)
@@ -67,9 +81,11 @@ def _redact_log_value(value):
     return value
 
 
-def install_fmp_log_redaction() -> None:
+def install_fmp_log_redaction(secret: str | None = None) -> None:
     """Chain one process-wide secret-safe LogRecord factory."""
     with _LOG_FACTORY_LOCK:
+        if isinstance(secret, str) and secret:
+            _CONFIGURED_SECRETS.add(secret)
         prior_factory = logging.getLogRecordFactory()
         if getattr(prior_factory, _FACTORY_MARKER, False):
             return
@@ -231,7 +247,7 @@ class FMPConnector:
             _normalized_symbol(symbol)
         if sec_facts_fallback is not None and not callable(sec_facts_fallback):
             raise TypeError("sec_facts_fallback must be callable")
-        install_fmp_log_redaction()
+        install_fmp_log_redaction(config.api_key if config is not None else None)
         self.config = config
         self.symbol = symbol.strip().upper() if symbol is not None else None
         self._sec_facts_fallback = sec_facts_fallback
@@ -321,11 +337,65 @@ class FMPConnector:
             except Exception:
                 pass
 
+    def _validated_rows(
+        self,
+        payload,
+        *,
+        expected_symbol: str | None = None,
+    ) -> tuple[Mapping[str, Any], ...]:
+        if isinstance(payload, Mapping):
+            lowered = {str(key).strip().lower() for key in payload}
+            diagnostic = (
+                "provider_error"
+                if lowered & {"error", "error message", "error_message"}
+                else "invalid_payload"
+            )
+            raise ConnectorError(
+                self.name, retryable=False, diagnostic_code=diagnostic
+            )
+        if not isinstance(payload, (list, tuple)):
+            raise ConnectorError(
+                self.name, retryable=False, diagnostic_code="invalid_payload"
+            )
+        rows: list[Mapping[str, Any]] = []
+        normalized_expected = (
+            _normalized_symbol(expected_symbol) if expected_symbol is not None else None
+        )
+        for item in payload:
+            if not isinstance(item, Mapping):
+                raise ConnectorError(
+                    self.name, retryable=False, diagnostic_code="invalid_payload"
+                )
+            lowered = {str(key).strip().lower() for key in item}
+            if lowered & {"error", "error message", "error_message"}:
+                raise ConnectorError(
+                    self.name, retryable=False, diagnostic_code="provider_error"
+                )
+            if normalized_expected is not None:
+                try:
+                    received = _normalized_symbol(str(item["symbol"]))
+                except (KeyError, TypeError, ValueError):
+                    raise ConnectorError(
+                        self.name, retryable=False, diagnostic_code="invalid_identity"
+                    ) from None
+                if received != normalized_expected:
+                    raise ConnectorError(
+                        self.name, retryable=False, diagnostic_code="identity_mismatch"
+                    )
+            rows.append(item)
+        return tuple(rows)
+
     def fetch_quote(self, symbol: str):
-        return self._request("quote", symbol)
+        normalized = _normalized_symbol(symbol)
+        return self._validated_rows(
+            self._request("quote", normalized), expected_symbol=normalized
+        )
 
     def fetch_income_statement(self, symbol: str):
-        return self._request("income-statement", symbol)
+        normalized = _normalized_symbol(symbol)
+        return self._validated_rows(
+            self._request("income-statement", normalized), expected_symbol=normalized
+        )
 
     def _resolve_symbol(self, value: str | None = None) -> str:
         return _normalized_symbol(value or self.symbol)
@@ -458,9 +528,11 @@ class FMPConnector:
     def parse(
         self,
         *,
-        quote: Sequence[Mapping[str, Any]],
-        statements: Sequence[Mapping[str, Any]],
+        quote,
+        statements,
     ) -> FundamentalPacket:
+        quote = self._validated_rows(quote)
+        statements = self._validated_rows(statements)
         unavailable: dict[str, str] = {}
         price: DatedPrice | None = None
         statement_values: dict[str, Decimal] = {}

@@ -65,16 +65,19 @@ class _ArticleConnector:
     def _batch(
         self,
         sections: Mapping[str, Sequence[ArticleMeta]],
+        checkpoint: ConnectorCheckpoint,
     ) -> ConnectorBatch:
         documents = tuple(
             self.from_article(article, section=section)
             for section in sorted(sections)
             for article in sections[section]
         )
-        cursor = max(
-            (document.published_at.isoformat() for document in documents),
-            default="empty",
-        )
+        cursor_candidates = [
+            document.published_at.isoformat() for document in documents
+        ]
+        if checkpoint.cursor is not None:
+            cursor_candidates.append(checkpoint.cursor)
+        cursor = max(cursor_candidates, default=None)
         return ConnectorBatch(
             connector=self.name,
             documents=documents,
@@ -136,7 +139,7 @@ class MarketAuxResearchConnector(_ArticleConnector):
             raise ConnectorError(
                 self.name, retryable=True, diagnostic_code="upstream_fetch_failed"
             ) from None
-        return self._batch(sections)
+        return self._batch(sections, checkpoint)
 
 
 class RSSResearchConnector(_ArticleConnector):
@@ -163,7 +166,7 @@ class RSSResearchConnector(_ArticleConnector):
                 self.name, retryable=False, diagnostic_code="configuration_missing"
             )
         try:
-            return self._batch(self._article_provider())
+            return self._batch(self._article_provider(), checkpoint)
         except ConnectorError:
             raise
         except Exception:

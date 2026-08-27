@@ -298,9 +298,21 @@ class SECConnector:
     def fetch_submissions(
         self, cik: str, *, checkpoint: ConnectorCheckpoint | None = None
     ) -> SECResult:
+        requested_cik = _normalize_cik(cik)
         payload, next_checkpoint, not_modified = self._request_json(
             self.submissions_url(cik), checkpoint
         )
+        if payload is not None:
+            try:
+                response_cik = _normalize_cik(str(payload["cik"]))
+            except (KeyError, TypeError, ValueError):
+                raise ConnectorError(
+                    self.name, retryable=False, diagnostic_code="invalid_identity"
+                ) from None
+            if response_cik != requested_cik:
+                raise ConnectorError(
+                    self.name, retryable=False, diagnostic_code="identity_mismatch"
+                )
         retrieved_at = datetime.now(timezone.utc)
         documents = (
             self.parse_submissions(payload, retrieved_at=retrieved_at)
@@ -316,6 +328,17 @@ class SECConnector:
         payload, next_checkpoint, not_modified = self._request_json(
             self.companyfacts_url(cik), checkpoint
         )
+        if payload is not None:
+            try:
+                response_cik = _normalize_cik(str(payload["cik"]))
+            except (KeyError, TypeError, ValueError):
+                raise ConnectorError(
+                    self.name, retryable=False, diagnostic_code="invalid_identity"
+                ) from None
+            if response_cik != normalized_cik:
+                raise ConnectorError(
+                    self.name, retryable=False, diagnostic_code="identity_mismatch"
+                )
         documents = (
             (self.parse_companyfacts(payload, normalized_cik, datetime.now(timezone.utc)),)
             if payload is not None
