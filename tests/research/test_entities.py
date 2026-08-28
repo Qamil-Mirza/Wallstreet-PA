@@ -135,6 +135,15 @@ def test_security_identity_rejects_invalid_or_unqualified_identifiers(changes):
         SecurityIdentity(**values)
 
 
+def test_figi_uses_official_structure_checksum_and_normalizes_case():
+    assert SecurityIdentity(figi="bbg000b9xry4").figi == "BBG000B9XRY4"
+    assert SecurityIdentity(figi="bbg000bbjqv0").figi == "BBG000BBJQV0"
+
+    for invalid in ("BBG000B9XRY5", "BBF000B9XRY4", "AAGAAAAAAAA6"):
+        with pytest.raises(EntityValidationError, match=r"^figi is invalid$"):
+            SecurityIdentity(figi=invalid)
+
+
 def test_identifier_precedence_beats_adversarial_name_and_lower_priority_id():
     entity = resolver().resolve(
         SecurityIdentity(
@@ -399,11 +408,66 @@ def test_etf_overlap_rolls_up_underlying_without_double_counting():
         nav=Decimal("100"),
         base_currency="USD",
         etf_holdings=(holdings,),
+        as_of=NOW,
     )
 
     assert exposure["NVDA"].direct_weight == Decimal("0.20")
     assert exposure["NVDA"].lookthrough_weight == Decimal("0.054")
     assert exposure["NVDA"].total_numeric_weight == Decimal("0.254")
+
+
+def test_dated_etf_holdings_are_unevaluated_without_an_evaluation_time():
+    holdings = ETFHoldings(
+        etf_symbol="OLD",
+        as_of=datetime(2020, 1, 1, tzinfo=timezone.utc),
+        constituents=(ETFConstituent("NVDA", Decimal("0.18")),),
+    )
+
+    exposure = PortfolioExposureMapper().map_positions(
+        (position("OLD", 30, asset_class="ETF"),),
+        nav=Decimal("100"),
+        base_currency="USD",
+        etf_holdings=(holdings,),
+    )
+
+    assert exposure["OLD"].etf_holdings_status == "unevaluated"
+    assert "NVDA" not in exposure
+
+
+def test_undated_etf_holdings_are_explicit_and_never_used_for_lookthrough():
+    holdings = ETFHoldings(
+        etf_symbol="SMH",
+        as_of=None,
+        constituents=(ETFConstituent("NVDA", Decimal("0.18")),),
+    )
+
+    exposure = PortfolioExposureMapper().map_positions(
+        (position("SMH", 30, asset_class="ETF"),),
+        nav=Decimal("100"),
+        base_currency="USD",
+        etf_holdings=(holdings,),
+        as_of=NOW,
+    )
+
+    assert exposure["SMH"].etf_holdings_status == "unknown_date"
+    assert "NVDA" not in exposure
+
+
+def test_etf_dates_reject_naive_datetimes():
+    with pytest.raises(EntityValidationError):
+        ETFHoldings(
+            etf_symbol="SMH",
+            as_of=datetime(2026, 8, 24),
+            constituents=(ETFConstituent("NVDA", Decimal("0.18")),),
+        )
+
+    with pytest.raises(EntityValidationError):
+        PortfolioExposureMapper().map_positions(
+            (position("SMH", 30, asset_class="ETF"),),
+            nav=Decimal("100"),
+            base_currency="USD",
+            as_of=datetime(2026, 8, 24),
+        )
 
 
 def test_exposure_aggregation_is_decimal_only_and_order_independent():
@@ -422,8 +486,73 @@ def test_exposure_aggregation_is_decimal_only_and_order_independent():
 
     assert forward == backward
     assert forward["NVDA"].direct_weight == Decimal("0.15")
-    assert "CASH" not in forward
+    assert forward["CASH:USD"].direct_weight == Decimal("0.05")
+    assert forward["CASH:USD"].lookthrough_weight == Decimal("0")
     assert "BOND" not in forward
+
+
+def test_cash_exposure_is_currency_aware_aggregated_and_never_qualitative():
+    mapper = PortfolioExposureMapper()
+    positions = (
+        position("CASH", 10, asset_class="CASH", currency="USD"),
+        position("USD.BALANCE", 5, asset_class="CASH", currency="USD"),
+        position("CASH", 20, asset_class="CASH", currency="EUR"),
+    )
+    relationship = Relationship(
+        relationship_id="relationship_" + "c" * 64,
+        source_entity_id="entity_" + "a" * 64,
+        target_entity_id="entity_" + "b" * 64,
+        kind="supplier",
+        as_of=NOW,
+        confidence=Decimal("0.8"),
+        stance="supports",
+        evidence_ids=("passage-1",),
+        supporting_claim_ids=(),
+        provenance="filing",
+    )
+
+    forward = mapper.map_positions(
+        positions,
+        nav=Decimal("100"),
+        base_currency="USD",
+        fx_to_base={"EUR": Decimal("0.8")},
+        relationship_exposures={"CASH:USD": (relationship,)},
+    )
+    backward = mapper.map_positions(
+        tuple(reversed(positions)),
+        nav=Decimal("100"),
+        base_currency="USD",
+        fx_to_base={"EUR": Decimal("0.8")},
+    )
+
+    assert set(forward) == {"CASH:EUR", "CASH:USD"}
+    assert forward["CASH:USD"].direct_weight == Decimal("0.15")
+    assert forward["CASH:EUR"].direct_weight == Decimal("0.16")
+    assert all(item.lookthrough_weight == 0 for item in forward.values())
+    assert all(not item.qualitative_relationships for item in forward.values())
+    assert {
+        key: (item.direct_weight, item.lookthrough_weight)
+        for key, item in forward.items()
+    } == {
+        key: (item.direct_weight, item.lookthrough_weight)
+        for key, item in backward.items()
+    }
+
+
+def test_cash_aggregation_is_order_independent_at_decimal_precision_boundary():
+    mapper = PortfolioExposureMapper()
+    positions = (
+        position("CASH", Decimal("1e40"), asset_class="CASH"),
+        position("CASH", Decimal("-1e40"), asset_class="CASH"),
+        position("CASH", Decimal("1"), asset_class="CASH"),
+    )
+
+    forward = mapper.map_positions(positions, nav=Decimal("1"), base_currency="USD")
+    backward = mapper.map_positions(
+        tuple(reversed(positions)), nav=Decimal("1"), base_currency="USD"
+    )
+
+    assert forward == backward
 
 
 def test_missing_and_stale_etf_holdings_are_explicit_not_fabricated():
@@ -479,11 +608,24 @@ def test_exposure_rejects_float_nav_invalid_currency_and_missing_fx():
     with pytest.raises(EntityValidationError):
         ExposurePosition("NVDA", Decimal("20"), "US", "STK")
     with pytest.raises(EntityValidationError):
+        ExposurePosition("CASH", Decimal("20"), "ZZZ", "CASH")
+    with pytest.raises(EntityValidationError):
+        mapper.map_positions((), nav=Decimal("100"), base_currency="ZZZ")
+    with pytest.raises(EntityValidationError):
         mapper.map_positions(
             (position("SHOP", 20, currency="CAD"),),
             nav=Decimal("100"),
             base_currency="USD",
         )
+
+
+def test_currency_validation_tracks_current_iso_4217_codes():
+    assert ExposurePosition("CASH", Decimal("1"), "zwg", "CASH").currency == "ZWG"
+    assert ExposurePosition("CASH", Decimal("1"), "xcg", "CASH").currency == "XCG"
+
+    for historical_code in ("BGN", "ZWL"):
+        with pytest.raises(EntityValidationError):
+            ExposurePosition("CASH", Decimal("1"), historical_code, "CASH")
 
 
 def test_foreign_currency_exposure_uses_explicit_decimal_fx_rate():

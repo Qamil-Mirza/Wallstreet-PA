@@ -22,6 +22,21 @@ _RECORD_ID = re.compile(r"(?:alias|provenance|task|relationship)_[0-9a-f]{64}")
 _CURRENCY = re.compile(r"[A-Z]{3}")
 _SYMBOL = re.compile(r"[A-Z0-9][A-Z0-9.\-]{0,31}")
 _MARKET = re.compile(r"[A-Z0-9][A-Z0-9._\-]{0,31}")
+_FIGI_CONSONANT = "BCDFGHJKLMNPQRSTVWXYZ"
+# Current currency/fund/metal codes from the ISO 4217 Maintenance Agency's List One.
+_ISO_4217_CODES = frozenset(
+    """AED AFN ALL AMD AOA ARS AUD AWG AZN BAM BBD BDT BHD BIF BMD BND
+    BOB BOV BRL BSD BTN BWP BYN BZD CAD CDF CHE CHF CHW CLF CLP CNY COP COU CRC
+    CUP CVE CZK DJF DKK DOP DZD EGP ERN ETB EUR FJD FKP GBP GEL GHS GIP GMD GNF
+    GTQ GYD HKD HNL HTG HUF IDR ILS INR IQD IRR ISK JMD JOD JPY KES KGS KHR
+    KMF KPW KRW KWD KYD KZT LAK LBP LKR LRD LSL LYD MAD MDL MGA MKD MMK MNT
+    MOP MRU MUR MVR MWK MXN MXV MYR MZN NAD NGN NIO NOK NPR NZD OMR PAB PEN
+    PGK PHP PKR PLN PYG QAR RON RSD RUB RWF SAR SBD SCR SDG SEK SGD SHP SLE SOS
+    SRD SSP STN SVC SYP SZL THB TJS TMT TND TOP TRY TTD TWD TZS UAH UGX USD
+    USN UYI UYU UYW UZS VED VES VND VUV WST XAD XAF XAG XAU XBA XBB XBC XBD
+    XCD XCG XDR XOF XPD XPF XPT XSU XTS XUA
+    XXX YER ZAR ZMW ZWG""".split()
+)
 _RELATIONSHIP_KINDS = {
     "supplier",
     "customer",
@@ -109,6 +124,13 @@ def _normalize_market(value: str | None) -> str | None:
     return normalized
 
 
+def _normalize_currency(value: str, field_name: str) -> str:
+    normalized = _text(value, field_name).upper()
+    if _CURRENCY.fullmatch(normalized) is None or normalized not in _ISO_4217_CODES:
+        raise EntityValidationError(f"{field_name} is invalid")
+    return normalized
+
+
 def _normalize_cik(value: str | int | None) -> str | None:
     if value is None:
         return None
@@ -177,11 +199,18 @@ def _normalize_figi(value: str | None) -> str | None:
     if value is None:
         return None
     normalized = _text(value, "figi").upper()
-    if re.fullmatch(r"[A-Z0-9]{11}[0-9]", normalized) is None:
+    body_pattern = rf"[{_FIGI_CONSONANT}]{{2}}G[{_FIGI_CONSONANT}0-9]{{8}}[0-9]"
+    if re.fullmatch(body_pattern, normalized) is None:
         raise EntityValidationError("figi is invalid")
     if normalized[:2] in {"BS", "BM", "GG", "GB", "GH", "KY", "VG"}:
         raise EntityValidationError("figi is invalid")
-    if not _luhn_valid(normalized):
+    total = 0
+    for index, character in enumerate(normalized[:11]):
+        number = int(character) if character.isdigit() else ord(character) - 55
+        if index % 2:
+            number *= 2
+        total += number // 10 + number % 10
+    if (10 - total % 10) % 10 != int(normalized[-1]):
         raise EntityValidationError("figi is invalid")
     return normalized
 
@@ -373,15 +402,16 @@ class ETFConstituent:
 
 @dataclass(frozen=True)
 class ETFHoldings:
-    """Dated, disclosed ETF constituents used for transparent look-through."""
+    """Disclosed ETF constituents with an explicit optional source date."""
 
     etf_symbol: str
-    as_of: datetime
+    as_of: datetime | None
     constituents: tuple[ETFConstituent, ...]
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "etf_symbol", _normalize_symbol(self.etf_symbol))
-        _aware(self.as_of, "ETF holdings as_of")
+        if self.as_of is not None:
+            _aware(self.as_of, "ETF holdings as_of")
         if not isinstance(self.constituents, tuple) or not self.constituents:
             raise EntityValidationError("ETF constituents must be a nonempty tuple")
         symbols = tuple(item.symbol for item in self.constituents)
@@ -403,10 +433,7 @@ class ExposurePosition:
     def __post_init__(self) -> None:
         object.__setattr__(self, "symbol", _normalize_symbol(self.symbol))
         _decimal(self.market_value, "position market_value")
-        currency = _text(self.currency, "currency").upper()
-        if _CURRENCY.fullmatch(currency) is None:
-            raise EntityValidationError("currency must be a three-letter code")
-        object.__setattr__(self, "currency", currency)
+        object.__setattr__(self, "currency", _normalize_currency(self.currency, "currency"))
         object.__setattr__(self, "asset_class", _text(self.asset_class, "asset_class").upper())
 
 
@@ -421,12 +448,27 @@ class PortfolioExposure:
     etf_holdings_status: str = "not_applicable"
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "symbol", _normalize_symbol(self.symbol))
+        if isinstance(self.symbol, str) and self.symbol.upper().startswith("CASH:"):
+            prefix, separator, currency = self.symbol.upper().partition(":")
+            if prefix != "CASH" or separator != ":":
+                raise EntityValidationError("symbol is invalid")
+            object.__setattr__(
+                self, "symbol", f"CASH:{_normalize_currency(currency, 'cash currency')}"
+            )
+        else:
+            object.__setattr__(self, "symbol", _normalize_symbol(self.symbol))
         _decimal(self.direct_weight, "direct_weight")
         _decimal(self.lookthrough_weight, "lookthrough_weight")
         if not isinstance(self.qualitative_relationships, tuple):
             raise EntityValidationError("qualitative_relationships must be a tuple")
-        if self.etf_holdings_status not in {"not_applicable", "current", "missing", "stale"}:
+        if self.etf_holdings_status not in {
+            "not_applicable",
+            "current",
+            "missing",
+            "stale",
+            "unknown_date",
+            "unevaluated",
+        }:
             raise EntityValidationError("etf_holdings_status is invalid")
 
     @property
@@ -710,15 +752,16 @@ class PortfolioExposureMapper:
         _decimal(nav, "nav")
         if nav <= 0:
             raise EntityValidationError("nav must be positive")
-        base = _text(base_currency, "base_currency").upper()
-        if _CURRENCY.fullmatch(base) is None:
-            raise EntityValidationError("base_currency must be a three-letter code")
+        base = _normalize_currency(base_currency, "base_currency")
         if as_of is not None:
             _aware(as_of, "as_of")
-        fx_rates = dict(fx_to_base or {})
+        fx_rates: dict[str, Decimal] = {}
+        for raw_currency, rate in (fx_to_base or {}).items():
+            currency = _normalize_currency(raw_currency, "FX currency")
+            if currency in fx_rates:
+                raise EntityValidationError("duplicate FX currency")
+            fx_rates[currency] = rate
         for currency, rate in fx_rates.items():
-            if _CURRENCY.fullmatch(currency) is None:
-                raise EntityValidationError("FX currency must be a three-letter code")
             _decimal(rate, "FX rate")
             if rate <= 0:
                 raise EntityValidationError("FX rate must be positive")
@@ -728,9 +771,11 @@ class PortfolioExposureMapper:
                 raise EntityValidationError("duplicate ETF holdings snapshots")
             holdings_by_symbol[item.etf_symbol] = item
         direct: dict[str, Decimal] = defaultdict(lambda: Decimal("0"))
+        cash_weights: dict[str, list[Decimal]] = defaultdict(list)
         lookthrough: dict[str, Decimal] = defaultdict(lambda: Decimal("0"))
         statuses: dict[str, str] = {}
         relationships = relationship_exposures or {}
+        cash_input_symbols: set[str] = set()
         for item in positions:
             if not isinstance(item, ExposurePosition):
                 raise TypeError("positions must contain ExposurePosition records")
@@ -741,6 +786,10 @@ class PortfolioExposureMapper:
                 if rate is None:
                     raise EntityValidationError("foreign-currency position requires FX rate")
                 base_value = item.market_value * rate
+            if item.asset_class == "CASH":
+                cash_weights[f"CASH:{item.currency}"].append(base_value / nav)
+                cash_input_symbols.add(item.symbol)
+                continue
             if item.asset_class in {"STK", "EQUITY", "ETF", "FUND"}:
                 direct[item.symbol] += base_value / nav
             else:
@@ -751,18 +800,35 @@ class PortfolioExposureMapper:
             if holdings is None:
                 statuses[item.symbol] = "missing"
                 continue
-            if as_of is not None and as_of - holdings.as_of > self.max_etf_holdings_age:
+            if holdings.as_of is None:
+                statuses[item.symbol] = "unknown_date"
+                continue
+            if as_of is None:
+                statuses[item.symbol] = "unevaluated"
+                continue
+            if as_of - holdings.as_of > self.max_etf_holdings_age:
                 statuses[item.symbol] = "stale"
                 continue
             statuses[item.symbol] = "current"
             etf_weight = base_value / nav
             for constituent in holdings.constituents:
                 lookthrough[constituent.symbol] += etf_weight * constituent.weight
-        symbols = set(direct) | set(lookthrough) | set(relationships)
+        for symbol, weights in cash_weights.items():
+            direct[symbol] = sum(sorted(weights, key=abs, reverse=True), Decimal("0"))
+        relationship_symbols = {
+            symbol
+            for symbol in relationships
+            if symbol not in cash_input_symbols and not symbol.upper().startswith("CASH:")
+        }
+        symbols = set(direct) | set(lookthrough) | relationship_symbols
         result = {}
         for symbol in sorted(symbols):
-            qualitative = tuple(
-                sorted(relationships.get(symbol, ()), key=lambda item: item.relationship_id)
+            qualitative = (
+                ()
+                if symbol.startswith("CASH:")
+                else tuple(
+                    sorted(relationships.get(symbol, ()), key=lambda item: item.relationship_id)
+                )
             )
             result[symbol] = PortfolioExposure(
                 symbol=symbol,
