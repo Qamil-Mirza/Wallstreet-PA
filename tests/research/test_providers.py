@@ -4,14 +4,20 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import FrozenInstanceError
 from datetime import date
 from decimal import Decimal
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import requests
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
-from news_bot.research.budget import BudgetLedger, ModelPrice, PriceTable
+from news_bot.research.budget import (
+    BudgetExceeded,
+    BudgetLedger,
+    ModelPrice,
+    PriceTable,
+)
 from news_bot.research.config import ResearchConfig
 from news_bot.research.models import AgentRole, InferenceMode
 from news_bot.research.providers.base import (
@@ -21,6 +27,7 @@ from news_bot.research.providers.base import (
     ModelResponse,
     ProviderAuthenticationError,
     ProviderConfigurationError,
+    ProviderNonRetryableError,
     ProviderRequestError,
     ProviderUnavailable,
     ProviderValidationError,
@@ -38,6 +45,15 @@ from .conftest import utc
 class ResearchOutput(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
     answer: str
+
+
+class MutableResearchOutput(BaseModel):
+    sections: list[dict[str, list[str]]]
+
+
+class ArbitraryResearchOutput(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+    value: object
 
 
 def make_request(
@@ -324,6 +340,70 @@ def test_model_response_rejects_unsafe_validated_model_text_without_leak():
     assert raised.value.__cause__ is None
 
 
+def test_model_response_data_is_defensive_against_nested_mutation():
+    source = MutableResearchOutput(
+        sections=[{"claims": ["original"]}]
+    )
+    result = ModelResponse(
+        data=source,
+        raw_response_hash="a" * 64,
+        input_tokens=1,
+        output_tokens=1,
+        reasoning_tokens=0,
+        model="research:latest",
+        latency_ms=1,
+        provider="ollama",
+        inference_mode=InferenceMode.LOCAL_ONLY,
+        run_id="run-1",
+    )
+    expected_metadata = (
+        result.raw_response_hash,
+        result.input_tokens,
+        result.output_tokens,
+        result.reasoning_tokens,
+        result.model,
+        result.provider,
+        result.run_id,
+    )
+
+    source.sections[0]["claims"].append("source mutation")
+    first_read = result.data
+    first_read.sections[0]["claims"].append("returned mutation")
+    first_read.sections.append({"claims": ["new section"]})
+    second_read = result.data
+
+    assert first_read is not second_read
+    assert second_read == MutableResearchOutput(
+        sections=[{"claims": ["original"]}]
+    )
+    assert (
+        result.raw_response_hash,
+        result.input_tokens,
+        result.output_tokens,
+        result.reasoning_tokens,
+        result.model,
+        result.provider,
+        result.run_id,
+    ) == expected_metadata
+
+
+def test_model_response_rejects_non_json_model_data_without_raw_cause():
+    with pytest.raises(ProviderRequestError) as raised:
+        ModelResponse(
+            data=ArbitraryResearchOutput(value=object()),
+            raw_response_hash="a" * 64,
+            input_tokens=1,
+            output_tokens=1,
+            reasoning_tokens=0,
+            model="research:latest",
+            latency_ms=1,
+            provider="ollama",
+            inference_mode=InferenceMode.LOCAL_ONLY,
+            run_id="run-1",
+        )
+    assert raised.value.__cause__ is None
+
+
 def test_ollama_checks_model_then_generates_with_json_schema():
     session = FakeSession([
         FakeHttpResponse({"models": [{"name": "research:latest"}]}),
@@ -447,17 +527,48 @@ class FakeOpenAIClient:
         self.responses = FakeResponses(outcome)
 
 
-def openai_result(*, output='{"answer":"supported"}', input_tokens=4, output_tokens=3, reasoning_tokens=1):
-    return SimpleNamespace(
-        output_text=output,
-        usage=SimpleNamespace(
-            input_tokens=input_tokens, output_tokens=output_tokens,
-            output_tokens_details=SimpleNamespace(reasoning_tokens=reasoning_tokens),
+_MISSING = object()
+
+
+def openai_result(
+    *,
+    output='{"answer":"supported"}',
+    input_tokens=4,
+    output_tokens=3,
+    reasoning_tokens=1,
+    status=_MISSING,
+    error=_MISSING,
+    incomplete_details=_MISSING,
+    response_output=_MISSING,
+):
+    values = {
+        "output_text": output,
+        "usage": SimpleNamespace(
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            output_tokens_details=SimpleNamespace(
+                reasoning_tokens=reasoning_tokens
+            ),
         ),
-    )
+    }
+    for name, value in (
+        ("status", status),
+        ("error", error),
+        ("incomplete_details", incomplete_details),
+        ("output", response_output),
+    ):
+        if value is not _MISSING:
+            values[name] = value
+    return SimpleNamespace(**values)
 
 
-def make_openai_provider(migrated_store, client, *, clock=lambda: utc(2026, 8, 24)):
+def make_openai_provider(
+    migrated_store,
+    client,
+    *,
+    clock=lambda: utc(2026, 8, 24),
+    token_estimator=lambda _: 10,
+):
     prices = PriceTable(
         effective_until=date(2026, 12, 31),
         prices={"gpt-test": ModelPrice(Decimal("1"), Decimal("2"))},
@@ -467,7 +578,7 @@ def make_openai_provider(migrated_store, client, *, clock=lambda: utc(2026, 8, 2
     return OpenAIProvider(
         client=client,
         routes={AgentRole.EVENT_SCOUT: ModelRoute("gpt-test", ReasoningEffort.LOW)},
-        budget=ledger, prices=prices, token_estimator=lambda _: 10,
+        budget=ledger, prices=prices, token_estimator=token_estimator,
         clock=clock, monotonic=lambda: 1.0,
     ), ledger
 
@@ -501,6 +612,119 @@ def test_openai_uses_request_reasoning_effort_and_reconciles(migrated_store):
     assert ledger.month_total(2026, 8) == Decimal("0.000010")
 
 
+def test_openai_deliberately_accepts_completed_or_absent_compatibility_status(
+    migrated_store,
+):
+    for result in (openai_result(status="completed"), openai_result()):
+        provider, ledger = make_openai_provider(
+            migrated_store, FakeOpenAIClient(result)
+        )
+        assert provider.generate(make_request()).data.answer == "supported"
+        assert ledger.month_total(2026, 8) > Decimal("0")
+
+
+@pytest.mark.parametrize(
+    ("result", "reason_code"),
+    [
+        (openai_result(status="incomplete"), "response_incomplete"),
+        (openai_result(status="failed"), "response_failed"),
+        (openai_result(status="cancelled"), "response_cancelled"),
+        (openai_result(status="in_progress"), "response_not_terminal"),
+        (
+            openai_result(
+                status="completed",
+                error=SimpleNamespace(message="marker-terminal-secret"),
+            ),
+            "response_error",
+        ),
+        (
+            openai_result(
+                status="completed",
+                incomplete_details=SimpleNamespace(
+                    reason="marker-incomplete-secret"
+                ),
+            ),
+            "response_incomplete",
+        ),
+    ],
+)
+def test_openai_rejects_terminal_states_after_reconciling_valid_usage(
+    migrated_store, result, reason_code
+):
+    provider, ledger = make_openai_provider(
+        migrated_store, FakeOpenAIClient(result)
+    )
+
+    with pytest.raises(ProviderUnavailable) as raised:
+        provider.generate(make_request())
+
+    assert raised.value.reason_code == reason_code
+    assert "marker" not in str(raised.value)
+    assert raised.value.__cause__ is None
+    assert ledger.month_total(2026, 8) == Decimal("0.000010")
+
+
+def test_openai_refusal_is_nonretryable_redacted_and_usage_is_reconciled(
+    migrated_store,
+):
+    result = openai_result(
+        status="completed",
+        response_output=[
+            SimpleNamespace(
+                type="message",
+                content=[
+                    SimpleNamespace(
+                        type="refusal", refusal="marker-refusal-secret"
+                    )
+                ],
+            )
+        ],
+    )
+    provider, ledger = make_openai_provider(
+        migrated_store, FakeOpenAIClient(result)
+    )
+
+    with pytest.raises(ProviderNonRetryableError) as raised:
+        provider.generate(make_request())
+
+    assert raised.value.reason_code == "response_refusal"
+    assert "marker" not in str(raised.value)
+    assert raised.value.__cause__ is None
+    assert ledger.month_total(2026, 8) == Decimal("0.000010")
+
+
+def test_router_does_not_schema_retry_external_terminal_or_refusal(
+    migrated_store,
+):
+    for result, policy, fallback_reason in (
+        (
+            openai_result(status="incomplete"),
+            FallbackPolicy.OUTAGES,
+            "external_unavailable",
+        ),
+        (
+            openai_result(
+                status="completed",
+                response_output=[SimpleNamespace(type="refusal")],
+            ),
+            FallbackPolicy.ANY_FAILURE,
+            "external_nonretryable",
+        ),
+    ):
+        client = FakeOpenAIClient(result)
+        external, _ = make_openai_provider(migrated_store, client)
+        router = ProviderRouter(
+            make_config(external=True),
+            external,
+            StubProvider("ollama", [response("ollama")]),
+        )
+
+        routed = router.generate(make_request(policy=policy))
+
+        assert routed.fallback_reason == fallback_reason
+        assert len(client.responses.calls) == 1
+
+
 class FakeRemoteError(Exception):
     def __init__(self, status_code, detail="remote failure"):
         super().__init__(detail)
@@ -521,7 +745,123 @@ def test_openai_timeout_keeps_pessimistic_reservation_counted(migrated_store):
     with pytest.raises(ProviderUnavailable) as raised:
         provider.generate(make_request())
     assert "prompt secret" not in str(raised.value)
-    assert ledger.month_total(2026, 8) == Decimal("0.000170")
+    assert ledger.month_total(2026, 8) == Decimal("0.000234")
+
+
+def test_openai_reservation_covers_canonical_full_request_envelope(
+    migrated_store,
+):
+    estimated_text = []
+
+    def estimate(value):
+        estimated_text.append(value)
+        return 10
+
+    provider, ledger = make_openai_provider(
+        migrated_store,
+        FakeOpenAIClient(TimeoutError("redacted")),
+        token_estimator=estimate,
+    )
+    request = make_request(effort=ReasoningEffort.HIGH)
+
+    with pytest.raises(ProviderUnavailable):
+        provider.generate(request)
+
+    assert len(estimated_text) == 1
+    envelope = json.loads(estimated_text[0])
+    assert envelope == {
+        "input": request.provider_input,
+        "instructions": request.system_prompt,
+        "max_output_tokens": request.max_output_tokens,
+        "model": "gpt-test",
+        "reasoning": {"effort": "high"},
+        "role": AgentRole.EVENT_SCOUT.value,
+        "store": False,
+        "text": {
+            "format": {
+                "name": "ResearchOutput",
+                "schema": ResearchOutput.model_json_schema(),
+                "strict": True,
+                "type": "json_schema",
+            }
+        },
+    }
+    assert estimated_text[0] == json.dumps(
+        envelope,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    assert ledger.month_total(2026, 8) == Decimal("0.000234")
+
+
+def test_openai_default_estimator_is_deterministic_utf8_upper_bound(
+    migrated_store,
+):
+    prices = PriceTable(
+        effective_until=date(2026, 12, 31),
+        prices={"gpt-test": ModelPrice(Decimal("1"), Decimal("2"))},
+        clock=lambda: utc(2026, 8, 24),
+    )
+    provider = OpenAIProvider(
+        client=FakeOpenAIClient(openai_result()),
+        routes={
+            AgentRole.EVENT_SCOUT: ModelRoute(
+                "gpt-test", ReasoningEffort.LOW
+            )
+        },
+        budget=BudgetLedger(migrated_store, Decimal("4"), Decimal("5")),
+        prices=prices,
+        clock=lambda: utc(2026, 8, 24),
+    )
+    assert provider.token_estimator("café") == len("café".encode("utf-8"))
+    assert provider.token_estimator("café") == provider.token_estimator("café")
+
+
+def test_giant_schema_exceeds_hard_budget_before_openai_client_call(
+    migrated_store,
+):
+    class GiantSchema(BaseModel):
+        answer: str = Field(description="x" * 60_000)
+
+    client = FakeOpenAIClient(openai_result())
+    clock = lambda: utc(2026, 8, 24)
+    provider = OpenAIProvider(
+        client=client,
+        routes={
+            AgentRole.EVENT_SCOUT: ModelRoute(
+                "gpt-test", ReasoningEffort.LOW
+            )
+        },
+        budget=BudgetLedger(migrated_store, Decimal("4"), Decimal("5")),
+        prices=PriceTable(
+            effective_until=date(2026, 12, 31),
+            prices={
+                "gpt-test": ModelPrice(
+                    Decimal("100000"), Decimal("2")
+                )
+            },
+            clock=clock,
+        ),
+        clock=clock,
+    )
+    request = ModelRequest(
+        role=AgentRole.EVENT_SCOUT,
+        system_prompt="system",
+        evidence_packet={},
+        output_schema=GiantSchema,
+        max_output_tokens=10,
+        reasoning_effort=ReasoningEffort.LOW,
+        fallback_policy=FallbackPolicy.OUTAGES,
+        run_id="giant-schema",
+    )
+
+    with pytest.raises(BudgetExceeded):
+        provider.generate(request)
+
+    assert client.responses.calls == []
+    assert provider.budget.month_total(2026, 8) == Decimal("0")
 
 
 def test_openai_schema_failure_reconciles_reported_usage(migrated_store):
@@ -548,13 +888,21 @@ def test_openai_rejects_escaped_unsafe_model_text_and_reconciles(
 
 def test_router_budgets_each_openai_validation_attempt_and_redacts_feedback(migrated_store):
     raw_secret = "raw-provider-secret"
+    estimated_text = []
+
+    def estimate(value):
+        estimated_text.append(value)
+        return 10
+
     client = FakeOpenAIClient(
         [
             openai_result(output='{"wrong":"' + raw_secret + '"}'),
             openai_result(output='{"answer":"supported"}'),
         ]
     )
-    external, ledger = make_openai_provider(migrated_store, client)
+    external, ledger = make_openai_provider(
+        migrated_store, client, token_estimator=estimate
+    )
     router = ProviderRouter(
         make_config(external=True), external, StubProvider("ollama", [])
     )
@@ -566,6 +914,10 @@ def test_router_budgets_each_openai_validation_attempt_and_redacts_feedback(migr
     assert ledger.month_total(2026, 8) == Decimal("0.000020")
     assert raw_secret not in client.responses.calls[1]["input"]
     assert "validation_feedback" in client.responses.calls[1]["input"]
+    assert len(estimated_text) == 2
+    assert "validation_feedback" not in json.loads(estimated_text[0])["input"]
+    assert "validation_feedback" in json.loads(estimated_text[1])["input"]
+    assert raw_secret not in estimated_text[1]
 
 
 def test_missing_optional_openai_sdk_fails_with_typed_error(migrated_store):

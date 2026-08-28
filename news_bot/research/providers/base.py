@@ -42,6 +42,28 @@ class ProviderUnavailable(ProviderError):
     """Raised for timeouts and retryable provider outages."""
 
 
+_TERMINAL_REASON_CODES = frozenset(
+    {
+        "response_cancelled",
+        "response_error",
+        "response_failed",
+        "response_incomplete",
+        "response_not_terminal",
+        "response_uninspectable",
+    }
+)
+
+
+class ProviderTerminalUnavailable(ProviderUnavailable):
+    """A paid response that cannot safely be treated as completed."""
+
+    def __init__(self, reason_code: str) -> None:
+        if reason_code not in _TERMINAL_REASON_CODES:
+            raise ProviderConfigurationError("terminal reason code is invalid")
+        self.reason_code = reason_code
+        super().__init__("external provider response was not completed")
+
+
 class ProviderValidationError(ProviderError):
     """Raised when provider JSON violates the requested contract."""
 
@@ -67,6 +89,15 @@ class ProviderValidationError(ProviderError):
 
 class ProviderNonRetryableError(ProviderError):
     """Raised for a redacted provider rejection that must not be retried."""
+
+
+class ProviderRefusalError(ProviderNonRetryableError):
+    """Raised when a completed provider response contains a refusal."""
+
+    reason_code = "response_refusal"
+
+    def __init__(self) -> None:
+        super().__init__("external provider refused the structured request")
 
 
 class TaskDeferred(ProviderError):
@@ -367,11 +398,10 @@ class ModelRequest:
         return value
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, init=False)
 class ModelResponse:
     """Validated data plus auditable metadata; raw provider text is never retained."""
 
-    data: BaseModel
     raw_response_hash: str
     input_tokens: int
     output_tokens: int
@@ -382,44 +412,110 @@ class ModelResponse:
     inference_mode: InferenceMode
     run_id: str
     fallback_reason: str | None = None
+    _data_schema: type[BaseModel] = field(repr=False)
+    _canonical_data: str = field(repr=False)
 
-    def __post_init__(self) -> None:
-        if not isinstance(self.data, BaseModel):
+    def __init__(
+        self,
+        data: BaseModel,
+        raw_response_hash: str,
+        input_tokens: int,
+        output_tokens: int,
+        reasoning_tokens: int,
+        model: str,
+        latency_ms: int,
+        provider: str,
+        inference_mode: InferenceMode,
+        run_id: str,
+        fallback_reason: str | None = None,
+    ) -> None:
+        if not isinstance(data, BaseModel):
             raise TypeError("data must be a validated Pydantic model")
         try:
-            _freeze_json(self.data.model_dump(mode="json"))
-        except (ProviderRequestError, TypeError, ValueError):
+            frozen_data = _freeze_json(
+                data.model_dump(mode="json", by_alias=True)
+            )
+            canonical_data = _canonical_json(frozen_data)
+            type(data).model_validate_json(canonical_data)
+        except Exception:
             raise ProviderRequestError("data contains invalid JSON text") from None
+        object.__setattr__(self, "_data_schema", type(data))
+        object.__setattr__(self, "_canonical_data", canonical_data)
         if (
-            not isinstance(self.raw_response_hash, str)
-            or len(self.raw_response_hash) != 64
-            or any(character not in "0123456789abcdef" for character in self.raw_response_hash)
+            not isinstance(raw_response_hash, str)
+            or len(raw_response_hash) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in raw_response_hash
+            )
         ):
             raise ValueError("raw_response_hash must be a lowercase SHA-256 digest")
+        object.__setattr__(self, "raw_response_hash", raw_response_hash)
+        values = {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "reasoning_tokens": reasoning_tokens,
+            "latency_ms": latency_ms,
+        }
         for name in ("input_tokens", "output_tokens", "reasoning_tokens", "latency_ms"):
-            value = getattr(self, name)
+            value = values[name]
             if type(value) is not int or value < 0:
                 raise ValueError(f"{name} must be a non-negative integer")
+            object.__setattr__(self, name, value)
+        text_values = {"model": model, "provider": provider, "run_id": run_id}
         for name in ("model", "provider", "run_id"):
             value = _safe_text(
                 name,
-                getattr(self, name),
+                text_values[name],
                 allow_multiline=False,
                 nonblank=True,
                 error_type=ProviderRequestError,
             )
             object.__setattr__(self, name, value)
-        if not isinstance(self.inference_mode, InferenceMode):
+        if not isinstance(inference_mode, InferenceMode):
             raise TypeError("inference_mode must be InferenceMode")
-        if self.fallback_reason is not None:
+        object.__setattr__(self, "inference_mode", inference_mode)
+        if fallback_reason is not None:
             fallback_reason = _safe_text(
                 "fallback_reason",
-                self.fallback_reason,
+                fallback_reason,
                 allow_multiline=False,
                 nonblank=True,
                 error_type=ProviderRequestError,
             )
-            object.__setattr__(self, "fallback_reason", fallback_reason)
+        object.__setattr__(self, "fallback_reason", fallback_reason)
+
+    @property
+    def data(self) -> BaseModel:
+        """Return a fresh validated copy of the canonical stored result."""
+        try:
+            return self._data_schema.model_validate_json(self._canonical_data)
+        except Exception:
+            raise ProviderRequestError(
+                "stored response data could not be validated"
+            ) from None
+
+    def with_routing(
+        self,
+        *,
+        inference_mode: InferenceMode,
+        fallback_reason: str | None,
+        run_id: str,
+    ) -> "ModelResponse":
+        """Return a defensive response copy with explicit routing metadata."""
+        return ModelResponse(
+            data=self.data,
+            raw_response_hash=self.raw_response_hash,
+            input_tokens=self.input_tokens,
+            output_tokens=self.output_tokens,
+            reasoning_tokens=self.reasoning_tokens,
+            model=self.model,
+            latency_ms=self.latency_ms,
+            provider=self.provider,
+            inference_mode=inference_mode,
+            run_id=run_id,
+            fallback_reason=fallback_reason,
+        )
 
 
 @runtime_checkable

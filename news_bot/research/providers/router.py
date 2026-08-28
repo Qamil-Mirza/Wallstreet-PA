@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
 from threading import Lock, RLock
 
 from ..config import ResearchConfig
@@ -128,8 +127,7 @@ class ProviderRouter:
             raise exhausted.error from None
         except ProviderUnavailable:
             raise TaskDeferred("configured Ollama model is unavailable") from None
-        return replace(
-            result,
+        return result.with_routing(
             inference_mode=InferenceMode.LOCAL_ONLY,
             fallback_reason=reason,
             run_id=request.run_id,

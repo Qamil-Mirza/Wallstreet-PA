@@ -31,6 +31,8 @@ from .base import (
     ProviderConfigurationError,
     ProviderNonRetryableError,
     ProviderRateLimitError,
+    ProviderRefusalError,
+    ProviderTerminalUnavailable,
     ProviderUnavailable,
     ProviderValidationError,
     ReasoningEffort,
@@ -39,6 +41,14 @@ from .base import (
     validated_provider_json,
     validation_issues,
 )
+
+
+_REQUEST_OVERHEAD_TOKENS = 64
+
+
+def _utf8_token_upper_bound(text: str) -> int:
+    """Use one token per UTF-8 byte as a deterministic conservative bound."""
+    return len(text.encode("utf-8", errors="strict"))
 
 
 @dataclass(frozen=True)
@@ -109,7 +119,10 @@ class OpenAIProvider:
         self.routes = MappingProxyType(normalized)
         self.budget = budget
         self.prices = prices
-        self.token_estimator = token_estimator or (lambda text: len(text.encode("utf-8")))
+        estimator = token_estimator or _utf8_token_upper_bound
+        if not callable(estimator):
+            raise ProviderConfigurationError("token estimator must be callable")
+        self.token_estimator = estimator
         self.clock = clock
         self.monotonic = monotonic
 
@@ -121,11 +134,38 @@ class OpenAIProvider:
         except KeyError:
             raise ProviderConfigurationError("no approved OpenAI route for role") from None
         client = self._get_client()
-        prompt_for_estimate = f"{request.system_prompt}\n{request.provider_input}"
-        estimated_input = self.token_estimator(prompt_for_estimate)
+        api_request = {
+            "model": route.model,
+            "instructions": request.system_prompt,
+            "input": request.provider_input,
+            "max_output_tokens": request.max_output_tokens,
+            "reasoning": {"effort": request.reasoning_effort.value},
+            "store": False,
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": request.schema_name,
+                    "schema": request.schema_payload(),
+                    "strict": True,
+                }
+            },
+        }
+        estimation_envelope = dict(api_request)
+        estimation_envelope["role"] = request.role.value
+        canonical_request = json.dumps(
+            estimation_envelope,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        estimated_input = self.token_estimator(canonical_request)
         if type(estimated_input) is not int or estimated_input < 0:
             raise ProviderConfigurationError("token estimator returned an invalid count")
+        estimated_input += _REQUEST_OVERHEAD_TOKENS
         instant = self.clock()
+        # Responses max_output_tokens covers both visible output and internal
+        # reasoning tokens, all billed in the output category.
         estimate = self.prices.estimate(
             route.model,
             estimated_input,
@@ -140,28 +180,15 @@ class OpenAIProvider:
         )
         started = self.monotonic()
         try:
-            provider_result = client.responses.create(
-                model=route.model,
-                instructions=request.system_prompt,
-                input=request.provider_input,
-                max_output_tokens=request.max_output_tokens,
-                reasoning={"effort": request.reasoning_effort.value},
-                store=False,
-                text={
-                    "format": {
-                        "type": "json_schema",
-                        "name": request.schema_name,
-                        "schema": request.schema_payload(),
-                        "strict": True,
-                    }
-                },
-            )
+            provider_result = client.responses.create(**api_request)
         except Exception as exc:
             self._handle_call_failure(reservation.id, exc)
             raise AssertionError("unreachable")
 
         try:
-            raw, input_tokens, output_tokens, reasoning_tokens = _extract_response(provider_result)
+            input_tokens, output_tokens, reasoning_tokens = _extract_usage(
+                provider_result
+            )
         except ProviderValidationError:
             self.budget.mark_usage_unknown(reservation.id, now=self.clock())
             raise
@@ -173,6 +200,8 @@ class OpenAIProvider:
             as_of=self.clock().date(),
         )
         self.budget.reconcile(reservation.id, actual, now=self.clock())
+        _enforce_completed_response(provider_result)
+        raw = _extract_output_text(provider_result)
         try:
             raw_bytes = raw.encode("utf-8", errors="strict")
         except UnicodeError:
@@ -251,22 +280,86 @@ def _status_code(exc: Exception) -> int | None:
     return nested if type(nested) is int else None
 
 
-def _extract_response(result: Any) -> tuple[str, int, int, int]:
-    raw = getattr(result, "output_text", None)
+def _extract_usage(result: Any) -> tuple[int, int, int]:
     usage = getattr(result, "usage", None)
     input_tokens = getattr(usage, "input_tokens", None)
     output_tokens = getattr(usage, "output_tokens", None)
     details = getattr(usage, "output_tokens_details", None)
     reasoning_tokens = getattr(details, "reasoning_tokens", 0)
-    if not isinstance(raw, str):
-        raise ProviderValidationError(
-            "OpenAI response omitted structured output",
-            issues=(ValidationIssue("$", "output_missing"),),
-        )
     for value in (input_tokens, output_tokens, reasoning_tokens):
         if type(value) is not int or value < 0:
             raise ProviderValidationError(
                 "OpenAI response omitted valid usage metadata",
                 issues=(ValidationIssue("usage", "invalid"),),
             )
-    return raw, input_tokens, output_tokens, reasoning_tokens
+    return input_tokens, output_tokens, reasoning_tokens
+
+
+def _extract_output_text(result: Any) -> str:
+    raw = getattr(result, "output_text", None)
+    if not isinstance(raw, str):
+        raise ProviderValidationError(
+            issues=(ValidationIssue("$", "output_missing"),),
+        )
+    return raw
+
+
+_ABSENT = object()
+
+
+def _response_field(value: Any, name: str, default: Any = _ABSENT) -> Any:
+    if isinstance(value, Mapping):
+        return value.get(name, default)
+    return getattr(value, name, default)
+
+
+def _contains_refusal(result: Any) -> bool:
+    direct = _response_field(result, "refusal", None)
+    if direct is not None:
+        return True
+    output = _response_field(result, "output", ())
+    if not isinstance(output, (list, tuple)):
+        return False
+    for item in output:
+        if _response_field(item, "type", None) == "refusal":
+            return True
+        if _response_field(item, "refusal", None) is not None:
+            return True
+        content = _response_field(item, "content", ())
+        if not isinstance(content, (list, tuple)):
+            continue
+        for part in content:
+            if _response_field(part, "type", None) == "refusal":
+                return True
+            if _response_field(part, "refusal", None) is not None:
+                return True
+    return False
+
+
+def _enforce_completed_response(result: Any) -> None:
+    """Reject non-completed terminal states after known usage is accounted."""
+    try:
+        if _contains_refusal(result):
+            raise ProviderRefusalError() from None
+        if _response_field(result, "error", None) is not None:
+            raise ProviderTerminalUnavailable("response_error") from None
+        if _response_field(result, "incomplete_details", None) is not None:
+            raise ProviderTerminalUnavailable("response_incomplete") from None
+        status = _response_field(result, "status")
+    except (ProviderRefusalError, ProviderTerminalUnavailable):
+        raise
+    except Exception:
+        raise ProviderTerminalUnavailable("response_uninspectable") from None
+
+    # Compatibility with injected clients and older SDK fixtures that predate
+    # the public status property. Explicit status values must be completed.
+    if status is _ABSENT:
+        return
+    reason_code = {
+        "incomplete": "response_incomplete",
+        "failed": "response_failed",
+        "cancelled": "response_cancelled",
+        "error": "response_error",
+    }.get(status, "response_not_terminal")
+    if status != "completed":
+        raise ProviderTerminalUnavailable(reason_code) from None
