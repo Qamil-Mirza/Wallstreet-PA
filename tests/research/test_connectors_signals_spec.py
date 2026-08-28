@@ -140,6 +140,139 @@ def test_official_form_d_six_table_archive_joins_and_persists(tmp_path):
     assert '"FORMDSUBMISSION"' in passages[0].text
     assert '"ISSUERS"' in passages[0].text
     assert '"OFFERING"' in passages[0].text
+    evidence = json.loads(passages[0].text)
+    assert evidence["RECIPIENTS"] == [
+        {
+            "ACCESSIONNUMBER": "0001234567-26-000001",
+            "RECIPIENTNAME": "Broker LLC",
+            "RECIPIENT_SEQ_KEY": "1",
+        }
+    ]
+    assert evidence["RELATEDPERSONS"] == [
+        {
+            "ACCESSIONNUMBER": "0001234567-26-000001",
+            "FIRSTNAME": "Avery",
+            "RELATEDPERSON_SEQ_KEY": "1",
+        }
+    ]
+    assert evidence["SIGNATURES"] == [
+        {
+            "ACCESSIONNUMBER": "0001234567-26-000001",
+            "SIGNATURENAME": "Morgan Lee",
+            "SIGNATURE_SEQ_KEY": "1",
+        }
+    ]
+
+
+def test_uspto_two_record_fetch_does_not_publish_first_evidence_or_checkpoint(
+    tmp_path
+):
+    sink = ingestor(tmp_path)
+    payload = _without_synthetic_evidence("uspto_sample.json")
+    first = payload["patentFileWrapperDataBag"][0]
+    second = json.loads(json.dumps(first))
+    second["applicationNumberText"] = "18123457"
+    second["applicationMetaData"].pop("firstApplicantName")
+    payload["patentFileWrapperDataBag"] = [first, second]
+    payload["count"] = 2
+
+    class Response:
+        status_code = 200
+        headers = {"Content-Type": "application/json"}
+        history = ()
+        url = "https://api.uspto.gov/api/v1/patent/applications/search"
+
+        def iter_content(self, chunk_size=65_536):
+            yield json.dumps(payload).encode("utf-8")
+
+        def close(self):
+            pass
+
+    class Session:
+        trust_env = True
+
+        def get(self, url, **kwargs):
+            return Response()
+
+    checkpoint = ConnectorCheckpoint("uspto", cursor="0")
+    connector = USPTOConnector(
+        USPTOConfig(api_key="private-uspto-key"),
+        session=Session(),
+        query="robotics",
+        ingestor=sink,
+    )
+
+    with pytest.raises(ConnectorError) as error:
+        connector.fetch(checkpoint)
+
+    assert error.value.diagnostic_code == "invalid_payload"
+    assert checkpoint.cursor == "0"
+    with sink.store.connect() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM source_documents").fetchone() == (0,)
+        assert connection.execute("SELECT COUNT(*) FROM document_passages").fetchone() == (0,)
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["sbir", "usaspending", "clinical_trials", "manual_import", "form_d"],
+)
+def test_signal_parsers_do_not_persist_first_record_when_second_is_invalid(
+    tmp_path, case
+):
+    sink = ingestor(tmp_path)
+    if case == "sbir":
+        payload = _without_synthetic_evidence("sbir_sample.json")
+        second = json.loads(json.dumps(payload[0]))
+        second.pop("firm")
+        payload.append(second)
+        parse = SBIRConnector(ingestor=sink).parse
+    elif case == "usaspending":
+        payload = _without_synthetic_evidence("usaspending_sample.json")
+        second = json.loads(json.dumps(payload["results"][0]))
+        second.pop("Recipient Name")
+        payload["results"].append(second)
+        parse = USASpendingConnector(ingestor=sink).parse
+    elif case == "clinical_trials":
+        payload = _without_synthetic_evidence("clinical_trials_sample.json")
+        second = json.loads(json.dumps(payload["studies"][0]))
+        second["protocolSection"]["identificationModule"]["organization"].pop(
+            "fullName"
+        )
+        payload["studies"].append(second)
+        parse = ClinicalTrialsConnector(ingestor=sink).parse
+    elif case == "manual_import":
+        header = (
+            "company,profile_date,geography,technology_terms,source_locator,stage,amount\n"
+        )
+        good = (
+            "Atlas Robotics Inc.,2026-08-15,California,Robotic Actuators,"
+            "licensed-export:atlas,Series A,5000000\n"
+        )
+        bad = (
+            "Nova Robotics Inc.,not-a-date,California,Robotic Actuators,"
+            "licensed-export:nova,Series A,5000000\n"
+        )
+        payload = header + good + bad
+        parse = ManualImportConnector(ingestor=sink).parse
+    else:
+        source = zipfile.ZipFile(io.BytesIO(official_form_d_zip()))
+        rebuilt = io.BytesIO()
+        with source, zipfile.ZipFile(rebuilt, "w", zipfile.ZIP_DEFLATED) as target:
+            for item in source.infolist():
+                content = source.read(item)
+                if Path(item.filename).stem.upper() == "ISSUERS":
+                    content += b"0001234567-26-000001\t2\t0007654321\t\tNY\textra\n"
+                target.writestr(item.filename, content)
+        payload = rebuilt.getvalue()
+        parse = FormDConnector(ingestor=sink).parse_zip
+
+    with pytest.raises(ConnectorError) as error:
+        parse(payload)
+
+    assert error.value.diagnostic_code == "invalid_payload"
+    with sink.store.connect() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM source_documents").fetchone() == (0,)
+        assert connection.execute("SELECT COUNT(*) FROM document_passages").fetchone() == (0,)
 
 
 def test_form_d_rejects_missing_duplicate_and_aggregate_bomb_tables(tmp_path):
@@ -208,10 +341,10 @@ def test_manual_import_persists_row_instead_of_accepting_lineage_id(tmp_path):
 def test_evidence_failure_is_redacted_and_prevents_form_d_batch(tmp_path, monkeypatch):
     sink = ingestor(tmp_path)
 
-    def fail(_source):
+    def fail(_sources):
         raise EvidencePersistenceError("private-record-value")
 
-    monkeypatch.setattr(sink, "ingest", fail)
+    monkeypatch.setattr(sink, "ingest_batch", fail)
     checkpoint = ConnectorCheckpoint("form_d", cursor="2026Q2")
     connector = FormDConnector(
         ingestor=sink,

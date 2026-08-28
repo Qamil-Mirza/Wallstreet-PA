@@ -187,6 +187,72 @@ def test_persistence_conflict_uses_typed_redacted_error(migrated_store):
     assert "private.test" not in str(error.value)
 
 
+def test_ingest_batch_rolls_back_new_documents_when_later_record_conflicts(
+    migrated_store, tmp_path
+):
+    conflicting_text = "Second private record."
+    conflicting_digest = hashlib.sha256(conflicting_text.encode("utf-8")).hexdigest()
+    migrated_store.insert_source_document(
+        SourceDocument(
+            document_id="document_conflict",
+            source_type="filing",
+            canonical_url="https://issuer.test/preexisting",
+            publisher="Issuer",
+            published_at=NOW,
+            retrieved_at=NOW,
+            content_hash=conflicting_digest,
+            raw_content_path=None,
+            extraction_status="complete",
+        )
+    )
+    ingestor = EvidenceIngestor(migrated_store, tmp_path / "cache")
+    sources = (
+        make_document("https://issuer.test/first", "First public record."),
+        make_document("https://issuer.test/second", conflicting_text),
+    )
+
+    with pytest.raises(EvidencePersistenceError):
+        ingestor.ingest_batch(sources)
+
+    with migrated_store.connect() as connection:
+        documents = connection.execute(
+            "SELECT document_id FROM source_documents ORDER BY document_id"
+        ).fetchall()
+        passages = connection.execute(
+            "SELECT passage_id FROM document_passages"
+        ).fetchall()
+    assert documents == [("document_conflict",)]
+    assert passages == []
+
+
+def test_ingest_batch_caches_every_record_before_opening_store_transaction(
+    migrated_store, tmp_path, monkeypatch
+):
+    ingestor = EvidenceIngestor(migrated_store, tmp_path / "cache")
+    sources = (
+        make_document("https://issuer.test/first", "First public record."),
+        make_document("https://issuer.test/second", "Second private record."),
+    )
+    real_cache = ingestor._cache
+    calls = 0
+
+    def fail_second_cache(content_hash, content):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise EvidenceCacheError("cache unavailable")
+        return real_cache(content_hash, content)
+
+    monkeypatch.setattr(ingestor, "_cache", fail_second_cache)
+
+    with pytest.raises(EvidenceCacheError):
+        ingestor.ingest_batch(sources)
+
+    with migrated_store.connect() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM source_documents").fetchone() == (0,)
+        assert connection.execute("SELECT COUNT(*) FROM document_passages").fetchone() == (0,)
+
+
 def test_concurrent_ingestion_is_idempotent_and_leaves_no_temp_files(
     migrated_store, tmp_path
 ):

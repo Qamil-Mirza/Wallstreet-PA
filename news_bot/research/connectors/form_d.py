@@ -15,13 +15,14 @@ from decimal import Decimal, InvalidOperation
 from pathlib import PurePosixPath
 from urllib.parse import quote
 
-from ..evidence import EvidenceIngestor
+from ..evidence import DocumentInput, EvidenceIngestor
 from .base import (
     ConnectorCheckpoint,
     ConnectorError,
     EmergingSignal,
     SignalConnectorBatch,
-    persist_signal_evidence,
+    persist_signal_evidence_batch,
+    signal_evidence_input,
 )
 
 
@@ -56,6 +57,17 @@ class FormDConfig:
         ):
             if not isinstance(getattr(self, field_name), int) or getattr(self, field_name) <= 0:
                 raise ValueError(f"{field_name} must be a positive integer")
+
+
+@dataclass(frozen=True)
+class _FormDSignalDraft:
+    locator: str
+    company: str
+    amount: Decimal | None
+    effective_date: date
+    geography: str
+    industry: str
+    source: DocumentInput
 
 
 def _decode(value: str | bytes, *, max_bytes: int, connector: str) -> str:
@@ -130,10 +142,10 @@ class FormDConnector:
         self.ingestor = ingestor
         self._retrieved_clock = retrieved_clock
 
-    def _signal(
+    def _draft(
         self, *, accession: str, issuer: Mapping[str, str], offering: Mapping[str, str],
         submission: Mapping[str, str], raw_record: Mapping[str, object],
-    ) -> EmergingSignal:
+    ) -> _FormDSignalDraft:
         sequence = issuer.get("ISSUER_SEQ_KEY", "").strip()
         locator = (
             f"sec-form-d:{accession}:issuer:{sequence}"
@@ -166,20 +178,47 @@ class FormDConnector:
                 "https://www.sec.gov/files/dera/data/form-d-data-sets"
                 f"?accession={quote(accession)}"
             )
-        document_id, passage_id = persist_signal_evidence(
-            self.ingestor, connector=self.name, source_locator=locator,
+        source = signal_evidence_input(
+            connector=self.name, source_locator=locator,
             source_url=source_url,
             publisher="U.S. Securities and Exchange Commission",
             effective_date=effective_date, raw_record=raw_record,
             retrieved_at=self._retrieved_clock(),
         )
-        return EmergingSignal(
-            source_document_id=document_id, source_locator=locator,
-            company=company, signal_type="funding",
-            amount=amount, stage=None, effective_date=effective_date,
+        return _FormDSignalDraft(
+            locator=locator,
+            company=company,
+            amount=amount,
+            effective_date=effective_date,
             geography=geography,
-            technology_terms=(industry,),
-            evidence_passage_id=passage_id,
+            industry=industry,
+            source=source,
+        )
+
+    def _persist_drafts(
+        self, drafts: list[_FormDSignalDraft]
+    ) -> tuple[EmergingSignal, ...]:
+        lineages = persist_signal_evidence_batch(
+            self.ingestor,
+            connector=self.name,
+            sources=tuple(draft.source for draft in drafts),
+        )
+        return tuple(
+            EmergingSignal(
+                source_document_id=document_id,
+                source_locator=draft.locator,
+                company=draft.company,
+                signal_type="funding",
+                amount=draft.amount,
+                stage=None,
+                effective_date=draft.effective_date,
+                geography=draft.geography,
+                technology_terms=(draft.industry,),
+                evidence_passage_id=passage_id,
+            )
+            for draft, (document_id, passage_id) in zip(
+                drafts, lineages, strict=True
+            )
         )
 
     def parse(self, content: str | bytes) -> tuple[EmergingSignal, ...]:
@@ -189,19 +228,19 @@ class FormDConnector:
             reader = csv.DictReader(io.StringIO(text, newline=""), dialect="excel-tab")
             if tuple(reader.fieldnames or ()) != _DIRECT_FIELDS:
                 raise ConnectorError(self.name, retryable=False, diagnostic_code="invalid_schema")
-            signals = []
+            drafts = []
             for row in reader:
                 if None in row or set(row) != set(_DIRECT_FIELDS):
                     raise ValueError("row shape does not match schema")
                 accession = _required(row, "ACCESSIONNUMBER")
-                signals.append(self._signal(
+                drafts.append(self._draft(
                     accession=accession,
                     issuer={"ENTITYNAME": row["ENTITYNAME"] or "", "STATEORCOUNTRY": row["STATEORCOUNTRY"] or ""},
                     offering={"TOTALOFFERINGAMOUNT": row["TOTALOFFERINGAMOUNT"] or "", "INDUSTRYGROUP": row["INDUSTRYGROUP"] or ""},
                     submission={"FILED": row["FILED"] or ""},
                     raw_record={"LICENSED_EXTRACT": dict(row)},
                 ))
-            return tuple(signals)
+            return self._persist_drafts(drafts)
         except ConnectorError:
             raise
         except (csv.Error, ValueError, InvalidOperation):
@@ -261,17 +300,33 @@ class FormDConnector:
             submissions = self._unique_by_accession(tables["FORMDSUBMISSION"])
             issuers = self._issuers_by_accession(tables["ISSUERS"])
             offerings = self._unique_by_accession(tables["OFFERING"])
-            signals = []
+            recipients = self._rows_by_accession(
+                tables["RECIPIENTS"], "RECIPIENT_SEQ_KEY"
+            )
+            related_people = self._rows_by_accession(
+                tables["RELATEDPERSONS"], "RELATEDPERSON_SEQ_KEY"
+            )
+            signatures = self._rows_by_accession(
+                tables["SIGNATURES"], "SIGNATURE_SEQ_KEY"
+            )
+            drafts = []
             for accession, submission in submissions.items():
                 if accession not in issuers or accession not in offerings:
                     raise ValueError("joined Form D row is incomplete")
                 for issuer in issuers[accession]:
-                    raw_record = {"FORMDSUBMISSION": submission, "ISSUERS": issuer, "OFFERING": offerings[accession]}
-                    signals.append(self._signal(
+                    raw_record = {
+                        "FORMDSUBMISSION": submission,
+                        "ISSUERS": issuer,
+                        "OFFERING": offerings[accession],
+                        "RECIPIENTS": list(recipients.get(accession, ())),
+                        "RELATEDPERSONS": list(related_people.get(accession, ())),
+                        "SIGNATURES": list(signatures.get(accession, ())),
+                    }
+                    drafts.append(self._draft(
                         accession=accession, issuer=issuer, offering=offerings[accession],
                         submission=submission, raw_record=raw_record,
                     ))
-            return tuple(signals)
+            return self._persist_drafts(drafts)
         except ConnectorError:
             raise
         except (KeyError, ValueError, InvalidOperation):
@@ -303,6 +358,25 @@ class FormDConnector:
             grouped.setdefault(accession, []).append(row)
         return {
             accession: tuple(sorted(items, key=lambda item: item["ISSUER_SEQ_KEY"]))
+            for accession, items in grouped.items()
+        }
+
+    @staticmethod
+    def _rows_by_accession(
+        rows: tuple[dict[str, str], ...], sequence_field: str
+    ) -> dict[str, tuple[dict[str, str], ...]]:
+        grouped: dict[str, list[dict[str, str]]] = {}
+        seen = set()
+        for row in rows:
+            accession = _required(row, "ACCESSIONNUMBER")
+            sequence = _required(row, sequence_field)
+            key = (accession, sequence)
+            if key in seen:
+                raise ValueError("duplicate accession sequence key")
+            seen.add(key)
+            grouped.setdefault(accession, []).append(row)
+        return {
+            accession: tuple(sorted(items, key=lambda item: item[sequence_field]))
             for accession, items in grouped.items()
         }
 

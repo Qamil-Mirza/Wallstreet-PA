@@ -20,7 +20,8 @@ from .base import (
     EmergingSignal,
     PacedJSONTransport,
     SignalConnectorBatch,
-    persist_signal_evidence,
+    persist_signal_evidence_batch,
+    signal_evidence_input,
     validated_api_base_url,
 )
 from .fmp import install_fmp_log_redaction
@@ -133,7 +134,7 @@ class USPTOConnector:
             rows = data["patentFileWrapperDataBag"]
             if not isinstance(rows, list):
                 raise ValueError("results must be a list")
-            records: list[EmergingSignal] = []
+            drafts = []
             for row in rows:
                 if not isinstance(row, Mapping):
                     raise ValueError("result must be an object")
@@ -156,8 +157,7 @@ class USPTOConnector:
                 company = _text(
                     metadata.get("firstApplicantName"), "firstApplicantName"
                 )
-                document_id, passage_id = persist_signal_evidence(
-                    self.ingestor,
+                source = signal_evidence_input(
                     connector=self.name,
                     source_locator=locator,
                     source_url=f"{self.config.base_url}/{application}",
@@ -166,7 +166,13 @@ class USPTOConnector:
                     raw_record=row,
                     retrieved_at=self._retrieved_clock(),
                 )
-                records.append(
+                drafts.append((locator, effective_date, company, terms, source))
+            lineages = persist_signal_evidence_batch(
+                self.ingestor,
+                connector=self.name,
+                sources=tuple(draft[4] for draft in drafts),
+            )
+            return tuple(
                     EmergingSignal(
                         source_document_id=document_id,
                         source_locator=locator,
@@ -179,8 +185,9 @@ class USPTOConnector:
                         technology_terms=terms,
                         evidence_passage_id=passage_id,
                     )
-                )
-            return tuple(records)
+                for (locator, effective_date, company, terms, _),
+                (document_id, passage_id) in zip(drafts, lineages, strict=True)
+            )
         except ConnectorError:
             raise
         except (KeyError, TypeError, ValueError):

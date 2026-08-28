@@ -6,7 +6,7 @@ import re
 import json
 import threading
 import unicodedata
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, time, timezone
 from decimal import Decimal
@@ -58,13 +58,31 @@ def persist_signal_evidence(
     retrieved_at: datetime,
 ) -> tuple[str, str]:
     """Persist one exact raw signal record before exposing lineage IDs."""
+    source = signal_evidence_input(
+        connector=connector,
+        source_locator=source_locator,
+        source_url=source_url,
+        publisher=publisher,
+        effective_date=effective_date,
+        raw_record=raw_record,
+        retrieved_at=retrieved_at,
+    )
+    return persist_signal_evidence_batch(ingestor, connector=connector, sources=(source,))[0]
+
+
+def signal_evidence_input(
+    *,
+    connector: str,
+    source_locator: str,
+    source_url: str,
+    publisher: str,
+    effective_date: date,
+    raw_record: Mapping[str, object],
+    retrieved_at: datetime,
+) -> DocumentInput:
+    """Validate and serialize one raw signal record without persisting it."""
     _connector_name(connector)
-    if ingestor is None:
-        raise ConnectorError(
-            connector, retryable=False, diagnostic_code="evidence_sink_missing"
-        )
-    if not isinstance(ingestor, EvidenceIngestor):
-        raise TypeError("ingestor must be EvidenceIngestor or None")
+    _nonblank(source_locator, "source_locator")
     if not isinstance(raw_record, Mapping):
         raise TypeError("raw_record must be a mapping")
     if (
@@ -84,32 +102,53 @@ def persist_signal_evidence(
         raise ConnectorError(
             connector, retryable=False, diagnostic_code="invalid_payload"
         ) from None
-    try:
-        document = ingestor.ingest(
-            DocumentInput(
-                source_type=connector,
-                url=source_url,
-                publisher=publisher,
-                published_at=datetime.combine(
-                    effective_date, time.min, tzinfo=timezone.utc
-                ),
-                retrieved_at=retrieved_at,
-                content=content,
-            )
+    return DocumentInput(
+        source_type=connector,
+        url=source_url,
+        publisher=publisher,
+        published_at=datetime.combine(
+            effective_date, time.min, tzinfo=timezone.utc
+        ),
+        retrieved_at=retrieved_at,
+        content=content,
+    )
+
+
+def persist_signal_evidence_batch(
+    ingestor: EvidenceIngestor | None,
+    *,
+    connector: str,
+    sources: Sequence[DocumentInput],
+) -> tuple[tuple[str, str], ...]:
+    """Atomically persist an ordered batch before exposing lineage IDs."""
+    _connector_name(connector)
+    source_records = tuple(sources)
+    if not source_records:
+        return ()
+    if ingestor is None:
+        raise ConnectorError(
+            connector, retryable=False, diagnostic_code="evidence_sink_missing"
         )
+    if not isinstance(ingestor, EvidenceIngestor):
+        raise TypeError("ingestor must be EvidenceIngestor or None")
+    try:
+        documents = ingestor.ingest_batch(source_records)
     except EvidenceError:
         raise ConnectorError(
             connector,
             retryable=False,
             diagnostic_code="evidence_persistence_failed",
         ) from None
-    if not document.passages:
+    if any(not document.passages for document in documents):
         raise ConnectorError(
             connector,
             retryable=False,
             diagnostic_code="evidence_persistence_failed",
         )
-    return document.document_id, document.passages[0].passage_id
+    return tuple(
+        (document.document_id, document.passages[0].passage_id)
+        for document in documents
+    )
 
 
 @dataclass(frozen=True)

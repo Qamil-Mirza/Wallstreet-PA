@@ -388,58 +388,76 @@ class EvidenceIngestor:
 
     def ingest(self, source: DocumentInput) -> IngestedDocument:
         """Canonicalize and atomically persist one idempotent source document."""
-        canonical_url = canonicalize_url(source.url)
-        text = canonicalize_content(source.content)
-        encoded = text.encode("utf-8")
-        digest = hashlib.sha256(encoded).hexdigest()
-        document_id = f"document_{digest}"
-        cached_path = self._cache(digest, encoded)
-        passages = _split_passages(text, document_id)
-        document = SourceDocument(
-            document_id=document_id,
-            source_type=source.source_type,
-            canonical_url=canonical_url,
-            publisher=source.publisher,
-            published_at=source.published_at,
-            retrieved_at=source.retrieved_at,
-            content_hash=digest,
-            raw_content_path=str(cached_path),
-            extraction_status="complete",
-        )
+        return self.ingest_batch((source,))[0]
+
+    def ingest_batch(
+        self, sources: Sequence[DocumentInput]
+    ) -> tuple[IngestedDocument, ...]:
+        """Cache then atomically persist an ordered source-document batch.
+
+        Cache publication intentionally precedes the database transaction.
+        Content-addressed cache artifacts are immutable and reusable if the
+        database transaction subsequently rolls back.
+        """
+        source_records = tuple(sources)
+        if any(not isinstance(source, DocumentInput) for source in source_records):
+            raise TypeError("sources must contain only DocumentInput records")
+        prepared = []
+        cached_paths: dict[str, Path] = {}
+        for source in source_records:
+            canonical_url = canonicalize_url(source.url)
+            text = canonicalize_content(source.content)
+            encoded = text.encode("utf-8")
+            digest = hashlib.sha256(encoded).hexdigest()
+            document_id = f"document_{digest}"
+            cached_path = self._cache(digest, encoded)
+            cached_paths[digest] = cached_path
+            passages = _split_passages(text, document_id)
+            document = SourceDocument(
+                document_id=document_id,
+                source_type=source.source_type,
+                canonical_url=canonical_url,
+                publisher=source.publisher,
+                published_at=source.published_at,
+                retrieved_at=source.retrieved_at,
+                content_hash=digest,
+                raw_content_path=str(cached_path),
+                extraction_status="complete",
+            )
+            prepared.append(
+                (
+                    document,
+                    tuple(
+                        DocumentPassageRecord(
+                            passage_id=item.passage_id,
+                            document_id=item.document_id,
+                            ordinal=item.ordinal,
+                            text=item.text,
+                            content_hash=item.content_hash,
+                            start_offset=item.start_offset,
+                            end_offset=item.end_offset,
+                        )
+                        for item in passages
+                    ),
+                )
+            )
         try:
-            self.store.insert_document_with_passages(
-                document,
-                tuple(
-                    DocumentPassageRecord(
-                        passage_id=item.passage_id,
-                        document_id=item.document_id,
-                        ordinal=item.ordinal,
-                        text=item.text,
-                        content_hash=item.content_hash,
-                        start_offset=item.start_offset,
-                        end_offset=item.end_offset,
-                    )
-                    for item in passages
-                ),
-            )
-            stored_document = self.store.get_document_by_content_hash(digest)
-            stored_passages = (
-                self.store.list_document_passages(stored_document.document_id)
-                if stored_document is not None
-                else ()
-            )
+            stored_records = self.store.insert_documents_with_passages(prepared)
         except sqlite3.Error:
             raise EvidencePersistenceError(
                 "canonical evidence could not be persisted"
             ) from None
-        if stored_document is None:
-            raise EvidencePersistenceError("canonical evidence could not be loaded")
-        return IngestedDocument(
-            document_id=stored_document.document_id,
-            canonical_url=stored_document.canonical_url,
-            content_hash=stored_document.content_hash,
-            raw_content_path=Path(stored_document.raw_content_path or cached_path),
-            passages=tuple(EvidencePassage(**vars(item)) for item in stored_passages),
+        return tuple(
+            IngestedDocument(
+                document_id=document.document_id,
+                canonical_url=document.canonical_url,
+                content_hash=document.content_hash,
+                raw_content_path=Path(
+                    document.raw_content_path or cached_paths[document.content_hash]
+                ),
+                passages=tuple(EvidencePassage(**vars(item)) for item in passages),
+            )
+            for document, passages in stored_records
         )
 
     def add_claim(

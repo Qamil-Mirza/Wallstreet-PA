@@ -16,7 +16,8 @@ from .base import (
     ConnectorError,
     EmergingSignal,
     SignalConnectorBatch,
-    persist_signal_evidence,
+    persist_signal_evidence_batch,
+    signal_evidence_input,
 )
 
 
@@ -91,7 +92,7 @@ class ManualImportConnector:
                 raise ConnectorError(
                     self.name, retryable=False, diagnostic_code="invalid_schema"
                 )
-            records: list[EmergingSignal] = []
+            drafts = []
             for row in reader:
                 if None in row or set(row) != set(_FIELDS):
                     raise ValueError("row shape does not match schema")
@@ -124,8 +125,7 @@ class ManualImportConnector:
                 company = _text(row["company"], "company") or ""
                 stage = _text(row["stage"], "stage", required=False)
                 geography = _text(row["geography"], "geography", required=False)
-                document_id, passage_id = persist_signal_evidence(
-                    self.ingestor,
+                source = signal_evidence_input(
                     connector=self.name,
                     source_locator=locator,
                     source_url=(
@@ -137,7 +137,24 @@ class ManualImportConnector:
                     raw_record=row,
                     retrieved_at=self._retrieved_clock(),
                 )
-                records.append(
+                drafts.append(
+                    (
+                        locator,
+                        effective_date,
+                        company,
+                        amount,
+                        stage,
+                        geography,
+                        terms,
+                        source,
+                    )
+                )
+            lineages = persist_signal_evidence_batch(
+                self.ingestor,
+                connector=self.name,
+                sources=tuple(draft[7] for draft in drafts),
+            )
+            return tuple(
                     EmergingSignal(
                         source_document_id=document_id,
                         source_locator=locator,
@@ -150,8 +167,17 @@ class ManualImportConnector:
                         technology_terms=terms,
                         evidence_passage_id=passage_id,
                     )
-                )
-            return tuple(records)
+                for (
+                    locator,
+                    effective_date,
+                    company,
+                    amount,
+                    stage,
+                    geography,
+                    terms,
+                    _,
+                ), (document_id, passage_id) in zip(drafts, lineages, strict=True)
+            )
         except ConnectorError:
             raise
         except (csv.Error, ValueError, InvalidOperation):

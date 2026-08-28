@@ -394,80 +394,123 @@ class ResearchStore:
         passages: Sequence[DocumentPassageRecord],
     ) -> None:
         """Atomically persist an idempotent document and all exact passages."""
-        passage_records = tuple(passages)
-        if any(item.document_id != document.document_id for item in passage_records):
-            raise sqlite3.IntegrityError("passage document_id does not match document")
-        expected_ordinals = tuple(range(len(passage_records)))
-        if tuple(item.ordinal for item in passage_records) != expected_ordinals:
-            raise sqlite3.IntegrityError("passage ordinals must be contiguous")
+        self.insert_documents_with_passages(((document, passages),))
 
-        document_values = (
-            document.document_id,
-            document.source_type,
-            document.canonical_url,
-            document.publisher,
-            _utc_text(document.published_at, "SourceDocument.published_at"),
-            _utc_text(document.retrieved_at, "SourceDocument.retrieved_at"),
-            document.content_hash,
-            document.raw_content_path,
-            document.extraction_status,
-        )
-        passage_values = tuple(
-            (
-                passage.passage_id,
-                passage.document_id,
-                passage.ordinal,
-                passage.text,
-                passage.content_hash,
-                _canonical_json(
-                    {
-                        "end_offset": passage.end_offset,
-                        "start_offset": passage.start_offset,
-                    }
-                ),
-            )
-            for passage in passage_records
-        )
+    def insert_documents_with_passages(
+        self,
+        records: Sequence[tuple[SourceDocument, Sequence[DocumentPassageRecord]]],
+    ) -> tuple[tuple[SourceDocument, tuple[DocumentPassageRecord, ...]], ...]:
+        """Persist a complete evidence batch in one SQLite transaction.
 
-        with self.transaction() as connection:
-            existing = connection.execute(
-                "SELECT document_id, source_type, canonical_url, publisher, "
-                "published_at, retrieved_at, content_hash, raw_content_path, "
-                "extraction_status FROM source_documents WHERE content_hash = ?",
-                (document.content_hash,),
-            ).fetchone()
-            if existing is not None:
-                stored_passages = tuple(
-                    connection.execute(
-                        "SELECT passage_id, document_id, ordinal, text, content_hash, "
-                        "locator_json FROM document_passages WHERE document_id = ? "
-                        "ORDER BY ordinal",
-                        (existing[0],),
-                    ).fetchall()
-                )
-                if (
-                    existing[0] == document.document_id
-                    and stored_passages == passage_values
-                ):
-                    return
+        Content-addressed cache files may already exist when this transaction
+        rolls back. They are immutable and reusable by a later ingestion.
+        """
+        prepared = []
+        for document, passages in records:
+            passage_records = tuple(passages)
+            if any(item.document_id != document.document_id for item in passage_records):
                 raise sqlite3.IntegrityError(
-                    "conflicting document content already exists"
+                    "passage document_id does not match document"
                 )
+            if tuple(item.ordinal for item in passage_records) != tuple(
+                range(len(passage_records))
+            ):
+                raise sqlite3.IntegrityError("passage ordinals must be contiguous")
+            document_values = (
+                document.document_id,
+                document.source_type,
+                document.canonical_url,
+                document.publisher,
+                _utc_text(document.published_at, "SourceDocument.published_at"),
+                _utc_text(document.retrieved_at, "SourceDocument.retrieved_at"),
+                document.content_hash,
+                document.raw_content_path,
+                document.extraction_status,
+            )
+            passage_values = tuple(
+                (
+                    passage.passage_id,
+                    passage.document_id,
+                    passage.ordinal,
+                    passage.text,
+                    passage.content_hash,
+                    _canonical_json(
+                        {
+                            "end_offset": passage.end_offset,
+                            "start_offset": passage.start_offset,
+                        }
+                    ),
+                )
+                for passage in passage_records
+            )
+            prepared.append(
+                (document, passage_records, document_values, passage_values)
+            )
 
-            created_at = _utc_text(datetime.now(timezone.utc))
-            connection.execute(
-                "INSERT INTO source_documents ("
-                "document_id, source_type, canonical_url, publisher, published_at, "
-                "retrieved_at, content_hash, raw_content_path, extraction_status, "
-                "created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (*document_values, created_at),
-            )
-            connection.executemany(
-                "INSERT INTO document_passages ("
-                "passage_id, document_id, ordinal, text, content_hash, locator_json, "
-                "created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                ((*values, created_at) for values in passage_values),
-            )
+        stored_records = []
+        with self.transaction() as connection:
+            for document, passage_records, document_values, passage_values in prepared:
+                existing = connection.execute(
+                    "SELECT document_id, source_type, canonical_url, publisher, "
+                    "published_at, retrieved_at, content_hash, raw_content_path, "
+                    "extraction_status FROM source_documents WHERE content_hash = ?",
+                    (document.content_hash,),
+                ).fetchone()
+                if existing is not None:
+                    stored_rows = tuple(
+                        connection.execute(
+                            "SELECT passage_id, document_id, ordinal, text, content_hash, "
+                            "locator_json FROM document_passages WHERE document_id = ? "
+                            "ORDER BY ordinal",
+                            (existing[0],),
+                        ).fetchall()
+                    )
+                    if existing[0] != document.document_id or stored_rows != passage_values:
+                        raise sqlite3.IntegrityError(
+                            "conflicting document content already exists"
+                        )
+                    stored_document = SourceDocument(
+                        document_id=existing[0],
+                        source_type=existing[1],
+                        canonical_url=existing[2],
+                        publisher=existing[3],
+                        published_at=_parse_utc(existing[4]),
+                        retrieved_at=_parse_utc(existing[5]),
+                        content_hash=existing[6],
+                        raw_content_path=existing[7],
+                        extraction_status=existing[8],
+                    )
+                    stored_passages = tuple(
+                        DocumentPassageRecord(
+                            passage_id=row[0],
+                            document_id=row[1],
+                            ordinal=row[2],
+                            text=row[3],
+                            content_hash=row[4],
+                            start_offset=json.loads(row[5])["start_offset"],
+                            end_offset=json.loads(row[5])["end_offset"],
+                        )
+                        for row in stored_rows
+                    )
+                    stored_records.append((stored_document, stored_passages))
+                    continue
+
+                created_at = _utc_text(datetime.now(timezone.utc))
+                connection.execute(
+                    "INSERT INTO source_documents ("
+                    "document_id, source_type, canonical_url, publisher, published_at, "
+                    "retrieved_at, content_hash, raw_content_path, extraction_status, "
+                    "created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (*document_values, created_at),
+                )
+                connection.executemany(
+                    "INSERT INTO document_passages ("
+                    "passage_id, document_id, ordinal, text, content_hash, locator_json, "
+                    "created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    ((*values, created_at) for values in passage_values),
+                )
+                stored_records.append((document, passage_records))
+        return tuple(stored_records)
 
     def get_document_by_content_hash(
         self, content_hash: str

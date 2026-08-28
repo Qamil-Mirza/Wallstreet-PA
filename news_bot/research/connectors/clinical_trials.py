@@ -20,7 +20,8 @@ from .base import (
     EmergingSignal,
     PacedJSONTransport,
     SignalConnectorBatch,
-    persist_signal_evidence,
+    persist_signal_evidence_batch,
+    signal_evidence_input,
     validated_api_base_url,
 )
 
@@ -122,7 +123,7 @@ class ClinicalTrialsConnector:
             studies = data["studies"]
             if not isinstance(studies, list):
                 raise ValueError("studies must be a list")
-            records: list[EmergingSignal] = []
+            drafts = []
             for study in studies:
                 if not isinstance(study, Mapping):
                     raise ValueError("study must be an object")
@@ -172,8 +173,7 @@ class ClinicalTrialsConnector:
                     organization.get("fullName"), "organization.fullName"
                 )
                 stage = _text(status.get("overallStatus"), "overallStatus")
-                document_id, passage_id = persist_signal_evidence(
-                    self.ingestor,
+                source = signal_evidence_input(
                     connector=self.name,
                     source_locator=locator,
                     source_url=f"{self.config.base_url}/studies/{nct_id}",
@@ -182,7 +182,23 @@ class ClinicalTrialsConnector:
                     raw_record=study,
                     retrieved_at=self._retrieved_clock(),
                 )
-                records.append(
+                drafts.append(
+                    (
+                        locator,
+                        effective_date,
+                        company,
+                        stage,
+                        geography,
+                        tuple(terms),
+                        source,
+                    )
+                )
+            lineages = persist_signal_evidence_batch(
+                self.ingestor,
+                connector=self.name,
+                sources=tuple(draft[6] for draft in drafts),
+            )
+            return tuple(
                     EmergingSignal(
                         source_document_id=document_id,
                         source_locator=locator,
@@ -192,11 +208,19 @@ class ClinicalTrialsConnector:
                         stage=stage,
                         effective_date=effective_date,
                         geography=geography,
-                        technology_terms=tuple(terms),
+                        technology_terms=terms,
                         evidence_passage_id=passage_id,
                     )
-                )
-            return tuple(records)
+                for (
+                    locator,
+                    effective_date,
+                    company,
+                    stage,
+                    geography,
+                    terms,
+                    _,
+                ), (document_id, passage_id) in zip(drafts, lineages, strict=True)
+            )
         except ConnectorError:
             raise
         except (KeyError, TypeError, ValueError):

@@ -23,7 +23,8 @@ from .base import (
     EmergingSignal,
     PacedJSONTransport,
     SignalConnectorBatch,
-    persist_signal_evidence,
+    persist_signal_evidence_batch,
+    signal_evidence_input,
     validated_api_base_url,
 )
 from .fmp import install_fmp_log_redaction
@@ -195,7 +196,7 @@ class SBIRConnector(_APIConnector):
             rows = data["awards"] if isinstance(data, Mapping) else data
             if not isinstance(rows, list):
                 raise ValueError("awards must be a list")
-            records: list[EmergingSignal] = []
+            drafts = []
             for row in rows:
                 if not isinstance(row, Mapping):
                     raise ValueError("award must be an object")
@@ -233,8 +234,7 @@ class SBIRConnector(_APIConnector):
                 )
                 company = _text(row.get("firm"), "firm")
                 amount = _amount(row.get("award_amount"))
-                document_id, passage_id = persist_signal_evidence(
-                    self.ingestor,
+                source = signal_evidence_input(
                     connector=self.name,
                     source_locator=locator,
                     source_url=(
@@ -245,7 +245,24 @@ class SBIRConnector(_APIConnector):
                     raw_record=row,
                     retrieved_at=self._retrieved_clock(),
                 )
-                records.append(
+                drafts.append(
+                    (
+                        locator,
+                        effective_date,
+                        company,
+                        amount,
+                        stage,
+                        geography,
+                        terms,
+                        source,
+                    )
+                )
+            lineages = persist_signal_evidence_batch(
+                self.ingestor,
+                connector=self.name,
+                sources=tuple(draft[7] for draft in drafts),
+            )
+            return tuple(
                     EmergingSignal(
                         source_document_id=document_id,
                         source_locator=locator,
@@ -258,8 +275,17 @@ class SBIRConnector(_APIConnector):
                         technology_terms=tuple(terms),
                         evidence_passage_id=passage_id,
                     )
-                )
-            return tuple(records)
+                for (
+                    locator,
+                    effective_date,
+                    company,
+                    amount,
+                    stage,
+                    geography,
+                    terms,
+                    _,
+                ), (document_id, passage_id) in zip(drafts, lineages, strict=True)
+            )
         except ConnectorError:
             raise
         except (KeyError, TypeError, ValueError):
@@ -392,7 +418,7 @@ class USASpendingConnector(_APIConnector):
             rows = data["results"]
             if not isinstance(rows, list):
                 raise ValueError("results must be a list")
-            records: list[EmergingSignal] = []
+            drafts = []
             for row in rows:
                 if not isinstance(row, Mapping):
                     raise ValueError("award must be an object")
@@ -417,8 +443,7 @@ class USASpendingConnector(_APIConnector):
                 )
                 company = _text(row.get("Recipient Name"), "Recipient Name")
                 amount = _amount(row.get("Award Amount"))
-                document_id, passage_id = persist_signal_evidence(
-                    self.ingestor,
+                source = signal_evidence_input(
                     connector=self.name,
                     source_locator=locator,
                     source_url=(
@@ -429,7 +454,23 @@ class USASpendingConnector(_APIConnector):
                     raw_record=row,
                     retrieved_at=self._retrieved_clock(),
                 )
-                records.append(
+                drafts.append(
+                    (
+                        locator,
+                        effective_date,
+                        company,
+                        amount,
+                        geography,
+                        tuple(terms),
+                        source,
+                    )
+                )
+            lineages = persist_signal_evidence_batch(
+                self.ingestor,
+                connector=self.name,
+                sources=tuple(draft[6] for draft in drafts),
+            )
+            return tuple(
                     EmergingSignal(
                         source_document_id=document_id,
                         source_locator=locator,
@@ -439,11 +480,19 @@ class USASpendingConnector(_APIConnector):
                         stage=None,
                         effective_date=effective_date,
                         geography=geography,
-                        technology_terms=tuple(terms),
+                        technology_terms=terms,
                         evidence_passage_id=passage_id,
                     )
-                )
-            return tuple(records)
+                for (
+                    locator,
+                    effective_date,
+                    company,
+                    amount,
+                    geography,
+                    terms,
+                    _,
+                ), (document_id, passage_id) in zip(drafts, lineages, strict=True)
+            )
         except ConnectorError:
             raise
         except (KeyError, TypeError, ValueError):
