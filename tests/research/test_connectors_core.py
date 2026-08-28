@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
 from datetime import date, datetime, timezone
 from decimal import Decimal
@@ -28,6 +29,14 @@ from news_bot.research.connectors.news import (
     RSSResearchConnector,
 )
 from news_bot.research.connectors.sec import SECConfig, SECConnector
+from news_bot.research.evidence import (
+    DocumentInput,
+    EvidenceCacheError,
+    EvidenceIngestor,
+    EvidencePersistenceError,
+)
+from news_bot.research.models import SourceDocument
+from news_bot.research.store import ResearchStore
 
 
 NOW = datetime(2026, 8, 24, 12, tzinfo=timezone.utc)
@@ -151,6 +160,173 @@ def test_failed_batch_persistence_does_not_advance_checkpoint():
         )
 
     assert advanced == []
+
+
+def _research_document(*, url: str, content: str, tag: str):
+    return NormalizedResearchDocument(
+        evidence=DocumentInput(
+            source_type="test_feed",
+            url=url,
+            publisher="Test Publisher",
+            published_at=NOW,
+            retrieved_at=NOW,
+            content=content,
+        ),
+        tags=(tag,),
+    )
+
+
+def _evidence_sink(tmp_path):
+    store = ResearchStore(tmp_path / "research.db")
+    store.migrate()
+    return EvidenceIngestor(store, tmp_path / "cache")
+
+
+def test_ingestor_batch_is_called_once_in_document_order_and_checkpoint_commits_last(
+    tmp_path, monkeypatch
+):
+    ingestor = _evidence_sink(tmp_path)
+    documents = (
+        _research_document(
+            url="https://example.test/first", content="First record.", tag="portfolio"
+        ),
+        _research_document(
+            url="https://example.test/second", content="Second record.", tag="market"
+        ),
+    )
+    batch = ConnectorBatch(
+        "sec", documents, ConnectorCheckpoint("sec", cursor="next")
+    )
+    events = []
+    real_ingest_batch = ingestor.ingest_batch
+
+    def record_batch(sources):
+        events.append(("documents", tuple(source.url for source in sources)))
+        return real_ingest_batch(sources)
+
+    monkeypatch.setattr(ingestor, "ingest_batch", record_batch)
+
+    ingested = commit_connector_batch(
+        batch,
+        ingestor=ingestor,
+        persist_checkpoint=lambda checkpoint: events.append(
+            ("checkpoint", checkpoint.cursor)
+        ),
+    )
+
+    assert events == [
+        (
+            "documents",
+            ("https://example.test/first", "https://example.test/second"),
+        ),
+        ("checkpoint", "next"),
+    ]
+    assert tuple(document.canonical_url for document in ingested) == (
+        "https://example.test/first",
+        "https://example.test/second",
+    )
+    assert tuple(document.tags for document in batch.documents) == (
+        ("portfolio",),
+        ("market",),
+    )
+
+
+def test_later_document_conflict_rolls_back_connector_batch_and_checkpoint(tmp_path):
+    ingestor = _evidence_sink(tmp_path)
+    conflict_content = "Second private record."
+    conflict_hash = hashlib.sha256(conflict_content.encode()).hexdigest()
+    ingestor.store.insert_source_document(
+        SourceDocument(
+            document_id="document_conflict",
+            source_type="preexisting",
+            canonical_url="https://example.test/preexisting",
+            publisher="Existing Publisher",
+            published_at=NOW,
+            retrieved_at=NOW,
+            content_hash=conflict_hash,
+            raw_content_path=None,
+            extraction_status="complete",
+        )
+    )
+    batch = ConnectorBatch(
+        "sec",
+        (
+            _research_document(
+                url="https://example.test/first",
+                content="First public record.",
+                tag="portfolio",
+            ),
+            _research_document(
+                url="https://example.test/second",
+                content=conflict_content,
+                tag="market",
+            ),
+        ),
+        ConnectorCheckpoint("sec", cursor="next"),
+    )
+    checkpoints = []
+
+    with pytest.raises(EvidencePersistenceError):
+        commit_connector_batch(
+            batch, ingestor=ingestor, persist_checkpoint=checkpoints.append
+        )
+
+    with ingestor.store.connect() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM source_documents"
+        ).fetchone() == (1,)
+        assert connection.execute(
+            "SELECT COUNT(*) FROM document_passages"
+        ).fetchone() == (0,)
+    assert checkpoints == []
+
+
+def test_later_cache_failure_persists_no_connector_evidence_or_checkpoint(
+    tmp_path, monkeypatch
+):
+    ingestor = _evidence_sink(tmp_path)
+    batch = ConnectorBatch(
+        "sec",
+        (
+            _research_document(
+                url="https://example.test/first",
+                content="First public record.",
+                tag="portfolio",
+            ),
+            _research_document(
+                url="https://example.test/second",
+                content="Second public record.",
+                tag="market",
+            ),
+        ),
+        ConnectorCheckpoint("sec", cursor="next"),
+    )
+    real_cache = ingestor._cache
+    cache_calls = 0
+
+    def fail_second_cache(content_hash, content):
+        nonlocal cache_calls
+        cache_calls += 1
+        if cache_calls == 2:
+            raise EvidenceCacheError("private-cache-path")
+        return real_cache(content_hash, content)
+
+    monkeypatch.setattr(ingestor, "_cache", fail_second_cache)
+    checkpoints = []
+
+    with pytest.raises(EvidenceCacheError):
+        commit_connector_batch(
+            batch, ingestor=ingestor, persist_checkpoint=checkpoints.append
+        )
+
+    with ingestor.store.connect() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM source_documents"
+        ).fetchone() == (0,)
+        assert connection.execute(
+            "SELECT COUNT(*) FROM document_passages"
+        ).fetchone() == (0,)
+    assert checkpoints == []
 
 
 def test_connector_errors_are_structured_and_secret_safe():

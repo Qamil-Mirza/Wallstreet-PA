@@ -323,6 +323,193 @@ def test_empty_api_result_preserves_checkpoint():
     assert batch.next_checkpoint == checkpoint
 
 
+def _clinical_study(*, nct_id: str, submitted: str):
+    study = json.loads(fixture("clinical_trials_sample.json"))["studies"][0]
+    study["protocolSection"]["identificationModule"]["nctId"] = nct_id
+    study["protocolSection"]["statusModule"]["studyFirstSubmitDate"] = submitted
+    return study
+
+
+def _usaspending_award(*, award_id: str, start_date: str):
+    award = json.loads(fixture("usaspending_sample.json"))["results"][0]
+    award["Award ID"] = award_id
+    award["Start Date"] = start_date
+    return award
+
+
+def test_clinical_trials_terminal_page_resets_token_and_next_run_emits_only_new_first_page(
+    tmp_path,
+):
+    old = _clinical_study(nct_id="NCT00000002", submitted="2026-08-16")
+    older = _clinical_study(nct_id="NCT00000001", submitted="2026-08-15")
+    new = _clinical_study(nct_id="NCT00000003", submitted="2026-08-20")
+    session = Session(
+        [
+            Response(
+                {"studies": [old], "nextPageToken": "private-page-token"},
+                url="https://clinicaltrials.gov/api/v2/studies",
+            ),
+            Response(
+                {"studies": [older]},
+                url="https://clinicaltrials.gov/api/v2/studies",
+            ),
+            Response(
+                {"studies": [new, old]},
+                url="https://clinicaltrials.gov/api/v2/studies",
+            ),
+            Response(
+                {"studies": []},
+                url="https://clinicaltrials.gov/api/v2/studies",
+            ),
+        ]
+    )
+    connector = ClinicalTrialsConnector(
+        session=session,
+        query="robotics",
+        ingestor=make_ingestor(tmp_path),
+        clock=lambda: 100.0,
+        sleeper=lambda _: None,
+    )
+
+    first = connector.fetch(ConnectorCheckpoint("clinical_trials"))
+    second = connector.fetch(first.next_checkpoint)
+    terminal_state = json.loads(second.next_checkpoint.cursor)
+    third = connector.fetch(second.next_checkpoint)
+    empty = connector.fetch(third.next_checkpoint)
+
+    assert json.loads(first.next_checkpoint.cursor)["continuation"] == "private-page-token"
+    assert terminal_state == {
+        "candidate": None,
+        "continuation": None,
+        "version": 1,
+        "watermark": {
+            "effective_date": "2026-08-16",
+            "record_id": "NCT00000002",
+        },
+    }
+    assert "pageToken" not in session.calls[2][2]["params"]
+    assert [signal.source_locator for signal in third.signals] == [
+        "clinicaltrials:NCT00000003"
+    ]
+    assert empty.signals == ()
+    assert empty.next_checkpoint == third.next_checkpoint
+
+
+def test_usaspending_terminal_page_resets_page_and_next_run_emits_only_new_first_page(
+    tmp_path,
+):
+    old = _usaspending_award(award_id="AWARD-002", start_date="2026-08-17")
+    older = _usaspending_award(award_id="AWARD-001", start_date="2026-08-16")
+    new = _usaspending_award(award_id="AWARD-003", start_date="2026-08-21")
+    session = Session(
+        [
+            Response(
+                {"results": [old], "page_metadata": {"next": 2}},
+                url="https://api.usaspending.gov/api/v2/search/spending_by_award/",
+            ),
+            Response(
+                {"results": [older], "page_metadata": {"next": None}},
+                url="https://api.usaspending.gov/api/v2/search/spending_by_award/",
+            ),
+            Response(
+                {"results": [new, old], "page_metadata": {"next": None}},
+                url="https://api.usaspending.gov/api/v2/search/spending_by_award/",
+            ),
+            Response(
+                {"results": [], "page_metadata": {"next": None}},
+                url="https://api.usaspending.gov/api/v2/search/spending_by_award/",
+            ),
+        ]
+    )
+    connector = USASpendingConnector(
+        session=session,
+        query="robotics",
+        ingestor=make_ingestor(tmp_path),
+        clock=lambda: 100.0,
+        sleeper=lambda _: None,
+    )
+
+    first = connector.fetch(ConnectorCheckpoint("usaspending"))
+    second = connector.fetch(first.next_checkpoint)
+    terminal_state = json.loads(second.next_checkpoint.cursor)
+    third = connector.fetch(second.next_checkpoint)
+    empty = connector.fetch(third.next_checkpoint)
+
+    assert json.loads(first.next_checkpoint.cursor)["continuation"] == "2"
+    assert terminal_state == {
+        "candidate": None,
+        "continuation": None,
+        "version": 1,
+        "watermark": {
+            "effective_date": "2026-08-17",
+            "record_id": "AWARD-002",
+        },
+    }
+    assert [call[2]["json"]["page"] for call in session.calls] == [1, 2, 1, 1]
+    assert [signal.source_locator for signal in third.signals] == [
+        "usaspending-award:AWARD-003"
+    ]
+    assert empty.signals == ()
+    assert empty.next_checkpoint == third.next_checkpoint
+
+
+@pytest.mark.parametrize("connector_name", ["clinical_trials", "usaspending"])
+def test_paginated_signal_connectors_reject_malformed_versioned_cursor_redacted(
+    connector_name,
+):
+    secret_cursor = '{"version":1,"continuation":"private-token"'
+    checkpoint = ConnectorCheckpoint(connector_name, cursor=secret_cursor)
+    session = Session([])
+    if connector_name == "clinical_trials":
+        connector = ClinicalTrialsConnector(session=session, query="robotics")
+    else:
+        connector = USASpendingConnector(session=session, query="robotics")
+
+    with pytest.raises(ConnectorError) as error:
+        connector.fetch(checkpoint)
+
+    assert error.value.diagnostic_code == "invalid_checkpoint"
+    assert "private-token" not in str(error.value)
+    assert session.calls == []
+
+
+@pytest.mark.parametrize("connector_name", ["clinical_trials", "usaspending"])
+def test_paginated_signal_maintenance_preserves_versioned_checkpoint(connector_name):
+    cursor = json.dumps(
+        {
+            "candidate": {
+                "effective_date": "2026-08-20",
+                "record_id": "stable-id",
+            },
+            "continuation": "2",
+            "version": 1,
+            "watermark": {
+                "effective_date": "2026-08-10",
+                "record_id": "prior-id",
+            },
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    checkpoint = ConnectorCheckpoint(connector_name, cursor=cursor)
+    url = (
+        "https://clinicaltrials.gov/api/v2/studies"
+        if connector_name == "clinical_trials"
+        else "https://api.usaspending.gov/api/v2/search/spending_by_award/"
+    )
+    session = Session([Response({}, url=url, status=503)])
+    if connector_name == "clinical_trials":
+        connector = ClinicalTrialsConnector(session=session, query="robotics")
+    else:
+        connector = USASpendingConnector(session=session, query="robotics")
+
+    batch = connector.fetch(checkpoint)
+
+    assert batch.signals == ()
+    assert batch.next_checkpoint == checkpoint
+    assert batch.status.diagnostic_code == "maintenance"
+
+
 def test_usaspending_uses_documented_post_schema_and_exact_host(tmp_path):
     response = Response(
         json.loads(fixture("usaspending_sample.json")),
@@ -474,14 +661,13 @@ def test_download_and_manual_sources_implement_typed_checkpoint_fetch(tmp_path):
 
 def test_empty_download_batch_never_advances_checkpoint(tmp_path):
     archive = official_form_d_zip()
-    # Remove the only submission while retaining the six documented tables.
+    # Retain all six documented tables while removing the complete filing.
     source = zipfile.ZipFile(io.BytesIO(archive))
     rebuilt = io.BytesIO()
     with source, zipfile.ZipFile(rebuilt, "w", zipfile.ZIP_DEFLATED) as target:
         for item in source.infolist():
             content = source.read(item)
-            if Path(item.filename).stem.upper() == "FORMDSUBMISSION":
-                content = content.splitlines(keepends=True)[0]
+            content = content.splitlines(keepends=True)[0]
             target.writestr(item.filename, content)
     archive = rebuilt.getvalue()
     checkpoint = ConnectorCheckpoint("form_d", cursor="2026Q2")

@@ -18,6 +18,7 @@ from .base import (
     ConnectorError,
     ConnectorStatus,
     EmergingSignal,
+    IncrementalPageCursor,
     PacedJSONTransport,
     SignalConnectorBatch,
     persist_signal_evidence_batch,
@@ -52,6 +53,24 @@ def _json_mapping(value: str | bytes | Mapping[str, object]) -> Mapping[str, obj
             "clinical_trials", retryable=False, diagnostic_code="invalid_payload"
         )
     return decoded
+
+
+def _study_marker(study: object) -> tuple[date, str]:
+    if not isinstance(study, Mapping):
+        raise ValueError("study must be an object")
+    protocol = study.get("protocolSection")
+    if not isinstance(protocol, Mapping):
+        raise ValueError("protocolSection must be an object")
+    identity = protocol.get("identificationModule")
+    status = protocol.get("statusModule")
+    if not isinstance(identity, Mapping) or not isinstance(status, Mapping):
+        raise ValueError("protocol modules must be objects")
+    return (
+        date.fromisoformat(
+            _text(status.get("studyFirstSubmitDate"), "studyFirstSubmitDate")
+        ),
+        _text(identity.get("nctId"), "nctId"),
+    )
 
 
 @dataclass(frozen=True)
@@ -237,9 +256,12 @@ class ClinicalTrialsConnector:
                 retryable=False,
                 diagnostic_code="request_context_missing",
             )
+        cursor = IncrementalPageCursor.parse(
+            checkpoint.cursor, connector=self.name
+        )
         params: dict[str, object] = {"query.term": self.query, "format": "json"}
-        if checkpoint.cursor is not None:
-            params["pageToken"] = checkpoint.cursor
+        if cursor.continuation is not None:
+            params["pageToken"] = cursor.continuation
         try:
             payload = self._transport.request(
                 "GET",
@@ -260,11 +282,32 @@ class ClinicalTrialsConnector:
             raise ConnectorError(
                 self.name, retryable=False, diagnostic_code="invalid_payload"
             )
-        signals = self.parse(payload)
-        if not signals:
-            return SignalConnectorBatch(self.name, (), checkpoint)
-        token = payload.get("nextPageToken")
-        cursor = _text(token, "nextPageToken") if token is not None else checkpoint.cursor
+        try:
+            studies = payload.get("studies")
+            if not isinstance(studies, list):
+                raise ValueError("studies must be a list")
+            if not studies:
+                return SignalConnectorBatch(self.name, (), checkpoint)
+            markers = tuple(_study_marker(study) for study in studies)
+            filtered = tuple(
+                study
+                for study, marker in zip(studies, markers, strict=True)
+                if cursor.is_new(marker)
+            )
+            token = payload.get("nextPageToken")
+            continuation = (
+                _text(token, "nextPageToken") if token is not None else None
+            )
+        except (TypeError, ValueError):
+            raise ConnectorError(
+                self.name, retryable=False, diagnostic_code="invalid_payload"
+            ) from None
+        normalized_payload = dict(payload)
+        normalized_payload["studies"] = list(filtered)
+        signals = self.parse(normalized_payload)
+        next_cursor = cursor.advance(markers, continuation=continuation)
         return SignalConnectorBatch(
-            self.name, signals, ConnectorCheckpoint(self.name, cursor=cursor)
+            self.name,
+            signals,
+            ConnectorCheckpoint(self.name, cursor=next_cursor.encode()),
         )

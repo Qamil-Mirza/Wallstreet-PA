@@ -21,6 +21,7 @@ from .base import (
     ConnectorError,
     ConnectorStatus,
     EmergingSignal,
+    IncrementalPageCursor,
     PacedJSONTransport,
     SignalConnectorBatch,
     persist_signal_evidence_batch,
@@ -509,14 +510,25 @@ class USASpendingConnector(_APIConnector):
                 retryable=False,
                 diagnostic_code="request_context_missing",
             )
+        cursor = IncrementalPageCursor.parse(
+            checkpoint.cursor, connector=self.name
+        )
         page = 1
-        if checkpoint.cursor is not None:
+        if cursor.continuation is not None:
             try:
-                page = int(checkpoint.cursor)
-            except ValueError:
-                raise ValueError("checkpoint cursor must be a page number") from None
+                page = int(cursor.continuation)
+            except (TypeError, ValueError):
+                raise ConnectorError(
+                    self.name,
+                    retryable=False,
+                    diagnostic_code="invalid_checkpoint",
+                ) from None
             if page < 1:
-                raise ValueError("checkpoint cursor must be positive")
+                raise ConnectorError(
+                    self.name,
+                    retryable=False,
+                    diagnostic_code="invalid_checkpoint",
+                )
         body: dict[str, object] = {
             "filters": {"keywords": [self.query]},
             "fields": [
@@ -553,16 +565,49 @@ class USASpendingConnector(_APIConnector):
             raise ConnectorError(
                 self.name, retryable=False, diagnostic_code="invalid_payload"
             )
-        signals = self.parse(payload)
-        if not signals:
-            return SignalConnectorBatch(self.name, (), checkpoint)
-        metadata = payload.get("page_metadata", {})
-        if not isinstance(metadata, Mapping):
+        try:
+            rows = payload.get("results")
+            metadata = payload.get("page_metadata")
+            if not isinstance(rows, list) or not isinstance(metadata, Mapping):
+                raise ValueError("pagination payload shape is invalid")
+            if not rows:
+                return SignalConnectorBatch(self.name, (), checkpoint)
+            markers = tuple(
+                (
+                    date.fromisoformat(_text(row.get("Start Date"), "Start Date")),
+                    _text(row.get("Award ID"), "Award ID"),
+                )
+                for row in rows
+                if isinstance(row, Mapping)
+            )
+            if len(markers) != len(rows):
+                raise ValueError("award must be an object")
+            filtered = tuple(
+                row
+                for row, marker in zip(rows, markers, strict=True)
+                if cursor.is_new(marker)
+            )
+            next_page = metadata.get("next")
+            if next_page is None:
+                continuation = None
+            elif (
+                isinstance(next_page, int)
+                and not isinstance(next_page, bool)
+                and next_page > 0
+            ):
+                continuation = str(next_page)
+            else:
+                raise ValueError("next page is invalid")
+        except (TypeError, ValueError):
             raise ConnectorError(
                 self.name, retryable=False, diagnostic_code="invalid_payload"
-            )
-        next_page = metadata.get("next")
-        cursor = str(next_page) if isinstance(next_page, int) and next_page > 0 else checkpoint.cursor
+            ) from None
+        normalized_payload = dict(payload)
+        normalized_payload["results"] = list(filtered)
+        signals = self.parse(normalized_payload)
+        next_cursor = cursor.advance(markers, continuation=continuation)
         return SignalConnectorBatch(
-            self.name, signals, ConnectorCheckpoint(self.name, cursor=cursor)
+            self.name,
+            signals,
+            ConnectorCheckpoint(self.name, cursor=next_cursor.encode()),
         )

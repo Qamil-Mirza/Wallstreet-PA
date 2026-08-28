@@ -323,6 +323,63 @@ def test_form_d_supports_multiple_official_issuer_rows(tmp_path):
     assert len({signal.source_locator for signal in signals}) == 2
 
 
+@pytest.mark.parametrize(
+    ("table", "orphan_row"),
+    [
+        (
+            "FORMDSUBMISSION",
+            b"0009999999-26-000099\t21-AUG-26\textra\n",
+        ),
+        (
+            "ISSUERS",
+            b"0009999999-26-000099\t1\t0009999999\tPrivate Issuer\tNY\textra\n",
+        ),
+        (
+            "OFFERING",
+            b"0009999999-26-000099\t900000\tTechnology\textra\n",
+        ),
+        (
+            "RECIPIENTS",
+            b"0009999999-26-000099\t1\tPrivate Recipient\n",
+        ),
+        (
+            "RELATEDPERSONS",
+            b"0009999999-26-000099\t1\tPrivate Person\n",
+        ),
+        (
+            "SIGNATURES",
+            b"0009999999-26-000099\t1\tPrivate Signer\n",
+        ),
+    ],
+)
+def test_form_d_rejects_orphan_accession_in_every_official_table_before_evidence(
+    tmp_path, table, orphan_row
+):
+    source = zipfile.ZipFile(io.BytesIO(official_form_d_zip()))
+    rebuilt = io.BytesIO()
+    with source, zipfile.ZipFile(rebuilt, "w", zipfile.ZIP_DEFLATED) as target:
+        for item in source.infolist():
+            content = source.read(item)
+            if Path(item.filename).stem.upper() == table:
+                content += orphan_row
+            target.writestr(item.filename, content)
+    sink = ingestor(tmp_path)
+
+    with pytest.raises(ConnectorError) as error:
+        FormDConnector(ingestor=sink).parse_zip(rebuilt.getvalue())
+
+    assert error.value.diagnostic_code == "invalid_payload"
+    assert "0009999999-26-000099" not in str(error.value)
+    assert "Private" not in str(error.value)
+    with sink.store.connect() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM source_documents"
+        ).fetchone() == (0,)
+        assert connection.execute(
+            "SELECT COUNT(*) FROM document_passages"
+        ).fetchone() == (0,)
+
+
 def test_manual_import_persists_row_instead_of_accepting_lineage_id(tmp_path):
     sink = ingestor(tmp_path)
     content = (

@@ -25,6 +25,10 @@ from ..evidence import (
 _DIAGNOSTIC_CODE = re.compile(r"[a-z0-9][a-z0-9_.:-]{0,63}")
 _CONNECTOR_NAME = re.compile(r"[a-z][a-z0-9_-]{0,63}")
 _SIGNAL_TYPE = re.compile(r"[a-z][a-z0-9_]{0,63}")
+_INCREMENTAL_CURSOR_FIELDS = frozenset(
+    {"candidate", "continuation", "version", "watermark"}
+)
+_INCREMENTAL_MARKER_FIELDS = frozenset({"effective_date", "record_id"})
 
 
 def _nonblank(value: str, field_name: str) -> None:
@@ -264,6 +268,129 @@ class ConnectorCheckpoint:
                 _nonblank(value, field_name)
                 if len(value) > 512:
                     raise ValueError(f"{field_name} is too long")
+
+
+@dataclass(frozen=True)
+class IncrementalPageCursor:
+    """Versioned pagination state with a stable completed-run watermark."""
+
+    continuation: str | None = None
+    watermark: tuple[date, str] | None = None
+    candidate: tuple[date, str] | None = None
+
+    @staticmethod
+    def _marker(value: object) -> tuple[date, str] | None:
+        if value is None:
+            return None
+        if not isinstance(value, Mapping) or set(value) != _INCREMENTAL_MARKER_FIELDS:
+            raise ValueError("incremental marker shape is invalid")
+        effective_date = value.get("effective_date")
+        record_id = value.get("record_id")
+        if not isinstance(effective_date, str) or not isinstance(record_id, str):
+            raise ValueError("incremental marker values are invalid")
+        parsed_date = date.fromisoformat(effective_date)
+        if parsed_date.isoformat() != effective_date:
+            raise ValueError("effective_date must use canonical ISO format")
+        _nonblank(record_id, "record_id")
+        if record_id.strip() != record_id or len(record_id) > 128:
+            raise ValueError("record_id is too long")
+        return parsed_date, record_id
+
+    @classmethod
+    def parse(
+        cls, cursor: str | None, *, connector: str
+    ) -> IncrementalPageCursor:
+        """Decode v1 JSON or treat a non-JSON cursor as legacy continuation."""
+        _connector_name(connector)
+        if cursor is None:
+            return cls()
+        if not cursor.lstrip().startswith(("{", "[")):
+            return cls(continuation=cursor)
+        try:
+            value = json.loads(cursor)
+            if (
+                not isinstance(value, Mapping)
+                or set(value) != _INCREMENTAL_CURSOR_FIELDS
+                or type(value.get("version")) is not int
+                or value.get("version") != 1
+            ):
+                raise ValueError("incremental cursor shape is invalid")
+            continuation = value.get("continuation")
+            if continuation is not None:
+                _nonblank(continuation, "continuation")
+                if len(continuation) > 128:
+                    raise ValueError("continuation is too long")
+            watermark = cls._marker(value.get("watermark"))
+            candidate = cls._marker(value.get("candidate"))
+            if continuation is None and candidate is not None:
+                raise ValueError("terminal cursor cannot retain a candidate")
+            if (
+                watermark is not None
+                and candidate is not None
+                and candidate < watermark
+            ):
+                raise ValueError("candidate cannot precede watermark")
+            return cls(
+                continuation=continuation,
+                watermark=watermark,
+                candidate=candidate,
+            )
+        except (TypeError, ValueError, json.JSONDecodeError):
+            raise ConnectorError(
+                connector,
+                retryable=False,
+                diagnostic_code="invalid_checkpoint",
+            ) from None
+
+    def is_new(self, marker: tuple[date, str]) -> bool:
+        return self.watermark is None or marker > self.watermark
+
+    def advance(
+        self,
+        markers: Sequence[tuple[date, str]],
+        *,
+        continuation: str | None,
+    ) -> IncrementalPageCursor:
+        candidates = tuple(markers)
+        if self.candidate is not None:
+            candidates += (self.candidate,)
+        candidate = max(candidates, default=self.watermark)
+        if continuation is None:
+            completed = max(
+                tuple(
+                    marker
+                    for marker in (self.watermark, candidate)
+                    if marker is not None
+                ),
+                default=None,
+            )
+            return type(self)(watermark=completed)
+        return type(self)(
+            continuation=continuation,
+            watermark=self.watermark,
+            candidate=candidate,
+        )
+
+    def encode(self) -> str:
+        def marker(value: tuple[date, str] | None):
+            if value is None:
+                return None
+            return {
+                "effective_date": value[0].isoformat(),
+                "record_id": value[1],
+            }
+
+        return json.dumps(
+            {
+                "candidate": marker(self.candidate),
+                "continuation": self.continuation,
+                "version": 1,
+                "watermark": marker(self.watermark),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
 
 
 @dataclass(frozen=True)
@@ -586,7 +713,9 @@ def commit_connector_batch(
     if (persist_documents is None) == (ingestor is None):
         raise ValueError("provide exactly one document persistence boundary")
     if ingestor is not None:
-        ingested = tuple(ingestor.ingest(document.evidence) for document in batch.documents)
+        ingested = ingestor.ingest_batch(
+            tuple(document.evidence for document in batch.documents)
+        )
     else:
         assert persist_documents is not None
         persist_documents(batch.documents)

@@ -309,10 +309,17 @@ class FormDConnector:
             signatures = self._rows_by_accession(
                 tables["SIGNATURES"], "SIGNATURE_SEQ_KEY"
             )
+            submission_accessions = set(submissions)
+            if (
+                set(issuers) != submission_accessions
+                or set(offerings) != submission_accessions
+                or not set(recipients).issubset(submission_accessions)
+                or not set(related_people).issubset(submission_accessions)
+                or not set(signatures).issubset(submission_accessions)
+            ):
+                raise ValueError("Form D accession domains do not match")
             drafts = []
             for accession, submission in submissions.items():
-                if accession not in issuers or accession not in offerings:
-                    raise ValueError("joined Form D row is incomplete")
                 for issuer in issuers[accession]:
                     raw_record = {
                         "FORMDSUBMISSION": submission,
