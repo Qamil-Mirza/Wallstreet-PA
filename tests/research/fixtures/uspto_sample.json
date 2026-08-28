@@ -1,0 +1,15 @@
+{
+  "count": 2,
+  "patentFileWrapperDataBag": [
+    {
+      "applicationNumberText": "19123456",
+      "applicationMetaData": {
+        "firstApplicantName": "Atlas Robotics, Inc.",
+        "filingDate": "2026-08-19",
+        "inventionTitle": "Compact harmonic-drive robotic actuator",
+        "technologyCenter": "Robotic Actuators"
+      },
+      "evidencePassageId": "passage-uspto-1"
+    }
+  ]
+}

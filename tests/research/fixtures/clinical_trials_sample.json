@@ -1,0 +1,23 @@
+{
+  "studies": [
+    {
+      "protocolSection": {
+        "identificationModule": {
+          "nctId": "NCT01234567",
+          "organization": {"fullName": "Nova Therapeutics, Inc."},
+          "briefTitle": "A Study of NT-101"
+        },
+        "statusModule": {
+          "studyFirstSubmitDate": "2026-08-16",
+          "overallStatus": "RECRUITING"
+        },
+        "contactsLocationsModule": {
+          "locations": [{"country": "United States", "state": "California"}]
+        },
+        "conditionsModule": {"conditions": ["Solid Tumor", "Gene Therapy"]}
+      },
+      "evidencePassageId": "passage-trial-1"
+    }
+  ],
+  "nextPageToken": "trial-page-2"
+}
