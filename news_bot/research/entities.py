@@ -9,7 +9,7 @@ import unicodedata
 from collections import defaultdict
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 
@@ -96,6 +96,11 @@ def _aware(value: datetime, field_name: str) -> None:
         raise EntityValidationError(f"{field_name} must be timezone-aware")
 
 
+def _utc(value: datetime, field_name: str) -> datetime:
+    _aware(value, field_name)
+    return value.astimezone(timezone.utc)
+
+
 def _stable_id(prefix: str, *parts: str) -> str:
     encoded = json.dumps(parts, ensure_ascii=False, separators=(",", ":")).encode()
     return f"{prefix}_{hashlib.sha256(encoded).hexdigest()}"
@@ -129,6 +134,26 @@ def _normalize_currency(value: str, field_name: str) -> str:
     if _CURRENCY.fullmatch(normalized) is None or normalized not in _ISO_4217_CODES:
         raise EntityValidationError(f"{field_name} is invalid")
     return normalized
+
+
+def _normalize_exposure_symbol(value: str) -> str:
+    if isinstance(value, str) and value.upper().startswith("CASH:"):
+        prefix, separator, currency = value.upper().partition(":")
+        if prefix != "CASH" or separator != ":":
+            raise EntityValidationError("exposure symbol is invalid")
+        return f"CASH:{_normalize_currency(currency, 'cash currency')}"
+    normalized = _normalize_symbol(value)
+    if normalized is None:
+        raise EntityValidationError("exposure symbol is invalid")
+    return normalized
+
+
+def _deterministic_decimal_sum(terms: Sequence[tuple[str, Decimal]]) -> Decimal:
+    ordered = sorted(
+        terms,
+        key=lambda item: (-abs(item[1]), item[0], item[1].as_tuple()),
+    )
+    return sum((value for _, value in ordered), Decimal("0"))
 
 
 def _normalize_cik(value: str | int | None) -> str | None:
@@ -369,7 +394,7 @@ class Relationship:
             raise EntityValidationError("relationship cannot be a self-edge")
         if self.kind not in _RELATIONSHIP_KINDS:
             raise EntityValidationError("relationship kind is invalid")
-        _aware(self.as_of, "relationship as_of")
+        object.__setattr__(self, "as_of", _utc(self.as_of, "relationship as_of"))
         _decimal(self.confidence, "relationship confidence")
         if not Decimal("0") <= self.confidence <= Decimal("1"):
             raise EntityValidationError("relationship confidence must be between 0 and 1")
@@ -448,15 +473,7 @@ class PortfolioExposure:
     etf_holdings_status: str = "not_applicable"
 
     def __post_init__(self) -> None:
-        if isinstance(self.symbol, str) and self.symbol.upper().startswith("CASH:"):
-            prefix, separator, currency = self.symbol.upper().partition(":")
-            if prefix != "CASH" or separator != ":":
-                raise EntityValidationError("symbol is invalid")
-            object.__setattr__(
-                self, "symbol", f"CASH:{_normalize_currency(currency, 'cash currency')}"
-            )
-        else:
-            object.__setattr__(self, "symbol", _normalize_symbol(self.symbol))
+        object.__setattr__(self, "symbol", _normalize_exposure_symbol(self.symbol))
         _decimal(self.direct_weight, "direct_weight")
         _decimal(self.lookthrough_weight, "lookthrough_weight")
         if not isinstance(self.qualitative_relationships, tuple):
@@ -468,6 +485,7 @@ class PortfolioExposure:
             "stale",
             "unknown_date",
             "unevaluated",
+            "future",
         }:
             raise EntityValidationError("etf_holdings_status is invalid")
 
@@ -691,12 +709,13 @@ class EntityResolver:
             verified = self._reference_verifier(evidence, claims)
         if not verified:
             raise MissingEvidence("relationship evidence does not exist")
+        observed_at = _utc(as_of, "relationship as_of")
         relationship_id = _stable_id(
             "relationship",
             source_entity_id,
             target_entity_id,
             kind,
-            as_of.isoformat(),
+            observed_at.isoformat(),
             format(confidence, "f") if isinstance(confidence, Decimal) else "invalid",
             stance,
             *(f"passage:{item}" for item in evidence),
@@ -708,7 +727,7 @@ class EntityResolver:
             source_entity_id,
             target_entity_id,
             kind,
-            as_of,
+            observed_at,
             confidence,
             stance,
             evidence,
@@ -731,7 +750,7 @@ class EntityResolver:
 
 
 class PortfolioExposureMapper:
-    """Compute direct and ETF look-through weights without inferred arithmetic."""
+    """Compute deterministic exposure; future ETF snapshots have zero tolerance."""
 
     def __init__(self, max_etf_holdings_age: timedelta = timedelta(days=45)) -> None:
         if not isinstance(max_etf_holdings_age, timedelta) or max_etf_holdings_age < timedelta(0):
@@ -770,11 +789,23 @@ class PortfolioExposureMapper:
             if item.etf_symbol in holdings_by_symbol:
                 raise EntityValidationError("duplicate ETF holdings snapshots")
             holdings_by_symbol[item.etf_symbol] = item
-        direct: dict[str, Decimal] = defaultdict(lambda: Decimal("0"))
-        cash_weights: dict[str, list[Decimal]] = defaultdict(list)
-        lookthrough: dict[str, Decimal] = defaultdict(lambda: Decimal("0"))
+        direct_terms: dict[str, list[tuple[str, Decimal]]] = defaultdict(list)
+        lookthrough_terms: dict[str, list[tuple[str, Decimal]]] = defaultdict(list)
         statuses: dict[str, str] = {}
-        relationships = relationship_exposures or {}
+        relationships: dict[str, dict[str, Relationship]] = defaultdict(dict)
+        for raw_symbol, assertions in (relationship_exposures or {}).items():
+            symbol = _normalize_exposure_symbol(raw_symbol)
+            if not isinstance(assertions, Sequence) or isinstance(assertions, (str, bytes)):
+                raise EntityValidationError("relationship exposures must be a sequence")
+            for assertion in assertions:
+                if not isinstance(assertion, Relationship):
+                    raise EntityValidationError(
+                        "relationship exposures must contain Relationship records"
+                    )
+                existing = relationships[symbol].get(assertion.relationship_id)
+                if existing is not None and existing != assertion:
+                    raise EntityValidationError("conflicting relationship identity")
+                relationships[symbol][assertion.relationship_id] = assertion
         cash_input_symbols: set[str] = set()
         for item in positions:
             if not isinstance(item, ExposurePosition):
@@ -786,12 +817,22 @@ class PortfolioExposureMapper:
                 if rate is None:
                     raise EntityValidationError("foreign-currency position requires FX rate")
                 base_value = item.market_value * rate
+            position_term_id = _stable_id(
+                "term",
+                item.symbol,
+                item.currency,
+                item.asset_class,
+                format(item.market_value, "f"),
+                format(base_value, "f"),
+            )
             if item.asset_class == "CASH":
-                cash_weights[f"CASH:{item.currency}"].append(base_value / nav)
+                direct_terms[f"CASH:{item.currency}"].append(
+                    (position_term_id, base_value / nav)
+                )
                 cash_input_symbols.add(item.symbol)
                 continue
             if item.asset_class in {"STK", "EQUITY", "ETF", "FUND"}:
-                direct[item.symbol] += base_value / nav
+                direct_terms[item.symbol].append((position_term_id, base_value / nav))
             else:
                 continue
             if item.asset_class not in {"ETF", "FUND"}:
@@ -806,15 +847,33 @@ class PortfolioExposureMapper:
             if as_of is None:
                 statuses[item.symbol] = "unevaluated"
                 continue
-            if as_of - holdings.as_of > self.max_etf_holdings_age:
+            age = as_of - holdings.as_of
+            if age < timedelta(0):
+                statuses[item.symbol] = "future"
+                continue
+            if age > self.max_etf_holdings_age:
                 statuses[item.symbol] = "stale"
                 continue
             statuses[item.symbol] = "current"
             etf_weight = base_value / nav
             for constituent in holdings.constituents:
-                lookthrough[constituent.symbol] += etf_weight * constituent.weight
-        for symbol, weights in cash_weights.items():
-            direct[symbol] = sum(sorted(weights, key=abs, reverse=True), Decimal("0"))
+                constituent_term_id = _stable_id(
+                    "term",
+                    position_term_id,
+                    constituent.symbol,
+                    format(constituent.weight, "f"),
+                )
+                lookthrough_terms[constituent.symbol].append(
+                    (constituent_term_id, etf_weight * constituent.weight)
+                )
+        direct = {
+            symbol: _deterministic_decimal_sum(terms)
+            for symbol, terms in direct_terms.items()
+        }
+        lookthrough = {
+            symbol: _deterministic_decimal_sum(terms)
+            for symbol, terms in lookthrough_terms.items()
+        }
         relationship_symbols = {
             symbol
             for symbol in relationships
@@ -827,13 +886,16 @@ class PortfolioExposureMapper:
                 ()
                 if symbol.startswith("CASH:")
                 else tuple(
-                    sorted(relationships.get(symbol, ()), key=lambda item: item.relationship_id)
+                    sorted(
+                        relationships.get(symbol, {}).values(),
+                        key=lambda item: item.relationship_id,
+                    )
                 )
             )
             result[symbol] = PortfolioExposure(
                 symbol=symbol,
-                direct_weight=direct[symbol],
-                lookthrough_weight=lookthrough[symbol],
+                direct_weight=direct.get(symbol, Decimal("0")),
+                lookthrough_weight=lookthrough.get(symbol, Decimal("0")),
                 qualitative_relationships=qualitative,
                 etf_holdings_status=statuses.get(symbol, "not_applicable"),
             )

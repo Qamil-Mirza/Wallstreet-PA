@@ -325,6 +325,129 @@ def test_existing_v2_claims_upgrade_with_lineage_anchor_without_data_loss(
     assert foreign_key_errors == []
 
 
+def test_populated_v3_relationship_upgrade_preserves_and_quarantines_legacy_data(
+    tmp_path, monkeypatch
+):
+    database_path = tmp_path / "research.db"
+    migration_root = (
+        Path(__file__).resolve().parents[2] / "news_bot/research/migrations"
+    )
+    legacy_migrations = []
+    for migration_name in (
+        "001_initial.sql",
+        "002_nullable_portfolio_freshness.sql",
+        "003_claim_dependencies.sql",
+    ):
+        source = migration_root / migration_name
+        copied = tmp_path / source.name
+        shutil.copyfile(source, copied)
+        legacy_migrations.append(copied)
+    old_store = ResearchStore(database_path)
+    monkeypatch.setattr(
+        old_store, "_migration_files", lambda: tuple(legacy_migrations)
+    )
+    old_store.migrate()
+    seed_claim_with_evidence(old_store)
+
+    created_at = "2026-08-24T00:00:00.000000Z"
+    source_entity_id = "entity_" + "a" * 64
+    target_entity_id = "entity_" + "b" * 64
+    relationship_id = "relationship_" + "c" * 64
+    legacy_metadata = '{"evidence_id":"passage-1","status":"active"}'
+    with old_store.transaction() as connection:
+        connection.executemany(
+            "INSERT INTO entities (entity_id, canonical_name, entity_type, created_at) "
+            "VALUES (?, ?, 'company', ?)",
+            (
+                (source_entity_id, "Company A", created_at),
+                (target_entity_id, "Company B", created_at),
+            ),
+        )
+        connection.execute(
+            "INSERT INTO relationships (relationship_id, source_entity_id, "
+            "target_entity_id, kind, as_of, confidence, metadata_json, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                relationship_id,
+                source_entity_id,
+                target_entity_id,
+                "supplier",
+                created_at,
+                "0.8",
+                legacy_metadata,
+                created_at,
+            ),
+        )
+
+    upgraded = ResearchStore(database_path)
+    upgraded.migrate()
+
+    with upgraded.connect() as connection:
+        versions = connection.execute(
+            "SELECT version FROM schema_migrations ORDER BY version"
+        ).fetchall()
+        relationship = connection.execute(
+            "SELECT source_entity_id, target_entity_id, kind, as_of, confidence, "
+            "stance, provenance, primary_passage_id, primary_claim_id, "
+            "lineage_sealed, metadata_json FROM relationships "
+            "WHERE relationship_id = ?",
+            (relationship_id,),
+        ).fetchone()
+        claim_state = connection.execute(
+            "SELECT status, lineage_sealed FROM claims WHERE claim_id = 'claim-1'"
+        ).fetchone()
+        claim_evidence = connection.execute(
+            "SELECT passage_id, stance FROM claim_evidence "
+            "WHERE claim_id = 'claim-1'"
+        ).fetchall()
+        indexes = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index'"
+            )
+        }
+        foreign_key_errors = connection.execute("PRAGMA foreign_key_check").fetchall()
+
+    assert versions == [(1,), (2,), (3,), (4,)]
+    assert relationship == (
+        source_entity_id,
+        target_entity_id,
+        "supplier",
+        created_at,
+        "0.8",
+        "supports",
+        "legacy",
+        None,
+        None,
+        0,
+        legacy_metadata,
+    )
+    assert upgraded.list_relationships(source_entity_id) == ()
+    assert claim_state == ("active", 1)
+    assert claim_evidence == [("passage-1", "supports")]
+    assert {
+        "idx_relationships_source_entity_id",
+        "idx_relationships_target_entity_id",
+        "idx_relationships_kind_as_of",
+    } <= indexes
+    assert foreign_key_errors == []
+
+    with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+        with upgraded.transaction() as connection:
+            connection.execute(
+                "UPDATE relationships SET confidence = '0.9' "
+                "WHERE relationship_id = ?",
+                (relationship_id,),
+            )
+    with pytest.raises(sqlite3.IntegrityError, match="lineage"):
+        with upgraded.transaction() as connection:
+            connection.execute(
+                "UPDATE relationships SET lineage_sealed = 1 "
+                "WHERE relationship_id = ?",
+                (relationship_id,),
+            )
+
+
 def test_store_fails_closed_when_no_migrations_are_available(tmp_path, monkeypatch):
     store = ResearchStore(tmp_path / "research.db")
     monkeypatch.setattr(store, "_migration_files", lambda: ())

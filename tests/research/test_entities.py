@@ -7,6 +7,7 @@ import json
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from itertools import permutations
 from pathlib import Path
 
 import pytest
@@ -386,6 +387,28 @@ def test_contradicting_relationship_assertion_is_retained_separately(migrated_st
     )
 
 
+def test_relationship_observation_time_is_canonicalized_to_utc_before_identity():
+    subject = resolver(reference_verifier=lambda evidence, claims: True)
+    source = "entity_" + "a" * 64
+    target = "entity_" + "b" * 64
+    common = dict(
+        source_entity_id=source,
+        target_entity_id=target,
+        kind="supplier",
+        confidence=Decimal("0.8"),
+        evidence_ids=("passage-1",),
+    )
+
+    utc_relationship = subject.add_relationship(**common, as_of=NOW)
+    offset_relationship = subject.add_relationship(
+        **common, as_of=NOW.astimezone(timezone(timedelta(hours=-7)))
+    )
+
+    assert utc_relationship == offset_relationship
+    assert offset_relationship.as_of == NOW
+    assert offset_relationship.as_of.tzinfo is timezone.utc
+
+
 def position(symbol, value, *, asset_class="STK", currency="USD"):
     return ExposurePosition(
         symbol=symbol,
@@ -468,6 +491,48 @@ def test_etf_dates_reject_naive_datetimes():
             base_currency="USD",
             as_of=datetime(2026, 8, 24),
         )
+
+
+def test_future_etf_holdings_are_explicit_and_never_used_for_lookthrough():
+    evaluation_time = NOW
+    future_in_offset_zone = (NOW + timedelta(seconds=1)).astimezone(
+        timezone(timedelta(hours=5, minutes=30))
+    )
+    holdings = ETFHoldings(
+        etf_symbol="SMH",
+        as_of=future_in_offset_zone,
+        constituents=(ETFConstituent("NVDA", Decimal("1")),),
+    )
+
+    exposure = PortfolioExposureMapper().map_positions(
+        (position("SMH", 30, asset_class="ETF"),),
+        nav=Decimal("100"),
+        base_currency="USD",
+        etf_holdings=(holdings,),
+        as_of=evaluation_time,
+    )
+
+    assert exposure["SMH"].etf_holdings_status == "future"
+    assert "NVDA" not in exposure
+
+
+def test_equal_etf_and_evaluation_instants_with_different_offsets_are_current():
+    holdings = ETFHoldings(
+        etf_symbol="SMH",
+        as_of=NOW.astimezone(timezone(timedelta(hours=5, minutes=30))),
+        constituents=(ETFConstituent("NVDA", Decimal("1")),),
+    )
+
+    exposure = PortfolioExposureMapper().map_positions(
+        (position("SMH", 30, asset_class="ETF"),),
+        nav=Decimal("100"),
+        base_currency="USD",
+        etf_holdings=(holdings,),
+        as_of=NOW,
+    )
+
+    assert exposure["SMH"].etf_holdings_status == "current"
+    assert exposure["NVDA"].lookthrough_weight == Decimal("0.3")
 
 
 def test_exposure_aggregation_is_decimal_only_and_order_independent():
@@ -553,6 +618,53 @@ def test_cash_aggregation_is_order_independent_at_decimal_precision_boundary():
     )
 
     assert forward == backward
+
+
+def test_direct_exposure_sum_is_exact_and_order_independent_at_precision_boundary():
+    mapper = PortfolioExposureMapper()
+    positions = (
+        position("NVDA", Decimal("1e40")),
+        position("NVDA", Decimal("-1e40")),
+        position("NVDA", Decimal("1")),
+    )
+
+    weights = {
+        mapper.map_positions(order, nav=Decimal("1"), base_currency="USD")[
+            "NVDA"
+        ].direct_weight
+        for order in permutations(positions)
+    }
+
+    assert weights == {Decimal("1")}
+
+
+def test_etf_lookthrough_sum_is_exact_and_order_independent_at_precision_boundary():
+    mapper = PortfolioExposureMapper()
+    positions = (
+        position("SMH", Decimal("1e40"), asset_class="ETF"),
+        position("SMH", Decimal("-1e40"), asset_class="ETF"),
+        position("SMH", Decimal("1"), asset_class="ETF"),
+    )
+    holdings = ETFHoldings(
+        etf_symbol="SMH",
+        as_of=NOW,
+        constituents=(ETFConstituent("NVDA", Decimal("1")),),
+    )
+
+    exposures = set()
+    for order in permutations(positions):
+        exposure = mapper.map_positions(
+            order,
+            nav=Decimal("1"),
+            base_currency="USD",
+            etf_holdings=(holdings,),
+            as_of=NOW,
+        )
+        exposures.add(
+            (exposure["SMH"].direct_weight, exposure["NVDA"].lookthrough_weight)
+        )
+
+    assert exposures == {(Decimal("1"), Decimal("1"))}
 
 
 def test_missing_and_stale_etf_holdings_are_explicit_not_fabricated():
@@ -666,3 +778,66 @@ def test_qualitative_relationship_exposure_never_becomes_numeric():
     assert exposure["NVDA"].direct_weight == Decimal("0.20")
     assert exposure["NVDA"].lookthrough_weight == Decimal("0")
     assert exposure["NVDA"].qualitative_relationships == (relationship,)
+
+
+def test_relationship_exposure_keys_are_canonicalized_merged_and_deduplicated():
+    mapper = PortfolioExposureMapper()
+    relationship = Relationship(
+        relationship_id="relationship_" + "a" * 64,
+        source_entity_id="entity_" + "a" * 64,
+        target_entity_id="entity_" + "b" * 64,
+        kind="supplier",
+        as_of=NOW,
+        confidence=Decimal("0.8"),
+        stance="supports",
+        evidence_ids=("passage-1",),
+        supporting_claim_ids=(),
+        provenance="filing",
+    )
+
+    exposure = mapper.map_positions(
+        (position("NVDA", 20),),
+        nav=Decimal("100"),
+        base_currency="USD",
+        relationship_exposures={"nvda": (relationship,), "NVDA": (relationship,)},
+    )
+
+    assert set(exposure) == {"NVDA"}
+    assert exposure["NVDA"].qualitative_relationships == (relationship,)
+
+
+@pytest.mark.parametrize("invalid_key", ["", "   ", "NV\nDA"])
+def test_relationship_exposure_keys_reject_blank_or_control_text(invalid_key):
+    with pytest.raises(EntityValidationError):
+        PortfolioExposureMapper().map_positions(
+            (),
+            nav=Decimal("100"),
+            base_currency="USD",
+            relationship_exposures={invalid_key: ()},
+        )
+
+
+def test_relationship_exposure_canonical_collision_rejects_conflicting_identity():
+    relationship = Relationship(
+        relationship_id="relationship_" + "a" * 64,
+        source_entity_id="entity_" + "a" * 64,
+        target_entity_id="entity_" + "b" * 64,
+        kind="supplier",
+        as_of=NOW,
+        confidence=Decimal("0.8"),
+        stance="supports",
+        evidence_ids=("passage-1",),
+        supporting_claim_ids=(),
+        provenance="filing",
+    )
+
+    with pytest.raises(EntityValidationError, match="conflicting relationship"):
+        PortfolioExposureMapper().map_positions(
+            (),
+            nav=Decimal("100"),
+            base_currency="USD",
+            relationship_exposures={
+                "nvda": (relationship,),
+                "NVDA": (replace(relationship, provenance="analyst"),),
+            },
+        )
