@@ -236,6 +236,346 @@ class ResearchStore:
         finally:
             connection.close()
 
+    def upsert_resolved_entity(
+        self, resolved: object, aliases: Sequence[object], provenance: object
+    ) -> None:
+        """Atomically persist an idempotent canonical entity resolution."""
+        from .entities import Alias, ResolutionProvenance, ResolvedEntity
+
+        if not isinstance(resolved, ResolvedEntity):
+            raise TypeError("resolved must be ResolvedEntity")
+        alias_records = tuple(aliases)
+        if any(not isinstance(alias, Alias) for alias in alias_records):
+            raise TypeError("aliases must contain Alias records")
+        if not isinstance(provenance, ResolutionProvenance):
+            raise TypeError("provenance must be ResolutionProvenance")
+        if any(alias.entity_id != resolved.entity_id for alias in alias_records):
+            raise sqlite3.IntegrityError("alias entity_id does not match entity")
+        if provenance.entity_id != resolved.entity_id:
+            raise sqlite3.IntegrityError(
+                "resolution provenance entity_id does not match entity"
+            )
+        with self.transaction() as connection:
+            entity_values = (
+                resolved.entity_id,
+                resolved.canonical_name,
+                "company",
+            )
+            existing_entity = connection.execute(
+                "SELECT entity_id, canonical_name, entity_type FROM entities "
+                "WHERE entity_id = ?",
+                (resolved.entity_id,),
+            ).fetchone()
+            created_at = _utc_text(datetime.now(timezone.utc))
+            if existing_entity is None:
+                connection.execute(
+                    "INSERT INTO entities (entity_id, canonical_name, entity_type, "
+                    "created_at) VALUES (?, ?, ?, ?)",
+                    (*entity_values, created_at),
+                )
+            elif tuple(existing_entity) != entity_values:
+                raise sqlite3.IntegrityError(
+                    "conflicting canonical entity already exists"
+                )
+            for alias in alias_records:
+                values = (
+                    alias.alias_id,
+                    alias.entity_id,
+                    alias.value,
+                    alias.alias_type,
+                    alias.market,
+                )
+                existing_alias = connection.execute(
+                    "SELECT alias_id, entity_id, value, alias_type, market "
+                    "FROM entity_aliases WHERE alias_id = ?",
+                    (alias.alias_id,),
+                ).fetchone()
+                if existing_alias is None:
+                    connection.execute(
+                        "INSERT INTO entity_aliases (alias_id, entity_id, value, "
+                        "alias_type, market, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                        (*values, created_at),
+                    )
+                elif tuple(existing_alias) != values:
+                    raise sqlite3.IntegrityError("conflicting entity alias exists")
+            provenance_values = (
+                provenance.provenance_id,
+                provenance.entity_id,
+                provenance.method,
+                provenance.source,
+                provenance.matched_identifier,
+            )
+            existing_provenance = connection.execute(
+                "SELECT provenance_id, entity_id, method, source, "
+                "matched_identifier FROM entity_resolution_provenance "
+                "WHERE provenance_id = ?",
+                (provenance.provenance_id,),
+            ).fetchone()
+            if existing_provenance is None:
+                connection.execute(
+                    "INSERT INTO entity_resolution_provenance (provenance_id, "
+                    "entity_id, method, source, matched_identifier, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (*provenance_values, created_at),
+                )
+            elif tuple(existing_provenance) != provenance_values:
+                raise sqlite3.IntegrityError(
+                    "conflicting entity resolution provenance exists"
+                )
+
+    def list_entity_aliases(self, entity_id: str) -> tuple[object, ...]:
+        """Return immutable aliases in deterministic order."""
+        from .entities import Alias
+
+        connection = self.connect()
+        try:
+            rows = connection.execute(
+                "SELECT alias_id, entity_id, value, alias_type, market "
+                "FROM entity_aliases WHERE entity_id = ? ORDER BY alias_id",
+                (entity_id,),
+            ).fetchall()
+        finally:
+            connection.close()
+        return tuple(Alias(*row) for row in rows)
+
+    def list_resolution_provenance(self, entity_id: str) -> tuple[object, ...]:
+        """Return resolution provenance in deterministic order."""
+        from .entities import ResolutionProvenance
+
+        connection = self.connect()
+        try:
+            rows = connection.execute(
+                "SELECT provenance_id, entity_id, method, source, "
+                "matched_identifier FROM entity_resolution_provenance "
+                "WHERE entity_id = ? ORDER BY provenance_id",
+                (entity_id,),
+            ).fetchall()
+        finally:
+            connection.close()
+        return tuple(ResolutionProvenance(*row) for row in rows)
+
+    def upsert_unresolved_research_task(self, task: object) -> None:
+        """Persist a deduplicated entity-resolution task without guessing."""
+        from .entities import UnresolvedResearchTask
+
+        if not isinstance(task, UnresolvedResearchTask):
+            raise TypeError("task must be UnresolvedResearchTask")
+        values = (
+            task.task_id,
+            "entity_resolution",
+            _canonical_json(
+                {
+                    "candidate_entity_ids": list(task.candidate_entity_ids),
+                    "normalized_query": task.normalized_query,
+                    "reason": task.reason,
+                }
+            ),
+            "pending",
+            0,
+        )
+        with self.transaction() as connection:
+            existing = connection.execute(
+                "SELECT task_id, task_kind, scope_json, state, priority "
+                "FROM research_tasks WHERE task_id = ?",
+                (task.task_id,),
+            ).fetchone()
+            if existing is not None:
+                if tuple(existing) == values:
+                    return
+                raise sqlite3.IntegrityError(
+                    "conflicting unresolved research task exists"
+                )
+            connection.execute(
+                "INSERT INTO research_tasks (task_id, task_kind, scope_json, "
+                "state, priority, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (*values, _utc_text(datetime.now(timezone.utc))),
+            )
+
+    @staticmethod
+    def _references_exist(
+        connection: sqlite3.Connection,
+        passage_ids: tuple[str, ...],
+        claim_ids: tuple[str, ...],
+    ) -> bool:
+        if not passage_ids and not claim_ids:
+            return False
+        if passage_ids:
+            placeholders = ",".join("?" for _ in passage_ids)
+            passage_count = connection.execute(
+                f"SELECT COUNT(*) FROM document_passages "
+                f"WHERE passage_id IN ({placeholders})",
+                passage_ids,
+            ).fetchone()[0]
+            if passage_count != len(passage_ids):
+                return False
+        if claim_ids:
+            placeholders = ",".join("?" for _ in claim_ids)
+            claim_count = connection.execute(
+                f"SELECT COUNT(*) FROM claims WHERE claim_id IN ({placeholders}) "
+                "AND lineage_sealed = 1",
+                claim_ids,
+            ).fetchone()[0]
+            if claim_count != len(claim_ids):
+                return False
+        return True
+
+    def evidence_references_exist(
+        self, passage_ids: Sequence[str], claim_ids: Sequence[str]
+    ) -> bool:
+        """Verify every relationship lineage reference without accepting a subset."""
+        passages = tuple(passage_ids)
+        claims = tuple(claim_ids)
+        if len(passages) != len(set(passages)) or len(claims) != len(set(claims)):
+            return False
+        connection = self.connect()
+        try:
+            return self._references_exist(connection, passages, claims)
+        finally:
+            connection.close()
+
+    def insert_relationship(self, relationship: object) -> None:
+        """Atomically persist an idempotent relationship and exact lineage."""
+        from .entities import Relationship
+
+        if not isinstance(relationship, Relationship):
+            raise TypeError("relationship must be Relationship")
+        values = (
+            relationship.relationship_id,
+            relationship.source_entity_id,
+            relationship.target_entity_id,
+            relationship.kind,
+            _utc_text(relationship.as_of, "Relationship.as_of"),
+            _decimal_text(relationship.confidence),
+            relationship.stance,
+            relationship.provenance,
+            relationship.evidence_ids[0] if relationship.evidence_ids else None,
+            (
+                relationship.supporting_claim_ids[0]
+                if relationship.supporting_claim_ids
+                else None
+            ),
+        )
+        with self.transaction() as connection:
+            if not self._references_exist(
+                connection,
+                relationship.evidence_ids,
+                relationship.supporting_claim_ids,
+            ):
+                raise sqlite3.IntegrityError(
+                    "relationship evidence references do not exist"
+                )
+            existing = connection.execute(
+                "SELECT relationship_id, source_entity_id, target_entity_id, kind, "
+                "as_of, confidence, stance, provenance, primary_passage_id, "
+                "primary_claim_id FROM relationships "
+                "WHERE relationship_id = ?",
+                (relationship.relationship_id,),
+            ).fetchone()
+            if existing is not None:
+                stored_passages = tuple(
+                    row[0]
+                    for row in connection.execute(
+                        "SELECT passage_id FROM relationship_evidence "
+                        "WHERE relationship_id = ? ORDER BY passage_id",
+                        (relationship.relationship_id,),
+                    ).fetchall()
+                )
+                stored_claims = tuple(
+                    row[0]
+                    for row in connection.execute(
+                        "SELECT claim_id FROM relationship_claim_evidence "
+                        "WHERE relationship_id = ? ORDER BY claim_id",
+                        (relationship.relationship_id,),
+                    ).fetchall()
+                )
+                if (
+                    tuple(existing) == values
+                    and stored_passages == relationship.evidence_ids
+                    and stored_claims == relationship.supporting_claim_ids
+                ):
+                    return
+                raise sqlite3.IntegrityError(
+                    "conflicting relationship assertion already exists"
+                )
+            created_at = _utc_text(datetime.now(timezone.utc))
+            connection.execute(
+                "INSERT INTO relationships (relationship_id, source_entity_id, "
+                "target_entity_id, kind, as_of, confidence, stance, provenance, "
+                "primary_passage_id, primary_claim_id, lineage_sealed, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)",
+                (*values, created_at),
+            )
+            connection.executemany(
+                "INSERT INTO relationship_evidence (relationship_id, passage_id) "
+                "VALUES (?, ?)",
+                (
+                    (relationship.relationship_id, passage_id)
+                    for passage_id in relationship.evidence_ids
+                ),
+            )
+            connection.executemany(
+                "INSERT INTO relationship_claim_evidence (relationship_id, claim_id) "
+                "VALUES (?, ?)",
+                (
+                    (relationship.relationship_id, claim_id)
+                    for claim_id in relationship.supporting_claim_ids
+                ),
+            )
+            connection.execute(
+                "UPDATE relationships SET lineage_sealed = 1 "
+                "WHERE relationship_id = ?",
+                (relationship.relationship_id,),
+            )
+
+    def list_relationships(self, source_entity_id: str) -> tuple[object, ...]:
+        """Return directed relationship assertions without collapsing contradictions."""
+        from .entities import Relationship
+
+        connection = self.connect()
+        try:
+            rows = connection.execute(
+                "SELECT relationship_id, source_entity_id, target_entity_id, kind, "
+                "as_of, confidence, stance, provenance FROM relationships "
+                "WHERE source_entity_id = ? AND lineage_sealed = 1 "
+                "ORDER BY stance, relationship_id",
+                (source_entity_id,),
+            ).fetchall()
+            records = []
+            for row in rows:
+                evidence_ids = tuple(
+                    item[0]
+                    for item in connection.execute(
+                        "SELECT passage_id FROM relationship_evidence "
+                        "WHERE relationship_id = ? ORDER BY passage_id",
+                        (row[0],),
+                    ).fetchall()
+                )
+                claim_ids = tuple(
+                    item[0]
+                    for item in connection.execute(
+                        "SELECT claim_id FROM relationship_claim_evidence "
+                        "WHERE relationship_id = ? ORDER BY claim_id",
+                        (row[0],),
+                    ).fetchall()
+                )
+                records.append(
+                    Relationship(
+                        relationship_id=row[0],
+                        source_entity_id=row[1],
+                        target_entity_id=row[2],
+                        kind=row[3],
+                        as_of=_parse_utc(row[4]),
+                        confidence=Decimal(row[5]),
+                        stance=row[6],
+                        evidence_ids=evidence_ids,
+                        supporting_claim_ids=claim_ids,
+                        provenance=row[7],
+                    )
+                )
+        finally:
+            connection.close()
+        return tuple(records)
+
     def insert_portfolio_snapshot(
         self,
         snapshot: PortfolioSnapshot,

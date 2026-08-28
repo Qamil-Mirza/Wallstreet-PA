@@ -1,0 +1,49 @@
+{
+  "0": {
+    "cik_str": 1045810,
+    "ticker": "NVDA",
+    "title": "NVIDIA CORP",
+    "exchange": "NASDAQ",
+    "conid": "4815747",
+    "isin": "US67066G1040",
+    "figi": "BBG000BBJQV0"
+  },
+  "1": {
+    "cik_str": 50863,
+    "ticker": "INTC",
+    "title": "INTEL CORP",
+    "exchange": "NASDAQ",
+    "conid": "270639",
+    "cusip": "458140100"
+  },
+  "2": {
+    "cik_str": 1652044,
+    "ticker": "GOOG",
+    "title": "ALPHABET INC",
+    "exchange": "NASDAQ"
+  },
+  "3": {
+    "cik_str": 1594805,
+    "ticker": "SHOP",
+    "title": "SHOPIFY INC",
+    "exchange": "NYSE"
+  },
+  "4": {
+    "cik_str": 1594806,
+    "ticker": "SHOP",
+    "title": "SHOPIFY CANADA INC",
+    "exchange": "TSX"
+  },
+  "5": {
+    "cik_str": 1900001,
+    "ticker": "ACMA",
+    "title": "ACME HOLDINGS INC",
+    "exchange": "NYSE"
+  },
+  "6": {
+    "cik_str": 1900002,
+    "ticker": "ACMB",
+    "title": "ACME HOLDINGS CORP",
+    "exchange": "NASDAQ"
+  }
+}

@@ -27,6 +27,10 @@ REQUIRED_TABLES = {
     "entities",
     "securities",
     "relationships",
+    "entity_aliases",
+    "entity_resolution_provenance",
+    "relationship_evidence",
+    "relationship_claim_evidence",
     "source_documents",
     "document_passages",
     "claims",
@@ -81,6 +85,42 @@ def test_store_migrates_empty_database(tmp_path):
     assert REQUIRED_TABLES <= names
 
 
+def test_relationship_cannot_be_sealed_without_matching_lineage(migrated_store):
+    created_at = "2026-08-24T00:00:00.000000Z"
+    with migrated_store.transaction() as connection:
+        connection.executemany(
+            "INSERT INTO entities (entity_id, canonical_name, entity_type, created_at) "
+            "VALUES (?, ?, 'company', ?)",
+            (
+                ("entity_" + "a" * 64, "Company A", created_at),
+                ("entity_" + "b" * 64, "Company B", created_at),
+            ),
+        )
+        connection.execute(
+            "INSERT INTO relationships (relationship_id, source_entity_id, "
+            "target_entity_id, kind, as_of, confidence, stance, provenance, "
+            "lineage_sealed, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)",
+            (
+                "relationship_" + "c" * 64,
+                "entity_" + "a" * 64,
+                "entity_" + "b" * 64,
+                "supplier",
+                created_at,
+                "0.8",
+                "supports",
+                "test",
+                created_at,
+            ),
+        )
+
+        with pytest.raises(sqlite3.IntegrityError, match="lineage"):
+            connection.execute(
+                "UPDATE relationships SET lineage_sealed = 1 "
+                "WHERE relationship_id = ?",
+                ("relationship_" + "c" * 64,),
+            )
+
+
 def test_migration_is_idempotent_and_recorded_once(tmp_path):
     store = ResearchStore(tmp_path / "research.db")
 
@@ -91,10 +131,11 @@ def test_migration_is_idempotent_and_recorded_once(tmp_path):
         rows = connection.execute(
             "SELECT version, name, applied_at FROM schema_migrations"
         ).fetchall()
-    assert len(rows) == 3
+    assert len(rows) == 4
     assert rows[0][0:2] == (1, "001_initial.sql")
     assert rows[1][0:2] == (2, "002_nullable_portfolio_freshness.sql")
     assert rows[2][0:2] == (3, "003_claim_dependencies.sql")
+    assert rows[3][0:2] == (4, "004_entity_resolution.sql")
     assert all(row[2].endswith("Z") for row in rows)
 
 
@@ -199,7 +240,7 @@ def test_existing_v1_database_upgrades_nullable_freshness_without_data_loss(
             "WHERE type = 'index' AND name LIKE 'idx_positions_%' ORDER BY name"
         ).fetchall()
 
-    assert versions == [(1,), (2,), (3,)]
+    assert versions == [(1,), (2,), (3,), (4,)]
     assert stored_snapshot == snapshot_row
     assert stored_security == security_row
     assert stored_position == position_row
@@ -269,7 +310,7 @@ def test_existing_v2_claims_upgrade_with_lineage_anchor_without_data_loss(
             (claim.claim_id,),
         ).fetchall()
         foreign_key_errors = connection.execute("PRAGMA foreign_key_check").fetchall()
-    assert versions == [(1,), (2,), (3,)]
+    assert versions == [(1,), (2,), (3,), (4,)]
     assert retained_evidence == [("passage-1", stance)]
     if stance == "supports":
         assert upgraded.get_claim(claim.claim_id) == claim
@@ -332,6 +373,7 @@ def test_built_wheel_contains_and_applies_all_migrations(tmp_path):
         "news_bot/research/migrations/001_initial.sql",
         "news_bot/research/migrations/002_nullable_portfolio_freshness.sql",
         "news_bot/research/migrations/003_claim_dependencies.sql",
+        "news_bot/research/migrations/004_entity_resolution.sql",
     }
     with zipfile.ZipFile(wheel) as archive:
         assert migration_names <= set(archive.namelist())
@@ -343,13 +385,13 @@ def test_built_wheel_contains_and_applies_all_migrations(tmp_path):
         "migration_dir = resources.files('news_bot.research').joinpath('migrations'); "
         "assert {p.name for p in migration_dir.iterdir()} >= "
         "{'001_initial.sql', '002_nullable_portfolio_freshness.sql', "
-        "'003_claim_dependencies.sql'}; "
+        "'003_claim_dependencies.sql', '004_entity_resolution.sql'}; "
         "from news_bot.research.store import ResearchStore; "
         "db = Path(tempfile.mkdtemp()) / 'research.db'; "
         "store = ResearchStore(db); store.migrate(); "
         "connection = sqlite3.connect(db); "
         "assert connection.execute('SELECT version FROM schema_migrations "
-        "ORDER BY version').fetchall() == [(1,), (2,), (3,)]; connection.close()"
+        "ORDER BY version').fetchall() == [(1,), (2,), (3,), (4,)]; connection.close()"
     )
     subprocess.run(
         [sys.executable, "-I", "-c", resource_probe],
@@ -362,7 +404,7 @@ def test_built_wheel_contains_and_applies_all_migrations(tmp_path):
 
 def test_failed_multi_statement_migration_is_atomic(tmp_path, monkeypatch):
     store = make_migrated_store(tmp_path)
-    bad_migration = tmp_path / "004_broken.sql"
+    bad_migration = tmp_path / "005_broken.sql"
     bad_migration.write_text(
         "CREATE TABLE should_roll_back (id INTEGER);\n"
         "INSERT INTO missing_table (id) VALUES (1);\n",
@@ -381,7 +423,7 @@ def test_failed_multi_statement_migration_is_atomic(tmp_path, monkeypatch):
         versions = connection.execute(
             "SELECT version FROM schema_migrations ORDER BY version"
         ).fetchall()
-    assert versions == [(1,), (2,), (3,)]
+    assert versions == [(1,), (2,), (3,), (4,)]
 
 
 def test_migrations_are_sorted_by_numeric_version(tmp_path, monkeypatch):
