@@ -29,6 +29,7 @@ from .base import (
     ModelResponse,
     ProviderAuthenticationError,
     ProviderConfigurationError,
+    ProviderError,
     ProviderNonRetryableError,
     ProviderRateLimitError,
     ProviderRefusalError,
@@ -173,7 +174,7 @@ class OpenAIProvider:
             as_of=instant.date(),
         )
         reservation = self.budget.reserve(
-            f"model:{request.run_id}:{request.role.value}",
+            f"model:{request.attempt_id or request.run_id}:{request.role.value}",
             estimate,
             now=instant,
             role=request.role,
@@ -200,33 +201,50 @@ class OpenAIProvider:
             as_of=self.clock().date(),
         )
         self.budget.reconcile(reservation.id, actual, now=self.clock())
-        _enforce_completed_response(provider_result)
-        raw = _extract_output_text(provider_result)
         try:
-            raw_bytes = raw.encode("utf-8", errors="strict")
-        except UnicodeError:
-            raise ProviderValidationError(
-                "OpenAI response failed the requested schema",
-                issues=(ValidationIssue("$", "invalid_utf8"),),
-            ) from None
-        try:
-            parsed_json = json.loads(raw)
-        except json.JSONDecodeError:
-            raise ProviderValidationError(
-                "OpenAI response failed the requested schema",
-                issues=(ValidationIssue("$", "json_invalid"),),
-            ) from None
-        parsed_json = validated_provider_json(parsed_json)
-        try:
-            parsed = request.output_schema.model_validate(parsed_json)
-        except ValidationError as exc:
-            raise ProviderValidationError(
-                "OpenAI response failed the requested schema",
-                issues=validation_issues(exc),
-            ) from None
+            response_hash = None
+            raw_candidate = _response_field(provider_result, "output_text", None)
+            if isinstance(raw_candidate, str):
+                try:
+                    response_hash = hashlib.sha256(
+                        raw_candidate.encode("utf-8", errors="strict")
+                    ).hexdigest()
+                except UnicodeError:
+                    pass
+            _enforce_completed_response(provider_result)
+            raw = _extract_output_text(provider_result)
+            try:
+                raw_bytes = raw.encode("utf-8", errors="strict")
+            except UnicodeError:
+                raise ProviderValidationError(
+                    "OpenAI response failed the requested schema",
+                    issues=(ValidationIssue("$", "invalid_utf8"),),
+                ) from None
+            response_hash = hashlib.sha256(raw_bytes).hexdigest()
+            try:
+                parsed_json = json.loads(raw)
+            except json.JSONDecodeError:
+                raise ProviderValidationError(
+                    "OpenAI response failed the requested schema",
+                    issues=(ValidationIssue("$", "json_invalid"),),
+                ) from None
+            parsed_json = validated_provider_json(parsed_json)
+            try:
+                parsed = request.output_schema.model_validate(parsed_json)
+            except ValidationError as exc:
+                raise ProviderValidationError(
+                    "OpenAI response failed the requested schema",
+                    issues=validation_issues(exc),
+                ) from None
+        except ProviderError as error:
+            error.input_tokens = input_tokens
+            error.output_tokens = output_tokens
+            error.reasoning_tokens = reasoning_tokens
+            error.response_hash = locals().get("response_hash")
+            raise
         return ModelResponse(
             data=parsed,
-            raw_response_hash=hashlib.sha256(raw_bytes).hexdigest(),
+            raw_response_hash=response_hash,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             reasoning_tokens=reasoning_tokens,

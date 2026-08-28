@@ -20,6 +20,7 @@ from .base import (
     ModelResponse,
     ProviderAuthenticationError,
     ProviderConfigurationError,
+    ProviderError,
     ProviderNonRetryableError,
     ProviderRateLimitError,
     ProviderUnavailable,
@@ -143,40 +144,59 @@ class OllamaProvider:
             "options": {"num_predict": request.max_output_tokens},
         }
         result = self._request_json("POST", "/api/generate", json_body=payload)
-        raw = result.get("response")
-        if not isinstance(raw, str):
-            raise ProviderValidationError(
-                "Ollama response did not contain structured text",
-                issues=(ValidationIssue("$", "output_missing"),),
+        audit_input_tokens = _known_count(result.get("prompt_eval_count"))
+        audit_output_tokens = _known_count(result.get("eval_count"))
+        audit_reasoning_tokens = _known_count(
+            result.get("reasoning_eval_count", 0)
+        )
+        try:
+            response_hash = None
+            raw = result.get("response")
+            if not isinstance(raw, str):
+                raise ProviderValidationError(
+                    "Ollama response did not contain structured text",
+                    issues=(ValidationIssue("$", "output_missing"),),
+                )
+            try:
+                raw_bytes = raw.encode("utf-8", errors="strict")
+            except UnicodeError:
+                raise ProviderValidationError(
+                    "Ollama response failed the requested schema",
+                    issues=(ValidationIssue("$", "invalid_utf8"),),
+                ) from None
+            response_hash = hashlib.sha256(raw_bytes).hexdigest()
+            try:
+                parsed_json = json.loads(raw)
+            except json.JSONDecodeError:
+                raise ProviderValidationError(
+                    "Ollama response failed the requested schema",
+                    issues=(ValidationIssue("$", "json_invalid"),),
+                ) from None
+            parsed_json = validated_provider_json(parsed_json)
+            try:
+                parsed = request.output_schema.model_validate(parsed_json)
+            except ValidationError as exc:
+                raise ProviderValidationError(
+                    "Ollama response failed the requested schema",
+                    issues=validation_issues(exc),
+                ) from None
+            input_tokens = _nonnegative_count(result.get("prompt_eval_count"))
+            output_tokens = _nonnegative_count(result.get("eval_count"))
+            reasoning_tokens = _nonnegative_count(
+                result.get("reasoning_eval_count", 0)
             )
-        try:
-            raw_bytes = raw.encode("utf-8", errors="strict")
-        except UnicodeError:
-            raise ProviderValidationError(
-                "Ollama response failed the requested schema",
-                issues=(ValidationIssue("$", "invalid_utf8"),),
-            ) from None
-        try:
-            parsed_json = json.loads(raw)
-        except json.JSONDecodeError:
-            raise ProviderValidationError(
-                "Ollama response failed the requested schema",
-                issues=(ValidationIssue("$", "json_invalid"),),
-            ) from None
-        parsed_json = validated_provider_json(parsed_json)
-        try:
-            parsed = request.output_schema.model_validate(parsed_json)
-        except ValidationError as exc:
-            raise ProviderValidationError(
-                "Ollama response failed the requested schema",
-                issues=validation_issues(exc),
-            ) from None
+        except ProviderError as error:
+            error.input_tokens = audit_input_tokens
+            error.output_tokens = audit_output_tokens
+            error.reasoning_tokens = audit_reasoning_tokens
+            error.response_hash = locals().get("response_hash")
+            raise
         return ModelResponse(
             data=parsed,
-            raw_response_hash=hashlib.sha256(raw_bytes).hexdigest(),
-            input_tokens=_nonnegative_count(result.get("prompt_eval_count")),
-            output_tokens=_nonnegative_count(result.get("eval_count")),
-            reasoning_tokens=_nonnegative_count(result.get("reasoning_eval_count", 0)),
+            raw_response_hash=response_hash,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            reasoning_tokens=reasoning_tokens,
             model=self.model,
             latency_ms=max(0, round((self.clock() - started) * 1000)),
             provider=self.name,
@@ -247,3 +267,8 @@ def _nonnegative_count(value: Any) -> int:
             issues=(ValidationIssue("usage", "invalid"),)
         )
     return value
+
+
+def _known_count(value: Any) -> int:
+    """Return valid reported usage for failure telemetry, otherwise zero."""
+    return value if type(value) is int and value >= 0 else 0

@@ -455,7 +455,18 @@ class EvidenceIngestor:
                 raw_content_path=Path(
                     document.raw_content_path or cached_paths[document.content_hash]
                 ),
-                passages=tuple(EvidencePassage(**vars(item)) for item in passages),
+                passages=tuple(
+                    EvidencePassage(
+                        passage_id=item.passage_id,
+                        document_id=item.document_id,
+                        ordinal=item.ordinal,
+                        text=item.text,
+                        content_hash=item.content_hash,
+                        start_offset=item.start_offset,
+                        end_offset=item.end_offset,
+                    )
+                    for item in passages
+                ),
             )
             for document, passages in stored_records
         )

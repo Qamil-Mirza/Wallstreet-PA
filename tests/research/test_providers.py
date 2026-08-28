@@ -62,6 +62,7 @@ def make_request(
     run_id: str = "run-1",
     policy: FallbackPolicy = FallbackPolicy.OUTAGES,
     effort: ReasoningEffort = ReasoningEffort.LOW,
+    attempt_recorder=None,
 ) -> ModelRequest:
     return ModelRequest(
         role=role,
@@ -72,6 +73,7 @@ def make_request(
         reasoning_effort=effort,
         fallback_policy=policy,
         run_id=run_id,
+        attempt_recorder=attempt_recorder,
     )
 
 
@@ -487,12 +489,22 @@ def test_ollama_schema_errors_are_typed_and_redacted():
     secret = "portfolio-secret-value"
     session = FakeSession([
         FakeHttpResponse({"models": [{"name": "research:latest"}]}),
-        FakeHttpResponse({"response": '{"wrong":"' + secret + '"}'}),
+        FakeHttpResponse({
+            "response": '{"wrong":"' + secret + '"}',
+            "prompt_eval_count": 9, "eval_count": 4,
+            "reasoning_eval_count": 1,
+        }),
     ])
     provider = OllamaProvider("http://localhost:11434", "research:latest", session=session)
     with pytest.raises(ProviderValidationError) as raised:
         provider.generate(make_request())
     assert secret not in str(raised.value)
+    assert (
+        raised.value.input_tokens,
+        raised.value.output_tokens,
+        raised.value.reasoning_tokens,
+    ) == (9, 4, 1)
+    assert len(raised.value.response_hash) == 64
 
 
 @pytest.mark.parametrize("unsafe_json", ['{"answer":"marker\\ud800"}', '{"answer":"marker\\u0000"}'])
@@ -662,6 +674,32 @@ def test_openai_rejects_terminal_states_after_reconciling_valid_usage(
     assert "marker" not in str(raised.value)
     assert raised.value.__cause__ is None
     assert ledger.month_total(2026, 8) == Decimal("0.000010")
+
+
+def test_router_trace_retains_reconciled_terminal_openai_usage(migrated_store):
+    provider, _ = make_openai_provider(
+        migrated_store,
+        FakeOpenAIClient(openai_result(status="incomplete")),
+    )
+    traces = []
+    router = ProviderRouter(
+        make_config(external=True), provider, StubProvider("ollama", [])
+    )
+
+    with pytest.raises(TaskDeferred):
+        router.generate(make_request(
+            policy=FallbackPolicy.NEVER, attempt_recorder=traces.append
+        ))
+
+    assert len(traces) == 1
+    assert traces[0].status == "failed"
+    assert traces[0].failure_code == "response_incomplete"
+    assert traces[0].model == "gpt-test"
+    assert (
+        traces[0].input_tokens,
+        traces[0].output_tokens,
+        traces[0].reasoning_tokens,
+    ) == (4, 3, 1)
 
 
 def test_openai_refusal_is_nonretryable_redacted_and_usage_is_reconciled(
@@ -1008,13 +1046,20 @@ def test_validation_failure_does_not_fallback_without_explicit_policy():
     assert local.calls == []
 
 
-def test_explicit_any_failure_policy_allows_validation_fallback():
+def test_validation_failure_policy_never_exceeds_two_physical_calls():
+    external = StubProvider(
+        "openai", [ProviderValidationError(), ProviderValidationError()]
+    )
+    local = StubProvider("ollama", [response("ollama")])
     router = ProviderRouter(
         make_config(external=True),
-        StubProvider("openai", [ProviderValidationError(), ProviderValidationError()]),
-        StubProvider("ollama", [response("ollama")]),
+        external,
+        local,
     )
-    assert router.generate(make_request(policy=FallbackPolicy.ANY_FAILURE)).fallback_reason == "external_validation"
+    with pytest.raises(ProviderValidationError):
+        router.generate(make_request(policy=FallbackPolicy.ANY_FAILURE))
+    assert len(external.calls) == 2
+    assert local.calls == []
 
 
 def test_external_validation_retries_same_provider_once_with_safe_feedback():
@@ -1037,18 +1082,18 @@ def test_external_validation_retries_same_provider_once_with_safe_feedback():
     assert '"code":"missing"' in external.calls[1].provider_input
 
 
-def test_two_external_validation_failures_then_explicitly_fall_back_to_ollama():
+def test_two_external_validation_failures_stop_before_local_fallback():
     external = StubProvider(
         "openai",
         [ProviderValidationError(), ProviderValidationError()],
     )
     local = StubProvider("ollama", [response("ollama")])
-    result = ProviderRouter(make_config(external=True), external, local).generate(
-        make_request(policy=FallbackPolicy.ANY_FAILURE)
-    )
+    with pytest.raises(ProviderValidationError):
+        ProviderRouter(make_config(external=True), external, local).generate(
+            make_request(policy=FallbackPolicy.ANY_FAILURE)
+        )
     assert len(external.calls) == 2
-    assert len(local.calls) == 1
-    assert result.fallback_reason == "external_validation"
+    assert local.calls == []
 
 
 def test_two_external_validation_failures_defer_when_local_is_forbidden():
@@ -1126,18 +1171,25 @@ def test_same_run_validation_retries_do_not_leak_feedback_between_concurrent_cal
     router = ProviderRouter(make_config(external=True), external, local)
 
     with ThreadPoolExecutor(max_workers=2) as pool:
-        results = list(
-            pool.map(
-                lambda _: router.generate(
-                    make_request(policy=FallbackPolicy.ANY_FAILURE)
-                ),
-                range(2),
+        futures = [
+            pool.submit(
+                router.generate,
+                make_request(policy=FallbackPolicy.ANY_FAILURE),
             )
-        )
+            for _ in range(2)
+        ]
+        results = []
+        errors = []
+        for future in futures:
+            try:
+                results.append(future.result())
+            except ProviderValidationError as error:
+                errors.append(error)
 
-    assert {result.provider for result in results} == {"openai", "ollama"}
+    assert [result.provider for result in results] == ["openai"]
+    assert len(errors) == 1
     assert len(external.calls) == 3
     assert external.calls[0].validation_feedback == ()
     assert external.calls[1].validation_feedback
     assert external.calls[2].validation_feedback == ()
-    assert len(local.calls) == 1
+    assert local.calls == []

@@ -31,6 +31,10 @@ class ResearchStoreError(RuntimeError):
     """Raised when the research store cannot safely initialize."""
 
 
+class AgentExecutionConflict(ResearchStoreError):
+    """Raised when a logical execution is already claimed or task state conflicts."""
+
+
 def _has_sql_content(script: str) -> bool:
     """Return whether text contains anything other than whitespace/comments."""
     index = 0
@@ -105,6 +109,8 @@ class DocumentPassageRecord:
     content_hash: str
     start_offset: int
     end_offset: int
+    published_at: datetime | None = None
+    retrieved_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -133,16 +139,37 @@ class AgentRunAudit:
     role: AgentRole
     started_at: datetime
     completed_at: datetime
-    provider: str
-    model: str
-    inference_mode: InferenceMode
+    provider: str | None
+    model: str | None
+    inference_mode: InferenceMode | None
     prompt_hash: str
-    evidence_hash: str
-    output_hash: str
+    evidence_hash: str | None
+    output_hash: str | None
     input_tokens: int
     output_tokens: int
     reasoning_tokens: int
     fallback_reason: str | None = None
+    attempt_id: str | None = None
+    status: str = "succeeded"
+    safe_failure_code: str | None = None
+
+
+@dataclass(frozen=True)
+class ProviderAttemptAudit:
+    """One redacted physical provider call retained under an agent execution."""
+
+    status: str
+    provider: str
+    model: str
+    latency_ms: int
+    input_tokens: int
+    output_tokens: int
+    reasoning_tokens: int
+    inference_mode: InferenceMode
+    recorded_at: datetime
+    fallback_reason: str | None = None
+    response_hash: str | None = None
+    failure_code: str | None = None
 
 
 class ResearchStore:
@@ -1158,8 +1185,11 @@ class ResearchStore:
         self,
         passage_ids: Sequence[str],
         claim_ids: Sequence[str],
+        *,
+        as_of: datetime,
     ) -> AgentEvidencePacket | None:
         """Load a complete safe evidence packet, or ``None`` for any bad reference."""
+        cutoff = _parse_utc(_utc_text(as_of, "agent evidence as_of"))
         requested_passages = tuple(sorted(set(passage_ids)))
         requested_claims = tuple(sorted(set(claim_ids)))
         if (
@@ -1170,19 +1200,29 @@ class ResearchStore:
             return None
         connection = self.connect()
         try:
+            connection.execute("BEGIN")
             placeholders = ",".join("?" for _ in requested_passages)
             passage_rows = connection.execute(
                 "SELECT p.passage_id, p.document_id, p.ordinal, p.text, "
-                "p.content_hash, p.locator_json, d.extraction_status "
+                "p.content_hash, p.locator_json, d.published_at, d.retrieved_at, "
+                "d.extraction_status "
                 "FROM document_passages AS p JOIN source_documents AS d "
                 "ON d.document_id = p.document_id "
                 f"WHERE p.passage_id IN ({placeholders}) ORDER BY p.passage_id",
                 requested_passages,
             ).fetchall()
             if len(passage_rows) != len(requested_passages) or any(
-                row[6] not in {"complete", "extracted", "normalized", "success"}
+                row[8] not in {"complete", "extracted", "normalized", "success"}
                 for row in passage_rows
             ):
+                return None
+            try:
+                if any(
+                    _parse_utc(row[6]) > cutoff or _parse_utc(row[7]) > cutoff
+                    for row in passage_rows
+                ):
+                    return None
+            except (TypeError, ValueError):
                 return None
             claim_rows = ()
             if requested_claims:
@@ -1196,7 +1236,15 @@ class ResearchStore:
                 ).fetchall()
                 if len(claim_rows) != len(requested_claims):
                     return None
+                try:
+                    if any(_parse_utc(row[4]) > cutoff for row in claim_rows):
+                        return None
+                except (TypeError, ValueError):
+                    return None
+            connection.commit()
         finally:
+            if connection.in_transaction:
+                connection.rollback()
             connection.close()
         passages = []
         for row in passage_rows:
@@ -1205,12 +1253,275 @@ class ResearchStore:
                 passage_id=row[0], document_id=row[1], ordinal=row[2], text=row[3],
                 content_hash=row[4], start_offset=locator.get("start_offset", 0),
                 end_offset=locator.get("end_offset", len(row[3])),
+                published_at=_parse_utc(row[6]), retrieved_at=_parse_utc(row[7]),
             ))
         claims = tuple(EvidenceClaim(
             claim_id=row[0], entity_id=row[1], kind=ClaimKind(row[2]), text=row[3],
             as_of=_parse_utc(row[4]), confidence=Decimal(row[5]), status=row[6],
         ) for row in claim_rows)
         return AgentEvidencePacket(tuple(passages), claims)
+
+    def claim_agent_execution(
+        self,
+        *,
+        workflow_run_id: str,
+        task_id: str,
+        role: AgentRole,
+        schema_version: str,
+        input_hash: str,
+        prompt_hash: str,
+        evidence_hash: str | None,
+        started_at: datetime,
+    ) -> str:
+        """Atomically claim one deterministic logical attempt before inference."""
+        for name, value in (
+            ("workflow_run_id", workflow_run_id),
+            ("task_id", task_id),
+            ("schema_version", schema_version),
+        ):
+            if (
+                not isinstance(value, str)
+                or not value
+                or len(value) > 256
+                or any(character.isspace() for character in value)
+            ):
+                raise ValueError(f"{name} is invalid")
+        if not isinstance(role, AgentRole):
+            raise TypeError("role must be AgentRole")
+        for digest in (input_hash, prompt_hash):
+            if re.fullmatch(r"[0-9a-f]{64}", digest or "") is None:
+                raise ValueError("agent execution hashes must be SHA-256 digests")
+        if evidence_hash is not None and re.fullmatch(
+            r"[0-9a-f]{64}", evidence_hash
+        ) is None:
+            raise ValueError("agent execution evidence hash must be SHA-256")
+        started_text = _utc_text(started_at, "agent execution started_at")
+        identity = _canonical_json({
+            "role": role.value,
+            "schema_version": schema_version,
+            "task_id": task_id,
+            "workflow_run_id": workflow_run_id,
+        })
+        attempt_id = "agent_attempt_" + hashlib.sha256(
+            identity.encode("utf-8")
+        ).hexdigest()
+        task_scope = _canonical_json({
+            "contract_version": schema_version,
+            "input_hash": input_hash,
+            "role": role.value,
+        })
+        with self.transaction() as connection:
+            existing_attempt = connection.execute(
+                "SELECT state FROM agent_executions WHERE attempt_id = ?",
+                (attempt_id,),
+            ).fetchone()
+            if existing_attempt is not None:
+                raise AgentExecutionConflict(
+                    "agent execution is already claimed or terminal"
+                )
+            existing_task = connection.execute(
+                "SELECT task_kind, scope_json, state FROM research_tasks "
+                "WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            if existing_task is None:
+                connection.execute(
+                    "INSERT INTO research_tasks (task_id, task_kind, scope_json, "
+                    "state, priority, created_at, started_at) "
+                    "VALUES (?, ?, ?, 'running', 0, ?, ?)",
+                    (task_id, role.value, task_scope, started_text, started_text),
+                )
+            else:
+                if (
+                    existing_task[0] != role.value
+                    or existing_task[1] != task_scope
+                    or existing_task[2] != "pending"
+                ):
+                    raise AgentExecutionConflict(
+                        "research task role, scope, or state conflicts"
+                    )
+                connection.execute(
+                    "UPDATE research_tasks SET state = 'running', started_at = ? "
+                    "WHERE task_id = ? AND state = 'pending'",
+                    (started_text, task_id),
+                )
+            connection.execute(
+                "INSERT INTO agent_executions (attempt_id, workflow_run_id, "
+                "task_id, role, schema_version, input_hash, prompt_hash, "
+                "evidence_hash, state, started_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'running', ?)",
+                (
+                    attempt_id, workflow_run_id, task_id, role.value,
+                    schema_version, input_hash, prompt_hash, evidence_hash,
+                    started_text,
+                ),
+            )
+        return attempt_id
+
+    def set_agent_execution_evidence_hash(
+        self, attempt_id: str, evidence_hash: str
+    ) -> None:
+        """Attach the canonical evidence hash once before the provider call."""
+        if re.fullmatch(r"[0-9a-f]{64}", evidence_hash or "") is None:
+            raise ValueError("agent execution evidence hash must be SHA-256")
+        with self.transaction() as connection:
+            cursor = connection.execute(
+                "UPDATE agent_executions SET evidence_hash = ? "
+                "WHERE attempt_id = ? AND state = 'running' "
+                "AND evidence_hash IS NULL",
+                (evidence_hash, attempt_id),
+            )
+            if cursor.rowcount != 1:
+                raise AgentExecutionConflict(
+                    "agent execution evidence hash cannot be attached"
+                )
+
+    def record_provider_attempt(
+        self, attempt_id: str, attempt: ProviderAttemptAudit
+    ) -> None:
+        """Append one immutable provider call while its execution is running."""
+        if not isinstance(attempt, ProviderAttemptAudit):
+            raise TypeError("attempt must be ProviderAttemptAudit")
+        if attempt.status not in {"succeeded", "failed"}:
+            raise ValueError("provider attempt status is invalid")
+        for name, value in (("provider", attempt.provider), ("model", attempt.model)):
+            if (
+                not isinstance(value, str)
+                or not value.strip()
+                or len(value) > 256
+                or any(ord(character) < 32 or ord(character) == 127 for character in value)
+            ):
+                raise ValueError(f"provider attempt {name} is invalid")
+        if not isinstance(attempt.inference_mode, InferenceMode):
+            raise TypeError("provider attempt inference_mode must be InferenceMode")
+        for name, value in (
+            ("latency_ms", attempt.latency_ms),
+            ("input_tokens", attempt.input_tokens),
+            ("output_tokens", attempt.output_tokens),
+            ("reasoning_tokens", attempt.reasoning_tokens),
+        ):
+            if type(value) is not int or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer")
+        if attempt.status == "failed" and re.fullmatch(
+            r"[a-z0-9_.-]+", attempt.failure_code or ""
+        ) is None:
+            raise ValueError("failed provider attempts require a safe failure code")
+        if attempt.status == "succeeded" and attempt.failure_code is not None:
+            raise ValueError("successful provider attempts cannot have a failure code")
+        if attempt.response_hash is not None and re.fullmatch(
+            r"[0-9a-f]{64}", attempt.response_hash
+        ) is None:
+            raise ValueError("provider response hash must be SHA-256")
+        if attempt.fallback_reason is not None and re.fullmatch(
+            r"[a-z0-9_.-]+", attempt.fallback_reason
+        ) is None:
+            raise ValueError("provider fallback reason must be a safe code")
+        recorded_text = _utc_text(attempt.recorded_at, "provider attempt recorded_at")
+        with self.transaction() as connection:
+            execution = connection.execute(
+                "SELECT state FROM agent_executions WHERE attempt_id = ?",
+                (attempt_id,),
+            ).fetchone()
+            if execution != ("running",):
+                raise AgentExecutionConflict("agent execution is not running")
+            ordinal = connection.execute(
+                "SELECT COALESCE(MAX(ordinal), 0) + 1 FROM provider_attempts "
+                "WHERE attempt_id = ?",
+                (attempt_id,),
+            ).fetchone()[0]
+            provider_attempt_id = "provider_attempt_" + hashlib.sha256(
+                f"{attempt_id}:{ordinal}".encode("ascii")
+            ).hexdigest()
+            connection.execute(
+                "INSERT INTO provider_attempts (provider_attempt_id, attempt_id, "
+                "ordinal, status, provider, model, latency_ms, input_tokens, "
+                "output_tokens, reasoning_tokens, inference_mode, fallback_reason, "
+                "response_hash, failure_code, recorded_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    provider_attempt_id, attempt_id, ordinal, attempt.status,
+                    attempt.provider, attempt.model, attempt.latency_ms,
+                    attempt.input_tokens, attempt.output_tokens,
+                    attempt.reasoning_tokens, attempt.inference_mode.value,
+                    attempt.fallback_reason, attempt.response_hash,
+                    attempt.failure_code, recorded_text,
+                ),
+            )
+
+    def provider_attempt_count(self, attempt_id: str) -> int:
+        """Return the number of immutable physical calls under an execution."""
+        connection = self.connect()
+        try:
+            return connection.execute(
+                "SELECT COUNT(*) FROM provider_attempts WHERE attempt_id = ?",
+                (attempt_id,),
+            ).fetchone()[0]
+        finally:
+            connection.close()
+
+    def finalize_agent_execution(
+        self,
+        attempt_id: str,
+        *,
+        succeeded: bool,
+        completed_at: datetime,
+        output_hash: str | None = None,
+        failure_code: str | None = None,
+    ) -> None:
+        """Seal a running execution once with aggregate provider telemetry."""
+        completed_text = _utc_text(completed_at, "agent execution completed_at")
+        if succeeded:
+            if re.fullmatch(r"[0-9a-f]{64}", output_hash or "") is None:
+                raise ValueError("successful execution requires output hash")
+            if failure_code is not None:
+                raise ValueError("successful execution cannot have failure code")
+        elif (
+            output_hash is not None
+            or not isinstance(failure_code, str)
+            or re.fullmatch(r"[a-z0-9_.-]+", failure_code) is None
+        ):
+            raise ValueError("failed execution requires a safe failure code")
+        with self.transaction() as connection:
+            execution = connection.execute(
+                "SELECT task_id, state FROM agent_executions WHERE attempt_id = ?",
+                (attempt_id,),
+            ).fetchone()
+            if execution is None or execution[1] != "running":
+                raise AgentExecutionConflict("agent execution is not running")
+            aggregate = connection.execute(
+                "SELECT COUNT(*), COALESCE(SUM(input_tokens), 0), "
+                "COALESCE(SUM(output_tokens), 0), "
+                "COALESCE(SUM(reasoning_tokens), 0) "
+                "FROM provider_attempts WHERE attempt_id = ?",
+                (attempt_id,),
+            ).fetchone()
+            last = connection.execute(
+                "SELECT provider, model, inference_mode, fallback_reason "
+                "FROM provider_attempts WHERE attempt_id = ? "
+                "ORDER BY ordinal DESC LIMIT 1",
+                (attempt_id,),
+            ).fetchone()
+            provider, model, inference_mode, fallback_reason = (
+                last if last is not None else (None, None, None, None)
+            )
+            state = "succeeded" if succeeded else "failed"
+            connection.execute(
+                "UPDATE agent_executions SET state = ?, completed_at = ?, "
+                "safe_failure_code = ?, output_hash = ?, provider = ?, model = ?, "
+                "inference_mode = ?, fallback_reason = ?, "
+                "provider_attempt_count = ?, input_tokens = ?, output_tokens = ?, "
+                "reasoning_tokens = ? WHERE attempt_id = ? AND state = 'running'",
+                (
+                    state, completed_text, failure_code, output_hash, provider,
+                    model, inference_mode, fallback_reason, *aggregate, attempt_id,
+                ),
+            )
+            task_state = "completed" if succeeded else "failed"
+            connection.execute(
+                "UPDATE research_tasks SET state = ?, completed_at = ?, "
+                "error_text = ? WHERE task_id = ? AND state = 'running'",
+                (task_state, completed_text, failure_code, execution[0]),
+            )
 
     def record_agent_run_audit(self, audit: AgentRunAudit) -> None:
         """Atomically retain hashes and usage, never prompt/evidence/output bodies."""
@@ -1268,6 +1579,33 @@ class ResearchStore:
         """Return the redacted audit view for a completed agent run."""
         connection = self.connect()
         try:
+            execution = connection.execute(
+                "SELECT attempt_id, workflow_run_id, task_id, role, state, started_at, "
+                "completed_at, provider, model, inference_mode, prompt_hash, "
+                "evidence_hash, output_hash, input_tokens, output_tokens, "
+                "reasoning_tokens, fallback_reason, safe_failure_code "
+                "FROM agent_executions WHERE state IN ('succeeded', 'failed') "
+                "AND (attempt_id = ? OR "
+                "workflow_run_id = ?) ORDER BY completed_at DESC, attempt_id LIMIT 1",
+                (run_id, run_id),
+            ).fetchone()
+            if execution is not None:
+                return AgentRunAudit(
+                    run_id=execution[1], task_id=execution[2],
+                    role=AgentRole(execution[3]),
+                    started_at=_parse_utc(execution[5]),
+                    completed_at=_parse_utc(execution[6]),
+                    provider=execution[7], model=execution[8],
+                    inference_mode=(
+                        None if execution[9] is None
+                        else InferenceMode(execution[9])
+                    ),
+                    prompt_hash=execution[10], evidence_hash=execution[11],
+                    output_hash=execution[12], input_tokens=execution[13],
+                    output_tokens=execution[14], reasoning_tokens=execution[15],
+                    fallback_reason=execution[16], attempt_id=execution[0],
+                    status=execution[4], safe_failure_code=execution[17],
+                )
             row = connection.execute(
                 "SELECT run_id, task_id, role, started_at, completed_at, provider, "
                 "model, metadata_json FROM agent_runs WHERE run_id = ? "

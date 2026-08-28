@@ -91,5 +91,7 @@ class FundamentalAnalyst(
         if (
             output.security_id != task_input.security.security_id
             or output.horizon_months != task_input.horizon_months
+            or output.valuation.currency != task_input.security.currency
+            or output.valuation.as_of > task_input.as_of
         ):
             raise AgentContractError("recommendation does not match eligible security task")

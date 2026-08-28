@@ -32,15 +32,20 @@ class IneligibleSecurity(AgentContractError):
 
 
 def _safe_identifier(value: str) -> str:
+    normalized = unicodedata.normalize("NFC", value) if isinstance(value, str) else value
     if (
-        not isinstance(value, str)
-        or not value.strip()
-        or len(value) > 256
-        or any(character.isspace() for character in value)
-        or any(unicodedata.category(character) == "Cc" for character in value)
+        not isinstance(normalized, str)
+        or not normalized.strip()
+        or len(normalized) > 256
+        or any(character.isspace() for character in normalized)
+        or any(unicodedata.category(character) == "Cc" for character in normalized)
     ):
         raise ValueError("identifier is invalid")
-    return value
+    try:
+        normalized.encode("utf-8", errors="strict")
+    except UnicodeError:
+        raise ValueError("identifier is invalid") from None
+    return normalized
 
 
 def _safe_text(value: str) -> str:
@@ -69,7 +74,9 @@ def _sorted_ids(values: tuple[str, ...]) -> tuple[str, ...]:
 
 
 class FrozenContract(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    model_config = ConfigDict(
+        extra="forbid", frozen=True, revalidate_instances="always"
+    )
 
 
 class EvidenceInput(FrozenContract):
@@ -94,6 +101,11 @@ class AgentTask(FrozenContract, Generic[InputT]):
 
     _validate_task_id = field_validator("task_id")(_safe_identifier)
     _validate_run_id = field_validator("run_id")(_safe_identifier)
+
+    @property
+    def workflow_run_id(self) -> str:
+        """Name the orchestration scope explicitly, distinct from attempt IDs."""
+        return self.run_id
 
 
 class AnalyticalOutput(FrozenContract):
@@ -284,6 +296,7 @@ class SecurityEligibility(FrozenContract):
     entity_id: str
     security_id: str | None = None
     symbol: str
+    currency: str = Field(default="USD", pattern=r"^[A-Z]{3}$")
     asset_kind: Literal["equity", "private", "etf", "cash", "nontradable"]
     resolved: bool
     public: bool
@@ -294,6 +307,11 @@ class SecurityEligibility(FrozenContract):
         lambda value: None if value is None else _safe_identifier(value)
     )
     _symbol = field_validator("symbol")(_safe_identifier)
+
+    @field_validator("currency", mode="before")
+    @classmethod
+    def _currency(cls, value: object) -> object:
+        return value.strip().upper() if isinstance(value, str) else value
 
     @property
     def rating_eligible(self) -> bool:
@@ -312,8 +330,8 @@ class FundamentalAnalystInput(EvidenceInput):
 
 
 class ValuationRange(FrozenContract):
-    low: Decimal = Field(allow_inf_nan=False)
-    high: Decimal = Field(allow_inf_nan=False)
+    low: Decimal = Field(gt=Decimal("0"), allow_inf_nan=False)
+    high: Decimal = Field(gt=Decimal("0"), allow_inf_nan=False)
     currency: str = Field(pattern=r"^[A-Z]{3}$")
     as_of: datetime
 

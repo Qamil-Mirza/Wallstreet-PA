@@ -4,27 +4,37 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import replace
 from datetime import datetime
 from importlib import resources
 from typing import Generic, TypeVar
 
 from pydantic import BaseModel, ValidationError
 
-from ..models import AgentRole
+from ..models import AgentRole, InferenceMode
 from ..providers.base import (
     FallbackPolicy,
     ModelRequest,
     ReasoningEffort,
     ValidationIssue,
+    ProviderAttemptTrace,
+    ProviderError,
+    provider_failure_code,
     validation_issues,
 )
-from ..store import AgentEvidencePacket, AgentRunAudit, ResearchStore
+from ..store import (
+    AgentEvidencePacket,
+    AgentExecutionConflict,
+    ProviderAttemptAudit,
+    ResearchStore,
+)
 from .contracts import (
     AgentContractError,
     AgentTask,
     AnalyticalOutput,
     EvidenceInput,
     EvidenceUnavailable,
+    IneligibleSecurity,
 )
 
 
@@ -100,6 +110,8 @@ class BoundedAgent(Generic[InputT, OutputT]):
                     "end_offset": passage.end_offset,
                     "ordinal": passage.ordinal,
                     "passage_id": passage.passage_id,
+                    "published_at": passage.published_at.isoformat(),
+                    "retrieved_at": passage.retrieved_at.isoformat(),
                     "start_offset": passage.start_offset,
                     "text": passage.text,
                 }
@@ -151,8 +163,17 @@ class BoundedAgent(Generic[InputT, OutputT]):
 
     def run(self, task: AgentTask[InputT]) -> OutputT:
         try:
-            validated_task = AgentTask[self.input_type].model_validate(task)
-        except (TypeError, ValueError, ValidationError):
+            canonical_task = json.dumps(
+                task.model_dump(mode="json", warnings="error"),
+                ensure_ascii=False,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            validated_task = AgentTask[self.input_type].model_validate_json(
+                canonical_task
+            )
+        except Exception:
             raise AgentContractError("agent task failed contract validation") from None
         started_at = self.clock()
         if (
@@ -161,26 +182,126 @@ class BoundedAgent(Generic[InputT, OutputT]):
             or started_at.utcoffset() is None
         ):
             raise AgentContractError("agent clock must return an aware datetime")
-        self._preflight(validated_task.input)
-        packet = self.store.load_agent_evidence(
-            validated_task.input.evidence_ids, validated_task.input.claim_ids
-        )
-        if packet is None:
-            raise EvidenceUnavailable("agent evidence is unavailable")
-        self._validate_evidence_packet(validated_task.input, packet)
-        request = self._request(validated_task, packet)
-        response = self.router.generate(request)
         try:
-            output = self._validate_response(validated_task.input, response)
-        except (AgentContractError, ValidationError) as first_error:
-            repair = request.for_validation_retry(self._repair_issues(first_error))
-            response = self.router.generate(repair)
+            canonical_input = json.dumps(
+                validated_task.input.model_dump(mode="json", warnings="error"),
+                ensure_ascii=False,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            attempt_id = self.store.claim_agent_execution(
+                workflow_run_id=validated_task.run_id,
+                task_id=validated_task.task_id,
+                role=self.role,
+                schema_version=validated_task.schema_version,
+                input_hash=hashlib.sha256(
+                    canonical_input.encode("utf-8")
+                ).hexdigest(),
+                prompt_hash=self.prompt_hash,
+                evidence_hash=None,
+                started_at=started_at,
+            )
+        except AgentExecutionConflict as error:
+            raise AgentContractError(str(error)) from None
+
+        provider_called = False
+        try:
+            self._preflight(validated_task.input)
+            packet = self.store.load_agent_evidence(
+                validated_task.input.evidence_ids,
+                validated_task.input.claim_ids,
+                as_of=validated_task.input.as_of,
+            )
+            if packet is None:
+                raise EvidenceUnavailable("agent evidence is unavailable")
+            self._validate_evidence_packet(validated_task.input, packet)
+            request = self._request(validated_task, packet)
+            self.store.set_agent_execution_evidence_hash(
+                attempt_id, request.evidence_hash
+            )
+
+            def record_attempt(trace: ProviderAttemptTrace) -> None:
+                self.store.record_provider_attempt(
+                    attempt_id,
+                    ProviderAttemptAudit(
+                        status=trace.status, provider=trace.provider,
+                        model=trace.model, latency_ms=trace.latency_ms,
+                        input_tokens=trace.input_tokens,
+                        output_tokens=trace.output_tokens,
+                        reasoning_tokens=trace.reasoning_tokens,
+                        inference_mode=trace.inference_mode,
+                        recorded_at=trace.recorded_at,
+                        fallback_reason=trace.fallback_reason,
+                        response_hash=trace.response_hash,
+                        failure_code=trace.failure_code,
+                    ),
+                )
+
+            request = replace(
+                request, attempt_id=attempt_id, attempt_recorder=record_attempt
+            )
+            provider_called = True
+            response = self.router.generate(request)
+            if self.store.provider_attempt_count(attempt_id) == 0:
+                self.store.record_provider_attempt(
+                    attempt_id,
+                    ProviderAttemptAudit(
+                        status="succeeded", provider=response.provider,
+                        model=response.model,
+                        latency_ms=getattr(response, "latency_ms", 0),
+                        input_tokens=response.input_tokens,
+                        output_tokens=response.output_tokens,
+                        reasoning_tokens=response.reasoning_tokens,
+                        inference_mode=response.inference_mode,
+                        recorded_at=self._completed_at(started_at),
+                        fallback_reason=response.fallback_reason,
+                        response_hash=response.raw_response_hash,
+                    ),
+                )
             try:
                 output = self._validate_response(validated_task.input, response)
             except (AgentContractError, ValidationError):
                 raise AgentContractError(
-                    "agent output failed contract validation after one repair"
+                    "agent output failed contract validation"
                 ) from None
+            completed_at = self._completed_at(started_at)
+            canonical_output = json.dumps(
+                output.model_dump(mode="json"), ensure_ascii=False, allow_nan=False,
+                sort_keys=True, separators=(",", ":"),
+            )
+            self.store.finalize_agent_execution(
+                attempt_id, succeeded=True, completed_at=completed_at,
+                output_hash=hashlib.sha256(
+                    canonical_output.encode("utf-8")
+                ).hexdigest(),
+            )
+            return output
+        except Exception as error:
+            if provider_called and self.store.provider_attempt_count(attempt_id) == 0:
+                self.store.record_provider_attempt(
+                    attempt_id,
+                    ProviderAttemptAudit(
+                        status="failed", provider="router", model="unknown",
+                        latency_ms=0, input_tokens=0, output_tokens=0,
+                        reasoning_tokens=0,
+                        inference_mode=InferenceMode.EXTERNAL,
+                        recorded_at=self._completed_at(started_at),
+                        failure_code=(
+                            provider_failure_code(error)
+                            if isinstance(error, ProviderError)
+                            else "provider_error"
+                        ),
+                    ),
+                )
+            self.store.finalize_agent_execution(
+                attempt_id, succeeded=False,
+                completed_at=self._completed_at(started_at),
+                failure_code=self._failure_code(error),
+            )
+            raise
+
+    def _completed_at(self, started_at: datetime) -> datetime:
         completed_at = self.clock()
         if (
             not isinstance(completed_at, datetime)
@@ -188,20 +309,17 @@ class BoundedAgent(Generic[InputT, OutputT]):
             or completed_at.utcoffset() is None
             or completed_at < started_at
         ):
-            raise AgentContractError("agent completion time is invalid")
-        canonical_output = json.dumps(
-            output.model_dump(mode="json"), ensure_ascii=False, allow_nan=False,
-            sort_keys=True, separators=(",", ":"),
-        )
-        self.store.record_agent_run_audit(AgentRunAudit(
-            run_id=validated_task.run_id, task_id=validated_task.task_id,
-            role=self.role, started_at=started_at, completed_at=completed_at,
-            provider=response.provider, model=response.model,
-            inference_mode=response.inference_mode, prompt_hash=self.prompt_hash,
-            evidence_hash=request.evidence_hash,
-            output_hash=hashlib.sha256(canonical_output.encode("utf-8")).hexdigest(),
-            input_tokens=response.input_tokens, output_tokens=response.output_tokens,
-            reasoning_tokens=response.reasoning_tokens,
-            fallback_reason=response.fallback_reason,
-        ))
-        return output
+            return started_at
+        return completed_at
+
+    @staticmethod
+    def _failure_code(error: Exception) -> str:
+        if isinstance(error, ProviderError):
+            return provider_failure_code(error)
+        if isinstance(error, EvidenceUnavailable):
+            return "evidence_unavailable"
+        if isinstance(error, IneligibleSecurity):
+            return "ineligible_security"
+        if isinstance(error, AgentContractError | ValidationError):
+            return "agent_contract"
+        return "agent_execution"

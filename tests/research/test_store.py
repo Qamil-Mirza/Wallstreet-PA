@@ -41,6 +41,8 @@ REQUIRED_TABLES = {
     "recommendations",
     "research_tasks",
     "agent_runs",
+    "agent_executions",
+    "provider_attempts",
     "reports",
     "model_usage",
     "budget_reservations",
@@ -131,11 +133,12 @@ def test_migration_is_idempotent_and_recorded_once(tmp_path):
         rows = connection.execute(
             "SELECT version, name, applied_at FROM schema_migrations"
         ).fetchall()
-    assert len(rows) == 4
+    assert len(rows) == 5
     assert rows[0][0:2] == (1, "001_initial.sql")
     assert rows[1][0:2] == (2, "002_nullable_portfolio_freshness.sql")
     assert rows[2][0:2] == (3, "003_claim_dependencies.sql")
     assert rows[3][0:2] == (4, "004_entity_resolution.sql")
+    assert rows[4][0:2] == (5, "005_agent_execution_audit.sql")
     assert all(row[2].endswith("Z") for row in rows)
 
 
@@ -240,7 +243,7 @@ def test_existing_v1_database_upgrades_nullable_freshness_without_data_loss(
             "WHERE type = 'index' AND name LIKE 'idx_positions_%' ORDER BY name"
         ).fetchall()
 
-    assert versions == [(1,), (2,), (3,), (4,)]
+    assert versions == [(1,), (2,), (3,), (4,), (5,)]
     assert stored_snapshot == snapshot_row
     assert stored_security == security_row
     assert stored_position == position_row
@@ -310,7 +313,7 @@ def test_existing_v2_claims_upgrade_with_lineage_anchor_without_data_loss(
             (claim.claim_id,),
         ).fetchall()
         foreign_key_errors = connection.execute("PRAGMA foreign_key_check").fetchall()
-    assert versions == [(1,), (2,), (3,), (4,)]
+    assert versions == [(1,), (2,), (3,), (4,), (5,)]
     assert retained_evidence == [("passage-1", stance)]
     if stance == "supports":
         assert upgraded.get_claim(claim.claim_id) == claim
@@ -408,7 +411,7 @@ def test_populated_v3_relationship_upgrade_preserves_and_quarantines_legacy_data
         }
         foreign_key_errors = connection.execute("PRAGMA foreign_key_check").fetchall()
 
-    assert versions == [(1,), (2,), (3,), (4,)]
+    assert versions == [(1,), (2,), (3,), (4,), (5,)]
     assert relationship == (
         source_entity_id,
         target_entity_id,
@@ -445,6 +448,132 @@ def test_populated_v3_relationship_upgrade_preserves_and_quarantines_legacy_data
                 "UPDATE relationships SET lineage_sealed = 1 "
                 "WHERE relationship_id = ?",
                 (relationship_id,),
+            )
+
+
+def test_populated_v4_database_upgrades_agent_audit_without_data_loss(
+    tmp_path, monkeypatch
+):
+    database_path = tmp_path / "research.db"
+    migration_root = (
+        Path(__file__).resolve().parents[2] / "news_bot/research/migrations"
+    )
+    legacy_migrations = []
+    for migration_name in (
+        "001_initial.sql",
+        "002_nullable_portfolio_freshness.sql",
+        "003_claim_dependencies.sql",
+        "004_entity_resolution.sql",
+    ):
+        copied = tmp_path / migration_name
+        shutil.copyfile(migration_root / migration_name, copied)
+        legacy_migrations.append(copied)
+    old_store = ResearchStore(database_path)
+    monkeypatch.setattr(
+        old_store, "_migration_files", lambda: tuple(legacy_migrations)
+    )
+    old_store.migrate()
+    created_at = "2026-08-24T00:00:00.000000Z"
+    with old_store.transaction() as connection:
+        connection.execute(
+            "INSERT INTO research_tasks (task_id, task_kind, scope_json, state, "
+            "priority, created_at, started_at, completed_at) "
+            "VALUES ('legacy-task', 'event_scout', '{}', 'completed', 0, ?, ?, ?)",
+            (created_at, created_at, created_at),
+        )
+        connection.execute(
+            "INSERT INTO agent_runs (run_id, task_id, role, status, started_at, "
+            "completed_at, provider, model, metadata_json) "
+            "VALUES ('legacy-run', 'legacy-task', 'event_scout', 'completed', "
+            "?, ?, 'ollama', 'legacy', '{}')",
+            (created_at, created_at),
+        )
+
+    upgraded = ResearchStore(database_path)
+    upgraded.migrate()
+
+    with upgraded.connect() as connection:
+        versions = connection.execute(
+            "SELECT version FROM schema_migrations ORDER BY version"
+        ).fetchall()
+        legacy = connection.execute(
+            "SELECT run_id, task_id, status FROM agent_runs"
+        ).fetchall()
+        foreign_key_errors = connection.execute(
+            "PRAGMA foreign_key_check"
+        ).fetchall()
+    assert versions == [(1,), (2,), (3,), (4,), (5,)]
+    assert legacy == [("legacy-run", "legacy-task", "completed")]
+    assert {"agent_executions", "provider_attempts"} <= upgraded.table_names()
+    assert foreign_key_errors == []
+
+
+def test_agent_execution_terminal_rows_and_provider_attempts_are_immutable(tmp_path):
+    store = make_migrated_store(tmp_path)
+    timestamp = "2026-08-24T00:00:00.000000Z"
+    attempt_id = "agent_attempt_" + "a" * 64
+    with store.transaction() as connection:
+        connection.execute(
+            "INSERT INTO research_tasks (task_id, task_kind, scope_json, state, "
+            "priority, created_at, started_at) "
+            "VALUES ('task-1', 'event_scout', '{}', 'running', 0, ?, ?)",
+            (timestamp, timestamp),
+        )
+        connection.execute(
+            "INSERT INTO agent_executions (attempt_id, workflow_run_id, task_id, "
+            "role, schema_version, input_hash, prompt_hash, evidence_hash, state, "
+            "started_at) VALUES (?, 'workflow-1', 'task-1', 'event_scout', '1', "
+            "?, ?, ?, 'running', ?)",
+            (attempt_id, "b" * 64, "c" * 64, "d" * 64, timestamp),
+        )
+        connection.execute(
+            "INSERT INTO provider_attempts (provider_attempt_id, attempt_id, "
+            "ordinal, status, provider, model, latency_ms, input_tokens, "
+            "output_tokens, reasoning_tokens, inference_mode, recorded_at) "
+            "VALUES (?, ?, 1, 'succeeded', 'ollama', 'local', 1, 1, 1, 0, "
+            "'local_only', ?)",
+            ("provider_attempt_" + "c" * 64, attempt_id, timestamp),
+        )
+        connection.execute(
+            "UPDATE agent_executions SET state = 'succeeded', completed_at = ?, "
+            "output_hash = ?, provider_attempt_count = 1, input_tokens = 1, "
+            "output_tokens = 1, reasoning_tokens = 0 WHERE attempt_id = ?",
+            (timestamp, "e" * 64, attempt_id),
+        )
+
+    with pytest.raises(sqlite3.IntegrityError, match="terminal"):
+        with store.transaction() as connection:
+            connection.execute(
+                "UPDATE agent_executions SET safe_failure_code = 'changed' "
+                "WHERE attempt_id = ?",
+                (attempt_id,),
+            )
+    with pytest.raises(sqlite3.IntegrityError, match="running"):
+        with store.transaction() as connection:
+            connection.execute(
+                "INSERT INTO provider_attempts (provider_attempt_id, attempt_id, "
+                "ordinal, status, provider, model, latency_ms, input_tokens, "
+                "output_tokens, reasoning_tokens, inference_mode, recorded_at) "
+                "VALUES ('provider_attempt_terminal', ?, 2, 'failed', 'ollama', "
+                "'local', 0, 0, 0, 0, 'local_only', ?)",
+                (attempt_id, timestamp),
+            )
+    with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+        with store.transaction() as connection:
+            connection.execute(
+                "UPDATE provider_attempts SET latency_ms = 2 "
+                "WHERE attempt_id = ?",
+                (attempt_id,),
+            )
+    with pytest.raises(sqlite3.IntegrityError):
+        with store.transaction() as connection:
+            connection.execute(
+                "INSERT INTO provider_attempts (provider_attempt_id, attempt_id, "
+                "ordinal, status, provider, model, latency_ms, input_tokens, "
+                "output_tokens, reasoning_tokens, inference_mode, recorded_at) "
+                "VALUES ('provider_attempt_missing', 'missing', 1, 'failed', "
+                "'ollama', 'local', 0, 0, 0, 0, 'local_only', ?)",
+                (timestamp,),
             )
 
 
@@ -497,6 +626,7 @@ def test_built_wheel_contains_and_applies_all_migrations(tmp_path):
         "news_bot/research/migrations/002_nullable_portfolio_freshness.sql",
         "news_bot/research/migrations/003_claim_dependencies.sql",
         "news_bot/research/migrations/004_entity_resolution.sql",
+        "news_bot/research/migrations/005_agent_execution_audit.sql",
     }
     with zipfile.ZipFile(wheel) as archive:
         assert migration_names <= set(archive.namelist())
@@ -508,13 +638,15 @@ def test_built_wheel_contains_and_applies_all_migrations(tmp_path):
         "migration_dir = resources.files('news_bot.research').joinpath('migrations'); "
         "assert {p.name for p in migration_dir.iterdir()} >= "
         "{'001_initial.sql', '002_nullable_portfolio_freshness.sql', "
-        "'003_claim_dependencies.sql', '004_entity_resolution.sql'}; "
+        "'003_claim_dependencies.sql', '004_entity_resolution.sql', "
+        "'005_agent_execution_audit.sql'}; "
         "from news_bot.research.store import ResearchStore; "
         "db = Path(tempfile.mkdtemp()) / 'research.db'; "
         "store = ResearchStore(db); store.migrate(); "
         "connection = sqlite3.connect(db); "
         "assert connection.execute('SELECT version FROM schema_migrations "
-        "ORDER BY version').fetchall() == [(1,), (2,), (3,), (4,)]; connection.close()"
+        "ORDER BY version').fetchall() == [(1,), (2,), (3,), (4,), (5,)]; "
+        "connection.close()"
     )
     subprocess.run(
         [sys.executable, "-I", "-c", resource_probe],
@@ -527,7 +659,7 @@ def test_built_wheel_contains_and_applies_all_migrations(tmp_path):
 
 def test_failed_multi_statement_migration_is_atomic(tmp_path, monkeypatch):
     store = make_migrated_store(tmp_path)
-    bad_migration = tmp_path / "005_broken.sql"
+    bad_migration = tmp_path / "006_broken.sql"
     bad_migration.write_text(
         "CREATE TABLE should_roll_back (id INTEGER);\n"
         "INSERT INTO missing_table (id) VALUES (1);\n",
@@ -546,7 +678,7 @@ def test_failed_multi_statement_migration_is_atomic(tmp_path, monkeypatch):
         versions = connection.execute(
             "SELECT version FROM schema_migrations ORDER BY version"
         ).fetchall()
-    assert versions == [(1,), (2,), (3,), (4,)]
+    assert versions == [(1,), (2,), (3,), (4,), (5,)]
 
 
 def test_migrations_are_sorted_by_numeric_version(tmp_path, monkeypatch):

@@ -7,8 +7,9 @@ import json
 import math
 import re
 import unicodedata
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
+from datetime import datetime
 from enum import Enum
 from types import MappingProxyType
 from typing import Any, Protocol, runtime_checkable
@@ -108,6 +109,24 @@ class ReasoningEffort(str, Enum):
     LOW = "low"
     MEDIUM = "medium"
     HIGH = "high"
+
+
+@dataclass(frozen=True)
+class ProviderAttemptTrace:
+    """Redacted telemetry for one physical provider invocation."""
+
+    status: str
+    provider: str
+    model: str
+    latency_ms: int
+    input_tokens: int
+    output_tokens: int
+    reasoning_tokens: int
+    inference_mode: InferenceMode
+    recorded_at: datetime
+    fallback_reason: str | None = None
+    response_hash: str | None = None
+    failure_code: str | None = None
 
 
 class FallbackPolicy(str, Enum):
@@ -290,7 +309,11 @@ class ModelRequest:
     reasoning_effort: ReasoningEffort
     fallback_policy: FallbackPolicy
     run_id: str
+    attempt_id: str | None = None
     validation_feedback: tuple[ValidationIssue, ...] = field(default=(), repr=False)
+    attempt_recorder: Callable[[ProviderAttemptTrace], None] | None = field(
+        default=None, repr=False, compare=False
+    )
     canonical_evidence: str = field(init=False, repr=False)
     evidence_hash: str = field(init=False)
     schema_name: str = field(init=False)
@@ -326,6 +349,12 @@ class ModelRequest:
             nonblank=True,
             error_type=ProviderRequestError,
         )
+        attempt_id = None
+        if self.attempt_id is not None:
+            attempt_id = _safe_text(
+                "attempt_id", self.attempt_id, allow_multiline=False,
+                nonblank=True, error_type=ProviderRequestError,
+            )
         if type(self.max_output_tokens) is not int or self.max_output_tokens <= 0:
             raise ValueError("max_output_tokens must be a positive integer")
         if not isinstance(self.output_schema, type) or not issubclass(self.output_schema, BaseModel):
@@ -351,6 +380,8 @@ class ModelRequest:
             raise ProviderRequestError(
                 "validation_feedback must be a tuple of ValidationIssue"
             )
+        if self.attempt_recorder is not None and not callable(self.attempt_recorder):
+            raise ProviderRequestError("attempt_recorder must be callable or None")
         frozen_evidence = _freeze_json(self.evidence_packet)
         canonical = _canonical_json(frozen_evidence)
         object.__setattr__(self, "role", role)
@@ -358,6 +389,7 @@ class ModelRequest:
         object.__setattr__(self, "fallback_policy", policy)
         object.__setattr__(self, "system_prompt", system_prompt)
         object.__setattr__(self, "run_id", run_id)
+        object.__setattr__(self, "attempt_id", attempt_id)
         object.__setattr__(self, "evidence_packet", frozen_evidence)
         object.__setattr__(self, "canonical_evidence", canonical)
         object.__setattr__(self, "schema_name", schema_name)
@@ -524,3 +556,23 @@ class ModelProvider(Protocol):
 
     def generate(self, request: ModelRequest) -> ModelResponse:
         """Return requested-schema data and provider-reported usage."""
+
+
+def provider_failure_code(error: Exception) -> str:
+    """Map provider failures to a stable code without retaining messages."""
+    if isinstance(error, ProviderTerminalUnavailable):
+        return error.reason_code
+    mapping = (
+        (ProviderAuthenticationError, "provider_authentication"),
+        (ProviderRateLimitError, "provider_rate_limit"),
+        (ProviderValidationError, "provider_validation"),
+        (ProviderNonRetryableError, "provider_nonretryable"),
+        (ProviderUnavailable, "provider_unavailable"),
+        (TaskDeferred, "task_deferred"),
+        (ProviderRequestError, "provider_request"),
+        (ProviderConfigurationError, "provider_configuration"),
+    )
+    for error_type, code in mapping:
+        if isinstance(error, error_type):
+            return code
+    return "provider_error"
