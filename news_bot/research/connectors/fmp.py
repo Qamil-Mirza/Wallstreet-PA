@@ -36,14 +36,15 @@ _AUTHORIZATION_CREDENTIAL = re.compile(
 _REDACTED = "[REDACTED]"
 _LOG_FACTORY_LOCK = threading.RLock()
 _FACTORY_MARKER = "_newsletter_fmp_redaction_factory"
-_CONFIGURED_SECRETS: set[str] = set()
+_CONFIGURED_SECRETS: frozenset[str] = frozenset()
 
 
 def _redact_text(value: str) -> str:
     redacted = _SECRET_ASSIGNMENT.sub(rf"\1{_REDACTED}", value)
     redacted = _AUTHORIZATION_CREDENTIAL.sub(rf"\1{_REDACTED}", redacted)
+    configured_secrets = _CONFIGURED_SECRETS
     for secret in sorted(
-        (item for item in _CONFIGURED_SECRETS if len(item) >= 8),
+        (item for item in configured_secrets if len(item) >= 8),
         key=len,
         reverse=True,
     ):
@@ -83,9 +84,10 @@ def _redact_log_value(value):
 
 def install_fmp_log_redaction(secret: str | None = None) -> None:
     """Chain one process-wide secret-safe LogRecord factory."""
+    global _CONFIGURED_SECRETS
     with _LOG_FACTORY_LOCK:
         if isinstance(secret, str) and secret:
-            _CONFIGURED_SECRETS.add(secret)
+            _CONFIGURED_SECRETS = _CONFIGURED_SECRETS | frozenset((secret,))
         prior_factory = logging.getLogRecordFactory()
         if getattr(prior_factory, _FACTORY_MARKER, False):
             return

@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -135,6 +136,53 @@ def test_fmp_log_redaction_chains_once_and_preserves_unrelated_records(caplog):
         assert unrelated.args == ("value",)
         assert unrelated.prior_factory_marker is True
         assert factory_calls
+    finally:
+        logging.setLogRecordFactory(original_factory)
+
+
+def test_fmp_secret_registration_and_log_redaction_are_thread_safe(monkeypatch, caplog):
+    iteration_started = threading.Event()
+    registration_finished = threading.Event()
+    original_factory = logging.getLogRecordFactory()
+
+    class CoordinatedSecrets(set):
+        def __iter__(self):
+            iterator = super().__iter__()
+            yield next(iterator)
+            iteration_started.set()
+            assert registration_finished.wait(timeout=2)
+            yield from iterator
+
+    first_secret = "first-concurrent-secret"
+    second_secret = "second-concurrent-secret"
+    monkeypatch.setattr(
+        fmp_module, "_CONFIGURED_SECRETS", CoordinatedSecrets({first_secret})
+    )
+    logging.setLogRecordFactory(logging.LogRecord)
+    logger = logging.getLogger("fmp.concurrent.redaction")
+
+    def register_secret() -> None:
+        assert iteration_started.wait(timeout=2)
+        try:
+            FMPConnector(
+                FMPConfig(api_key=second_secret), session=RecordingSession([])
+            )
+        finally:
+            registration_finished.set()
+
+    try:
+        fmp_module.install_fmp_log_redaction()
+        with caplog.at_level(logging.ERROR, logger=logger.name):
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                registration = pool.submit(register_secret)
+                logged = pool.submit(logger.error, "request failed: %s", first_secret)
+                registration.result(timeout=5)
+                logged.result(timeout=5)
+            logger.error("request failed: %s", second_secret)
+
+        assert first_secret not in caplog.text
+        assert second_secret not in caplog.text
+        assert caplog.text.count("[REDACTED]") == 2
     finally:
         logging.setLogRecordFactory(original_factory)
 
