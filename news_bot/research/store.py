@@ -14,8 +14,10 @@ from decimal import Decimal
 from pathlib import Path
 
 from .models import (
+    AgentRole,
     ClaimKind,
     EvidenceClaim,
+    InferenceMode,
     PortfolioSnapshot,
     Position,
     SourceDocument,
@@ -112,6 +114,35 @@ class ClaimLineageRecord:
     claim_id: str
     passage: DocumentPassageRecord
     stance: str
+
+
+@dataclass(frozen=True)
+class AgentEvidencePacket:
+    """Deterministically ordered, citation-ready evidence for one agent call."""
+
+    passages: tuple[DocumentPassageRecord, ...]
+    claims: tuple[EvidenceClaim, ...]
+
+
+@dataclass(frozen=True)
+class AgentRunAudit:
+    """Redacted metadata retained for one completed bounded agent run."""
+
+    run_id: str
+    task_id: str
+    role: AgentRole
+    started_at: datetime
+    completed_at: datetime
+    provider: str
+    model: str
+    inference_mode: InferenceMode
+    prompt_hash: str
+    evidence_hash: str
+    output_hash: str
+    input_tokens: int
+    output_tokens: int
+    reasoning_tokens: int
+    fallback_reason: str | None = None
 
 
 class ResearchStore:
@@ -1122,6 +1153,143 @@ class ResearchStore:
             )
             if cursor.rowcount != 1:
                 raise KeyError(f"Unknown claim_id: {claim_id}")
+
+    def load_agent_evidence(
+        self,
+        passage_ids: Sequence[str],
+        claim_ids: Sequence[str],
+    ) -> AgentEvidencePacket | None:
+        """Load a complete safe evidence packet, or ``None`` for any bad reference."""
+        requested_passages = tuple(sorted(set(passage_ids)))
+        requested_claims = tuple(sorted(set(claim_ids)))
+        if (
+            not requested_passages
+            or len(requested_passages) != len(tuple(passage_ids))
+            or len(requested_claims) != len(tuple(claim_ids))
+        ):
+            return None
+        connection = self.connect()
+        try:
+            placeholders = ",".join("?" for _ in requested_passages)
+            passage_rows = connection.execute(
+                "SELECT p.passage_id, p.document_id, p.ordinal, p.text, "
+                "p.content_hash, p.locator_json, d.extraction_status "
+                "FROM document_passages AS p JOIN source_documents AS d "
+                "ON d.document_id = p.document_id "
+                f"WHERE p.passage_id IN ({placeholders}) ORDER BY p.passage_id",
+                requested_passages,
+            ).fetchall()
+            if len(passage_rows) != len(requested_passages) or any(
+                row[6] not in {"complete", "extracted", "normalized", "success"}
+                for row in passage_rows
+            ):
+                return None
+            claim_rows = ()
+            if requested_claims:
+                placeholders = ",".join("?" for _ in requested_claims)
+                claim_rows = connection.execute(
+                    "SELECT claim_id, entity_id, kind, text, as_of, confidence, status "
+                    "FROM claims "
+                    f"WHERE claim_id IN ({placeholders}) AND lineage_sealed = 1 "
+                    "AND status = 'active' ORDER BY claim_id",
+                    requested_claims,
+                ).fetchall()
+                if len(claim_rows) != len(requested_claims):
+                    return None
+        finally:
+            connection.close()
+        passages = []
+        for row in passage_rows:
+            locator = json.loads(row[5]) if row[5] is not None else {}
+            passages.append(DocumentPassageRecord(
+                passage_id=row[0], document_id=row[1], ordinal=row[2], text=row[3],
+                content_hash=row[4], start_offset=locator.get("start_offset", 0),
+                end_offset=locator.get("end_offset", len(row[3])),
+            ))
+        claims = tuple(EvidenceClaim(
+            claim_id=row[0], entity_id=row[1], kind=ClaimKind(row[2]), text=row[3],
+            as_of=_parse_utc(row[4]), confidence=Decimal(row[5]), status=row[6],
+        ) for row in claim_rows)
+        return AgentEvidencePacket(tuple(passages), claims)
+
+    def record_agent_run_audit(self, audit: AgentRunAudit) -> None:
+        """Atomically retain hashes and usage, never prompt/evidence/output bodies."""
+        if not isinstance(audit, AgentRunAudit):
+            raise TypeError("audit must be AgentRunAudit")
+        digests = (audit.prompt_hash, audit.evidence_hash, audit.output_hash)
+        if any(re.fullmatch(r"[0-9a-f]{64}", item) is None for item in digests):
+            raise ValueError("agent audit hashes must be SHA-256 digests")
+        for value in (audit.input_tokens, audit.output_tokens, audit.reasoning_tokens):
+            if type(value) is not int or value < 0:
+                raise ValueError("agent usage must be non-negative integers")
+        metadata = {
+            "evidence_hash": audit.evidence_hash,
+            "fallback_reason": audit.fallback_reason,
+            "inference_mode": audit.inference_mode.value,
+            "input_tokens": audit.input_tokens,
+            "output_hash": audit.output_hash,
+            "output_tokens": audit.output_tokens,
+            "prompt_hash": audit.prompt_hash,
+            "reasoning_tokens": audit.reasoning_tokens,
+            "schema_version": "1",
+        }
+        task_scope = _canonical_json({"contract_version": "1"})
+        run_values = (
+            audit.run_id, audit.task_id, audit.role.value, "completed",
+            _utc_text(audit.started_at), _utc_text(audit.completed_at),
+            audit.provider, audit.model, _canonical_json(metadata),
+        )
+        with self.transaction() as connection:
+            connection.execute(
+                "INSERT OR IGNORE INTO research_tasks (task_id, task_kind, scope_json, "
+                "state, priority, created_at, started_at, completed_at) "
+                "VALUES (?, ?, ?, 'completed', 0, ?, ?, ?)",
+                (audit.task_id, audit.role.value, task_scope,
+                 _utc_text(audit.started_at), _utc_text(audit.started_at),
+                 _utc_text(audit.completed_at)),
+            )
+            existing = connection.execute(
+                "SELECT run_id, task_id, role, status, started_at, completed_at, "
+                "provider, model, metadata_json FROM agent_runs WHERE run_id = ?",
+                (audit.run_id,),
+            ).fetchone()
+            if existing is not None:
+                if tuple(existing) == run_values:
+                    return
+                raise sqlite3.IntegrityError("conflicting agent run already exists")
+            connection.execute(
+                "INSERT INTO agent_runs (run_id, task_id, role, status, started_at, "
+                "completed_at, output_text, error_text, provider, model, metadata_json) "
+                "VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?)",
+                run_values,
+            )
+
+    def get_agent_run_audit(self, run_id: str) -> AgentRunAudit | None:
+        """Return the redacted audit view for a completed agent run."""
+        connection = self.connect()
+        try:
+            row = connection.execute(
+                "SELECT run_id, task_id, role, started_at, completed_at, provider, "
+                "model, metadata_json FROM agent_runs WHERE run_id = ? "
+                "AND status = 'completed' AND output_text IS NULL AND error_text IS NULL",
+                (run_id,),
+            ).fetchone()
+        finally:
+            connection.close()
+        if row is None:
+            return None
+        metadata = json.loads(row[7])
+        return AgentRunAudit(
+            run_id=row[0], task_id=row[1], role=AgentRole(row[2]),
+            started_at=_parse_utc(row[3]), completed_at=_parse_utc(row[4]),
+            provider=row[5], model=row[6],
+            inference_mode=InferenceMode(metadata["inference_mode"]),
+            prompt_hash=metadata["prompt_hash"], evidence_hash=metadata["evidence_hash"],
+            output_hash=metadata["output_hash"], input_tokens=metadata["input_tokens"],
+            output_tokens=metadata["output_tokens"],
+            reasoning_tokens=metadata["reasoning_tokens"],
+            fallback_reason=metadata["fallback_reason"],
+        )
 
     def append_thesis_revision(
         self,

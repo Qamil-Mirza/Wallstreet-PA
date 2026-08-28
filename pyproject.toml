@@ -30,7 +30,7 @@ dev = [
 include = ["news_bot*"]
 
 [tool.setuptools.package-data]
-"news_bot.research" = ["migrations/*.sql"]
+"news_bot.research" = ["migrations/*.sql", "prompts/*.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
