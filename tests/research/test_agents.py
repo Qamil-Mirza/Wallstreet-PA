@@ -5,6 +5,7 @@ from decimal import Decimal
 from types import SimpleNamespace
 
 import pytest
+from pydantic import ValidationError
 
 from news_bot.research.agents.analysts import EvidenceAnalyst, FundamentalAnalyst, IndustryStrategist
 from news_bot.research.agents.contracts import (
@@ -287,6 +288,52 @@ def test_strategist_requires_scenarios_summing_to_one(tmp_path):
         ))
 
 
+@pytest.mark.parametrize("scenarios", [
+    [
+        {"name": "base", "probability": 1, "horizon_years": 7,
+         "description": "Base", "signposts": ["demand"]},
+    ],
+    [
+        {"name": "base", "probability": "0.6", "horizon_years": 7,
+         "description": "Base", "signposts": ["demand"]},
+        {"name": "upside", "probability": "0.4", "horizon_years": 7,
+         "description": "Upside", "signposts": ["capacity"]},
+    ],
+])
+def test_strategist_requires_exactly_base_upside_and_downside(tmp_path, scenarios):
+    invalid = common_output(scenarios=scenarios)
+    router = FakeRouter(invalid, invalid)
+    with pytest.raises(AgentContractError):
+        IndustryStrategist(router, seed_store(tmp_path), clock=lambda: NOW).run(task(
+            IndustryStrategistInput(
+                industry="robotic actuators", horizon_years=7,
+                evidence_ids=("passage-1",), as_of=NOW,
+            )
+        ))
+    assert len(router.calls) == 2
+    assert router.calls[1].validation_feedback
+
+
+def test_strategist_normalizes_names_and_orders_scenarios_deterministically(tmp_path):
+    router = FakeRouter(common_output(scenarios=[
+        {"name": "DOWNSIDE", "probability": "0.2", "horizon_years": 7,
+         "description": "Downside", "signposts": ["demand"]},
+        {"name": "upside", "probability": "0.3", "horizon_years": 7,
+         "description": "Upside", "signposts": ["capacity"]},
+        {"name": "Base", "probability": "0.5", "horizon_years": 7,
+         "description": "Base", "signposts": ["adoption"]},
+    ]))
+    result = IndustryStrategist(
+        router, seed_store(tmp_path), clock=lambda: NOW
+    ).run(task(IndustryStrategistInput(
+        industry="robotic actuators", horizon_years=7,
+        evidence_ids=("passage-1",), as_of=NOW,
+    )))
+    assert tuple(item.name for item in result.scenarios) == (
+        "base", "upside", "downside"
+    )
+
+
 def test_fundamental_recommendation_has_complete_investment_case(tmp_path):
     router = FakeRouter(common_output(
         security_id="security-1", thesis="Durable growth", horizon_months=18,
@@ -313,7 +360,7 @@ def test_reviewer_and_editor_are_limited_to_supplied_lineage(tmp_path):
     review = SkepticalReviewer(FakeRouter(common_output(
         verdict="revise", issues=[{
             "code": "stale_assumption", "message": "Refresh valuation",
-            "evidence_ids": ["passage-1"],
+            "evidence_ids": ["passage-1"], "target_claim_ids": ["claim-1"],
         }],
     )), store, clock=lambda: NOW).run(task(
         ReviewerInput(target_claim_ids=("claim-1",), evidence_ids=("passage-1",),
@@ -333,6 +380,64 @@ def test_reviewer_and_editor_are_limited_to_supplied_lineage(tmp_path):
     ))
     assert isinstance(outline, ResearchEditorOutput)
     assert outline.sections[0].approved_claim_ids == ("claim-1",)
+
+
+def test_reviewer_input_targets_must_be_unique_and_loaded_in_claim_ids():
+    with pytest.raises(ValidationError):
+        ReviewerInput(
+            target_claim_ids=("claim-1", "claim-1"),
+            evidence_ids=("passage-1",), claim_ids=("claim-1",), as_of=NOW,
+        )
+    with pytest.raises(ValidationError):
+        ReviewerInput(
+            target_claim_ids=("claim-missing",), evidence_ids=("passage-1",),
+            claim_ids=("claim-1",), as_of=NOW,
+        )
+
+
+@pytest.mark.parametrize("invalid_target", ["claim-missing", "claim-unapproved"])
+def test_reviewer_preflight_rejects_mixed_invalid_targets_atomically(
+    tmp_path, invalid_target
+):
+    store = seed_store(tmp_path)
+    if invalid_target == "claim-unapproved":
+        store.insert_claim(EvidenceClaim(
+            claim_id=invalid_target, entity_id=None, kind=ClaimKind.FACT,
+            text="Old assertion.", as_of=NOW, confidence=Decimal("0.8"),
+            status="active",
+        ), ("passage-1",))
+        store.update_claim_status(invalid_target, "superseded")
+    router = FakeRouter()
+    agent = SkepticalReviewer(router, store, clock=lambda: NOW)
+    reviewer_input = ReviewerInput(
+        target_claim_ids=("claim-1", invalid_target),
+        evidence_ids=("passage-1",), claim_ids=("claim-1", invalid_target), as_of=NOW,
+    )
+    with pytest.raises(AgentContractError, match="unavailable") as raised:
+        agent.run(task(reviewer_input, task_id="review-invalid", run_id="review-invalid"))
+    assert invalid_target not in str(raised.value)
+    assert router.calls == []
+    assert store.get_agent_run_audit("review-invalid") is None
+
+
+def test_reviewer_issues_must_reference_only_review_targets(tmp_path):
+    invalid = common_output(
+        verdict="revise", issues=[{
+            "code": "unsupported", "message": "Unsupported conclusion",
+            "evidence_ids": ["passage-1"], "target_claim_ids": ["claim-other"],
+        }],
+    )
+    router = FakeRouter(invalid, invalid)
+    agent = SkepticalReviewer(router, seed_store(tmp_path), clock=lambda: NOW)
+    with pytest.raises(AgentContractError):
+        agent.run(task(
+            ReviewerInput(
+                target_claim_ids=("claim-1",), evidence_ids=("passage-1",),
+                claim_ids=("claim-1",), as_of=NOW,
+            ), task_id="review-scope", run_id="review-scope",
+        ))
+    assert len(router.calls) == 2
+    assert agent.store.get_agent_run_audit("review-scope") is None
 
 
 def test_director_creates_deterministic_typed_tasks(tmp_path):

@@ -12,6 +12,9 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from ..models import ClaimKind, InferenceMode, RecommendationRating, ReviewVerdict
 
 
+SCENARIO_PROBABILITY_TOLERANCE = Decimal("0.000001")
+
+
 class AgentError(RuntimeError):
     """Base class for redacted agent boundary failures."""
 
@@ -244,6 +247,11 @@ class Scenario(FrozenContract):
 
     _description = field_validator("description")(_safe_text)
 
+    @field_validator("name", mode="before")
+    @classmethod
+    def _normalized_name(cls, value: object) -> object:
+        return value.strip().lower() if isinstance(value, str) else value
+
     @field_validator("signposts")
     @classmethod
     def _signposts(cls, values: tuple[str, ...]) -> tuple[str, ...]:
@@ -253,13 +261,22 @@ class Scenario(FrozenContract):
 class IndustryStrategistOutput(AnalyticalOutput):
     scenarios: tuple[Scenario, ...] = Field(min_length=1)
 
+    @field_validator("scenarios")
+    @classmethod
+    def _complete_ordered_set(
+        cls, values: tuple[Scenario, ...]
+    ) -> tuple[Scenario, ...]:
+        required = ("base", "upside", "downside")
+        if len(values) != 3 or {item.name for item in values} != set(required):
+            raise ValueError("scenarios require exactly base, upside, and downside")
+        order = {name: index for index, name in enumerate(required)}
+        return tuple(sorted(values, key=lambda item: order[item.name]))
+
     @model_validator(mode="after")
     def _probabilities_sum_to_one(self) -> "IndustryStrategistOutput":
         total = sum((item.probability for item in self.scenarios), Decimal("0"))
-        if abs(total - Decimal("1")) > Decimal("0.000001"):
+        if abs(total - Decimal("1")) > SCENARIO_PROBABILITY_TOLERANCE:
             raise ValueError("scenario probabilities must sum to one")
-        if len({item.name for item in self.scenarios}) != len(self.scenarios):
-            raise ValueError("scenario names must be unique")
         return self
 
 
@@ -337,14 +354,22 @@ class ReviewerInput(EvidenceInput):
 
     _targets = field_validator("target_claim_ids")(_sorted_ids)
 
+    @model_validator(mode="after")
+    def _targets_are_loaded(self) -> "ReviewerInput":
+        if not set(self.target_claim_ids) <= set(self.claim_ids):
+            raise ValueError("review targets must be included in claim_ids")
+        return self
+
 
 class ReviewIssue(FrozenContract):
     code: str = Field(pattern=r"^[a-z0-9_.-]+$")
     message: str
     evidence_ids: tuple[str, ...] = Field(min_length=1)
+    target_claim_ids: tuple[str, ...] = Field(min_length=1)
 
     _message = field_validator("message")(_safe_text)
     _evidence = field_validator("evidence_ids")(_sorted_ids)
+    _targets = field_validator("target_claim_ids")(_sorted_ids)
 
 
 class ReviewerOutput(AnalyticalOutput):

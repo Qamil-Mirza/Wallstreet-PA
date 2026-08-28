@@ -74,6 +74,11 @@ class BoundedAgent(Generic[InputT, OutputT]):
     def _preflight(self, task_input: InputT) -> None:
         """Role-specific deterministic checks that run before model inference."""
 
+    def _validate_evidence_packet(
+        self, task_input: InputT, packet: AgentEvidencePacket
+    ) -> None:
+        """Apply role-specific checks after the store validates every reference."""
+
     @staticmethod
     def _evidence_json(packet: AgentEvidencePacket) -> dict[str, object]:
         return {
@@ -162,6 +167,7 @@ class BoundedAgent(Generic[InputT, OutputT]):
         )
         if packet is None:
             raise EvidenceUnavailable("agent evidence is unavailable")
+        self._validate_evidence_packet(validated_task.input, packet)
         request = self._request(validated_task, packet)
         response = self.router.generate(request)
         try:
@@ -199,4 +205,3 @@ class BoundedAgent(Generic[InputT, OutputT]):
             fallback_reason=response.fallback_reason,
         ))
         return output
-
