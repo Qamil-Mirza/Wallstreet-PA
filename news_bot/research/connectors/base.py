@@ -8,7 +8,7 @@ import threading
 import unicodedata
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import date, datetime, time, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 from typing import Protocol, runtime_checkable
 from urllib.parse import urlsplit
@@ -29,6 +29,7 @@ _INCREMENTAL_CURSOR_FIELDS = frozenset(
     {"candidate", "continuation", "version", "watermark"}
 )
 _INCREMENTAL_MARKER_FIELDS = frozenset({"effective_date", "record_id"})
+_INCREMENTAL_OVERLAP = timedelta(days=1)
 
 
 def _nonblank(value: str, field_name: str) -> None:
@@ -343,7 +344,11 @@ class IncrementalPageCursor:
             ) from None
 
     def is_new(self, marker: tuple[date, str]) -> bool:
-        return self.watermark is None or marker > self.watermark
+        """Include a bounded date overlap; provider IDs are not arrival clocks."""
+        return (
+            self.watermark is None
+            or marker[0] >= self.watermark[0] - _INCREMENTAL_OVERLAP
+        )
 
     def advance(
         self,

@@ -337,7 +337,7 @@ def _usaspending_award(*, award_id: str, start_date: str):
     return award
 
 
-def test_clinical_trials_terminal_page_resets_token_and_next_run_emits_only_new_first_page(
+def test_clinical_trials_terminal_page_resets_token_and_replays_bounded_first_page(
     tmp_path,
 ):
     old = _clinical_study(nct_id="NCT00000002", submitted="2026-08-16")
@@ -389,13 +389,14 @@ def test_clinical_trials_terminal_page_resets_token_and_next_run_emits_only_new_
     }
     assert "pageToken" not in session.calls[2][2]["params"]
     assert [signal.source_locator for signal in third.signals] == [
-        "clinicaltrials:NCT00000003"
+        "clinicaltrials:NCT00000003",
+        "clinicaltrials:NCT00000002",
     ]
     assert empty.signals == ()
     assert empty.next_checkpoint == third.next_checkpoint
 
 
-def test_usaspending_terminal_page_resets_page_and_next_run_emits_only_new_first_page(
+def test_usaspending_terminal_page_resets_page_and_replays_bounded_first_page(
     tmp_path,
 ):
     old = _usaspending_award(award_id="AWARD-002", start_date="2026-08-17")
@@ -447,10 +448,138 @@ def test_usaspending_terminal_page_resets_page_and_next_run_emits_only_new_first
     }
     assert [call[2]["json"]["page"] for call in session.calls] == [1, 2, 1, 1]
     assert [signal.source_locator for signal in third.signals] == [
-        "usaspending-award:AWARD-003"
+        "usaspending-award:AWARD-003",
+        "usaspending-award:AWARD-002",
     ]
     assert empty.signals == ()
     assert empty.next_checkpoint == third.next_checkpoint
+
+
+def test_clinical_trials_replays_watermark_date_for_late_lower_id_without_duplicate_evidence(
+    tmp_path,
+):
+    high = _clinical_study(nct_id="NCT99999999", submitted="2026-08-20")
+    older = _clinical_study(nct_id="NCT50000000", submitted="2026-08-19")
+    late_lower = _clinical_study(nct_id="NCT00000001", submitted="2026-08-20")
+    session = Session(
+        [
+            Response(
+                {"studies": [high], "nextPageToken": "page-2"},
+                url="https://clinicaltrials.gov/api/v2/studies",
+            ),
+            Response(
+                {"studies": [older]},
+                url="https://clinicaltrials.gov/api/v2/studies",
+            ),
+            Response(
+                {"studies": [late_lower]},
+                url="https://clinicaltrials.gov/api/v2/studies",
+            ),
+            Response(
+                {"studies": [late_lower]},
+                url="https://clinicaltrials.gov/api/v2/studies",
+            ),
+        ]
+    )
+    sink = make_ingestor(tmp_path)
+    connector = ClinicalTrialsConnector(
+        session=session,
+        query="robotics",
+        ingestor=sink,
+        clock=lambda: 100.0,
+        sleeper=lambda _: None,
+    )
+
+    first = connector.fetch(ConnectorCheckpoint("clinical_trials"))
+    completed = connector.fetch(first.next_checkpoint)
+    late = connector.fetch(completed.next_checkpoint)
+    with sink.store.connect() as connection:
+        counts_after_late = (
+            connection.execute("SELECT COUNT(*) FROM source_documents").fetchone()[0],
+            connection.execute("SELECT COUNT(*) FROM document_passages").fetchone()[0],
+        )
+    repeated = connector.fetch(late.next_checkpoint)
+    with sink.store.connect() as connection:
+        counts_after_repeat = (
+            connection.execute("SELECT COUNT(*) FROM source_documents").fetchone()[0],
+            connection.execute("SELECT COUNT(*) FROM document_passages").fetchone()[0],
+        )
+
+    assert [signal.source_locator for signal in late.signals] == [
+        "clinicaltrials:NCT00000001"
+    ]
+    assert [signal.source_locator for signal in repeated.signals] == [
+        "clinicaltrials:NCT00000001"
+    ]
+    assert json.loads(late.next_checkpoint.cursor)["watermark"] == {
+        "effective_date": "2026-08-20",
+        "record_id": "NCT99999999",
+    }
+    assert counts_after_late == (3, 3)
+    assert counts_after_repeat == counts_after_late
+
+
+def test_usaspending_replays_watermark_date_for_late_lower_id_without_duplicate_evidence(
+    tmp_path,
+):
+    high = _usaspending_award(award_id="ZZZ-AWARD", start_date="2026-08-20")
+    older = _usaspending_award(award_id="MID-AWARD", start_date="2026-08-19")
+    late_lower = _usaspending_award(award_id="AAA-AWARD", start_date="2026-08-20")
+    endpoint = "https://api.usaspending.gov/api/v2/search/spending_by_award/"
+    session = Session(
+        [
+            Response(
+                {"results": [high], "page_metadata": {"next": 2}}, url=endpoint
+            ),
+            Response(
+                {"results": [older], "page_metadata": {"next": None}}, url=endpoint
+            ),
+            Response(
+                {"results": [late_lower], "page_metadata": {"next": None}},
+                url=endpoint,
+            ),
+            Response(
+                {"results": [late_lower], "page_metadata": {"next": None}},
+                url=endpoint,
+            ),
+        ]
+    )
+    sink = make_ingestor(tmp_path)
+    connector = USASpendingConnector(
+        session=session,
+        query="robotics",
+        ingestor=sink,
+        clock=lambda: 100.0,
+        sleeper=lambda _: None,
+    )
+
+    first = connector.fetch(ConnectorCheckpoint("usaspending"))
+    completed = connector.fetch(first.next_checkpoint)
+    late = connector.fetch(completed.next_checkpoint)
+    with sink.store.connect() as connection:
+        counts_after_late = (
+            connection.execute("SELECT COUNT(*) FROM source_documents").fetchone()[0],
+            connection.execute("SELECT COUNT(*) FROM document_passages").fetchone()[0],
+        )
+    repeated = connector.fetch(late.next_checkpoint)
+    with sink.store.connect() as connection:
+        counts_after_repeat = (
+            connection.execute("SELECT COUNT(*) FROM source_documents").fetchone()[0],
+            connection.execute("SELECT COUNT(*) FROM document_passages").fetchone()[0],
+        )
+
+    assert [signal.source_locator for signal in late.signals] == [
+        "usaspending-award:AAA-AWARD"
+    ]
+    assert [signal.source_locator for signal in repeated.signals] == [
+        "usaspending-award:AAA-AWARD"
+    ]
+    assert json.loads(late.next_checkpoint.cursor)["watermark"] == {
+        "effective_date": "2026-08-20",
+        "record_id": "ZZZ-AWARD",
+    }
+    assert counts_after_late == (3, 3)
+    assert counts_after_repeat == counts_after_late
 
 
 @pytest.mark.parametrize("connector_name", ["clinical_trials", "usaspending"])
