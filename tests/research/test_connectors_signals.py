@@ -35,6 +35,10 @@ from news_bot.research.connectors.clinical_trials import (
 from news_bot.research.connectors.form_d import FormDConfig, FormDConnector
 from news_bot.research.connectors.manual_import import ManualImportConnector
 from news_bot.research.connectors.uspto import USPTOConfig, USPTOConnector
+from news_bot.research.evidence import EvidenceIngestor
+from news_bot.research.store import ResearchStore
+
+from .test_connectors_signals_spec import official_form_d_zip
 
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -44,23 +48,29 @@ def fixture(name: str) -> str:
     return (FIXTURES / name).read_text(encoding="utf-8")
 
 
+def make_ingestor(tmp_path: Path) -> EvidenceIngestor:
+    store = ResearchStore(tmp_path / "research.db")
+    store.migrate()
+    return EvidenceIngestor(store, tmp_path / "cache")
+
+
 @pytest.mark.parametrize(
-    ("connector", "fixture_name", "expected_signal"),
+    ("factory", "fixture_name", "expected_signal"),
     [
-        (FormDConnector(), "form_d_sample.tsv", "funding"),
-        (USPTOConnector(), "uspto_sample.json", "patent"),
-        (SBIRConnector(), "sbir_sample.json", "grant"),
-        (USASpendingConnector(), "usaspending_sample.json", "contract"),
-        (ClinicalTrialsConnector(), "clinical_trials_sample.json", "clinical_trial"),
+        (lambda sink: FormDConnector(ingestor=sink), "form_d_sample.tsv", "funding"),
+        (lambda sink: USPTOConnector(ingestor=sink), "uspto_sample.json", "patent"),
+        (lambda sink: SBIRConnector(ingestor=sink), "sbir_sample.json", "grant"),
+        (lambda sink: USASpendingConnector(ingestor=sink), "usaspending_sample.json", "contract"),
+        (lambda sink: ClinicalTrialsConnector(ingestor=sink), "clinical_trials_sample.json", "clinical_trial"),
         (
-            ManualImportConnector(),
+            lambda sink: ManualImportConnector(ingestor=sink),
             "manual_company_import.csv",
             "private_market_profile",
         ),
     ],
 )
-def test_public_signal_normalization(connector, fixture_name, expected_signal):
-    records = connector.parse(fixture(fixture_name))
+def test_public_signal_normalization(tmp_path, factory, fixture_name, expected_signal):
+    records = factory(make_ingestor(tmp_path)).parse(fixture(fixture_name))
 
     assert records[0].signal_type == expected_signal
     assert records[0].source_document_id
@@ -93,8 +103,8 @@ def test_emerging_signal_is_frozen_validated_and_normalized():
         dataclasses.replace(signal, evidence_passage_id=" ")
 
 
-def test_source_ids_are_deterministic_and_source_identity_changes_them():
-    connector = FormDConnector()
+def test_source_ids_are_deterministic_and_source_identity_changes_them(tmp_path):
+    connector = FormDConnector(ingestor=make_ingestor(tmp_path))
     first = connector.parse(fixture("form_d_sample.tsv"))[0]
     second = connector.parse(fixture("form_d_sample.tsv"))[0]
     changed = fixture("form_d_sample.tsv").replace(
@@ -115,12 +125,13 @@ def _zip_bytes(name: str, content: bytes, *, declared_size: int | None = None) -
     return buffer.getvalue()
 
 
-def test_form_d_accepts_one_bounded_tsv_zip_member():
-    connector = FormDConnector(FormDConfig(max_archive_bytes=20_000, max_member_bytes=5_000))
-
-    records = connector.parse_zip(
-        _zip_bytes("2026Q3/FORM_D.tsv", fixture("form_d_sample.tsv").encode())
+def test_form_d_accepts_bounded_licensed_tsv_extract(tmp_path):
+    connector = FormDConnector(
+        FormDConfig(max_archive_bytes=20_000, max_member_bytes=5_000),
+        ingestor=make_ingestor(tmp_path),
     )
+
+    records = connector.parse(fixture("form_d_sample.tsv"))
 
     assert records[0].amount == Decimal("1250000.50")
 
@@ -136,16 +147,16 @@ def test_form_d_rejects_unsafe_or_wrong_archive_member(member):
     assert error.value.diagnostic_code == "invalid_archive"
 
 
-def test_form_d_rejects_archive_bombs_and_invalid_utf8_without_echoing_data():
+def test_form_d_rejects_legacy_archive_and_invalid_utf8_without_echoing_data():
     connector = FormDConnector(FormDConfig(max_archive_bytes=20_000, max_member_bytes=32))
     secret = b"private-token-123\xff"
 
     with pytest.raises(ConnectorError) as too_large:
         connector.parse_zip(_zip_bytes("FORM_D.tsv", b"a" * 1_000))
     with pytest.raises(ConnectorError) as invalid_encoding:
-        FormDConnector().parse_zip(_zip_bytes("FORM_D.tsv", secret))
+        FormDConnector().parse(secret)
 
-    assert too_large.value.diagnostic_code == "archive_member_too_large"
+    assert too_large.value.diagnostic_code == "invalid_archive"
     assert invalid_encoding.value.diagnostic_code == "invalid_encoding"
     assert "private-token" not in str(invalid_encoding.value)
 
@@ -226,14 +237,15 @@ class Session:
         self.closed = True
 
 
-def test_uspto_uses_authenticated_safe_transport_and_closes_response():
+def test_uspto_uses_authenticated_safe_transport_and_closes_response(tmp_path):
     response = Response(
         json.loads(fixture("uspto_sample.json")),
         url="https://api.uspto.gov/api/v1/patent/applications/search",
     )
     session = Session([response])
     connector = USPTOConnector(
-        USPTOConfig(api_key="private-uspto-key"), session=session, query="robotics"
+        USPTOConfig(api_key="private-uspto-key"), session=session, query="robotics",
+        ingestor=make_ingestor(tmp_path),
     )
 
     batch = connector.fetch(ConnectorCheckpoint("uspto", cursor="0"))
@@ -268,7 +280,7 @@ def test_uspto_auth_failure_is_nonretryable_and_attempted_once(status):
     assert "private-uspto-key" not in str(error.value)
 
 
-def test_maintenance_marks_only_connector_unavailable_and_preserves_cursor():
+def test_maintenance_marks_only_connector_unavailable_and_preserves_cursor(tmp_path):
     checkpoint = ConnectorCheckpoint("uspto", cursor="1")
     session = Session(
         [
@@ -291,7 +303,9 @@ def test_maintenance_marks_only_connector_unavailable_and_preserves_cursor():
             available=False, retryable=True, diagnostic_code="maintenance"
         ),
     )
-    independent = ClinicalTrialsConnector().parse(fixture("clinical_trials_sample.json"))
+    independent = ClinicalTrialsConnector(ingestor=make_ingestor(tmp_path)).parse(
+        fixture("clinical_trials_sample.json")
+    )
     assert independent[0].signal_type == "clinical_trial"
 
 
@@ -309,14 +323,15 @@ def test_empty_api_result_preserves_checkpoint():
     assert batch.next_checkpoint == checkpoint
 
 
-def test_usaspending_uses_documented_post_schema_and_exact_host():
+def test_usaspending_uses_documented_post_schema_and_exact_host(tmp_path):
     response = Response(
         json.loads(fixture("usaspending_sample.json")),
         url="https://api.usaspending.gov/api/v2/search/spending_by_award/",
     )
     session = Session([response])
     connector = USASpendingConnector(
-        USASpendingConfig(), session=session, query="robotic actuators"
+        USASpendingConfig(), session=session, query="robotic actuators",
+        ingestor=make_ingestor(tmp_path),
     )
 
     batch = connector.fetch(ConnectorCheckpoint("usaspending"))
@@ -348,7 +363,7 @@ def test_api_connectors_reject_disallowed_endpoint_before_request():
     assert session.calls == []
 
 
-def test_sbir_health_outage_uses_bulk_fallback_but_auth_failure_does_not():
+def test_sbir_health_outage_uses_bulk_fallback_but_auth_failure_does_not(tmp_path):
     maintenance_session = Session(
         [
             Response(
@@ -363,6 +378,7 @@ def test_sbir_health_outage_uses_bulk_fallback_but_auth_failure_does_not():
         SBIRConfig(),
         session=maintenance_session,
         bulk_loader=lambda: fallback_calls.append(True) or fixture("sbir_sample.json"),
+        ingestor=make_ingestor(tmp_path),
     )
 
     maintenance_batch = connector.fetch(ConnectorCheckpoint("sbir"))
@@ -391,7 +407,7 @@ def test_sbir_health_outage_uses_bulk_fallback_but_auth_failure_does_not():
     assert len(auth_session.calls) == 1
 
 
-def test_source_specific_pacing_is_thread_safe():
+def test_source_specific_pacing_is_thread_safe(tmp_path):
     times = iter([0.0, 0.0, 0.0, 0.0])
     sleeps = []
     session = Session(
@@ -404,6 +420,7 @@ def test_source_specific_pacing_is_thread_safe():
         USPTOConfig(api_key="private-uspto-key", min_interval_seconds=0.25),
         session=session,
         query="robotics",
+        ingestor=make_ingestor(tmp_path),
         clock=lambda: next(times),
         sleeper=sleeps.append,
     )
@@ -432,14 +449,17 @@ def test_connector_owns_only_its_internal_session(monkeypatch):
     assert external.closed is False
 
 
-def test_download_and_manual_sources_implement_typed_checkpoint_fetch():
-    archive = _zip_bytes("FORM_D.tsv", fixture("form_d_sample.tsv").encode())
+def test_download_and_manual_sources_implement_typed_checkpoint_fetch(tmp_path):
+    archive = official_form_d_zip()
+    sink = make_ingestor(tmp_path)
     form_checkpoint = ConnectorCheckpoint("form_d", cursor="2026Q2")
     form_d = FormDConnector(
-        archive_loader=lambda checkpoint: (archive, "2026Q3")
+        archive_loader=lambda checkpoint: (archive, "2026Q3"), ingestor=sink,
     )
     manual_checkpoint = ConnectorCheckpoint("manual_import", cursor="import-1")
-    manual = ManualImportConnector(content=fixture("manual_company_import.csv"))
+    manual = ManualImportConnector(
+        content=fixture("manual_company_import.csv"), ingestor=sink
+    )
 
     form_batch = form_d.fetch(form_checkpoint)
     manual_batch = manual.fetch(manual_checkpoint)
@@ -452,12 +472,22 @@ def test_download_and_manual_sources_implement_typed_checkpoint_fetch():
     assert manual_batch.signals[0].signal_type == "private_market_profile"
 
 
-def test_empty_download_batch_never_advances_checkpoint():
-    header_only = fixture("form_d_sample.tsv").splitlines()[0] + "\n"
-    archive = _zip_bytes("FORM_D.tsv", header_only.encode())
+def test_empty_download_batch_never_advances_checkpoint(tmp_path):
+    archive = official_form_d_zip()
+    # Remove the only submission while retaining the six documented tables.
+    source = zipfile.ZipFile(io.BytesIO(archive))
+    rebuilt = io.BytesIO()
+    with source, zipfile.ZipFile(rebuilt, "w", zipfile.ZIP_DEFLATED) as target:
+        for item in source.infolist():
+            content = source.read(item)
+            if Path(item.filename).stem.upper() == "FORMDSUBMISSION":
+                content = content.splitlines(keepends=True)[0]
+            target.writestr(item.filename, content)
+    archive = rebuilt.getvalue()
     checkpoint = ConnectorCheckpoint("form_d", cursor="2026Q2")
     connector = FormDConnector(
-        archive_loader=lambda incoming: (archive, "2026Q3")
+        archive_loader=lambda incoming: (archive, "2026Q3"),
+        ingestor=make_ingestor(tmp_path),
     )
 
     batch = connector.fetch(checkpoint)

@@ -7,9 +7,11 @@ import time
 import unicodedata
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime, timezone
 
 import requests
+
+from ..evidence import EvidenceIngestor
 
 from .base import (
     ConnectorCheckpoint,
@@ -18,7 +20,7 @@ from .base import (
     EmergingSignal,
     PacedJSONTransport,
     SignalConnectorBatch,
-    signal_document_id,
+    persist_signal_evidence,
     validated_api_base_url,
 )
 
@@ -70,9 +72,9 @@ class ClinicalTrialsConfig:
             raise ValueError("max_response_bytes must be positive")
         if (
             not isinstance(self.min_interval_seconds, (int, float))
-            or self.min_interval_seconds < 0
+            or self.min_interval_seconds <= 0
         ):
-            raise ValueError("min_interval_seconds must be nonnegative")
+            raise ValueError("min_interval_seconds must be positive")
 
 
 class ClinicalTrialsConnector:
@@ -84,11 +86,15 @@ class ClinicalTrialsConnector:
         *,
         session=None,
         query: str | None = None,
+        ingestor: EvidenceIngestor | None = None,
+        retrieved_clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
         clock: Callable[[], float] = time.monotonic,
         sleeper: Callable[[float], None] = time.sleep,
     ) -> None:
         self.config = config or ClinicalTrialsConfig()
         self.query = _text(query, "query") if query is not None else None
+        self.ingestor = ingestor
+        self._retrieved_clock = retrieved_clock
         self._owns_session = session is None
         self.session = session or requests.Session()
         if self._owns_session:
@@ -156,25 +162,38 @@ class ClinicalTrialsConnector:
                     raise ValueError("conditions must be a text list")
                 nct_id = _text(identity.get("nctId"), "nctId")
                 locator = f"clinicaltrials:{nct_id}"
+                effective_date = date.fromisoformat(
+                    _text(
+                        status.get("studyFirstSubmitDate"),
+                        "studyFirstSubmitDate",
+                    )
+                )
+                company = _text(
+                    organization.get("fullName"), "organization.fullName"
+                )
+                stage = _text(status.get("overallStatus"), "overallStatus")
+                document_id, passage_id = persist_signal_evidence(
+                    self.ingestor,
+                    connector=self.name,
+                    source_locator=locator,
+                    source_url=f"{self.config.base_url}/studies/{nct_id}",
+                    publisher="ClinicalTrials.gov",
+                    effective_date=effective_date,
+                    raw_record=study,
+                    retrieved_at=self._retrieved_clock(),
+                )
                 records.append(
                     EmergingSignal(
-                        source_document_id=signal_document_id(self.name, locator),
+                        source_document_id=document_id,
                         source_locator=locator,
-                        company=_text(organization.get("fullName"), "organization.fullName"),
+                        company=company,
                         signal_type="clinical_trial",
                         amount=None,
-                        stage=_text(status.get("overallStatus"), "overallStatus"),
-                        effective_date=date.fromisoformat(
-                            _text(
-                                status.get("studyFirstSubmitDate"),
-                                "studyFirstSubmitDate",
-                            )
-                        ),
+                        stage=stage,
+                        effective_date=effective_date,
                         geography=geography,
                         technology_terms=tuple(terms),
-                        evidence_passage_id=_text(
-                            study.get("evidencePassageId"), "evidencePassageId"
-                        ),
+                        evidence_passage_id=passage_id,
                     )
                 )
             return tuple(records)

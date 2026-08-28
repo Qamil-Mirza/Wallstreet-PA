@@ -3,17 +3,20 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
 import unicodedata
-from datetime import date
+from collections.abc import Callable
+from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
 
+from ..evidence import EvidenceIngestor
 from .base import (
     ConnectorCheckpoint,
     ConnectorError,
     EmergingSignal,
     SignalConnectorBatch,
-    signal_document_id,
+    persist_signal_evidence,
 )
 
 
@@ -22,7 +25,6 @@ _FIELDS = (
     "profile_date",
     "geography",
     "technology_terms",
-    "evidence_passage_id",
     "source_locator",
     "stage",
     "amount",
@@ -47,12 +49,19 @@ class ManualImportConnector:
     name = "manual_import"
 
     def __init__(
-        self, *, max_bytes: int = 5_000_000, content: str | bytes | None = None
+        self,
+        *,
+        max_bytes: int = 5_000_000,
+        content: str | bytes | None = None,
+        ingestor: EvidenceIngestor | None = None,
+        retrieved_clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
     ) -> None:
         if not isinstance(max_bytes, int) or max_bytes <= 0:
             raise ValueError("max_bytes must be a positive integer")
         self.max_bytes = max_bytes
         self.content = content
+        self.ingestor = ingestor
+        self._retrieved_clock = retrieved_clock
 
     def parse(self, content: str | bytes) -> tuple[EmergingSignal, ...]:
         if isinstance(content, str):
@@ -109,25 +118,37 @@ class ManualImportConnector:
                     if terms_text
                     else ()
                 )
+                effective_date = date.fromisoformat(
+                    _text(row["profile_date"], "profile_date") or ""
+                )
+                company = _text(row["company"], "company") or ""
+                stage = _text(row["stage"], "stage", required=False)
+                geography = _text(row["geography"], "geography", required=False)
+                document_id, passage_id = persist_signal_evidence(
+                    self.ingestor,
+                    connector=self.name,
+                    source_locator=locator,
+                    source_url=(
+                        "https://local.invalid/manual-import?source="
+                        + hashlib.sha256(locator.encode("utf-8")).hexdigest()
+                    ),
+                    publisher="Licensed manual import",
+                    effective_date=effective_date,
+                    raw_record=row,
+                    retrieved_at=self._retrieved_clock(),
+                )
                 records.append(
                     EmergingSignal(
-                        source_document_id=signal_document_id(self.name, locator),
+                        source_document_id=document_id,
                         source_locator=locator,
-                        company=_text(row["company"], "company") or "",
+                        company=company,
                         signal_type="private_market_profile",
                         amount=amount,
-                        stage=_text(row["stage"], "stage", required=False),
-                        effective_date=date.fromisoformat(
-                            _text(row["profile_date"], "profile_date") or ""
-                        ),
-                        geography=_text(
-                            row["geography"], "geography", required=False
-                        ),
+                        stage=stage,
+                        effective_date=effective_date,
+                        geography=geography,
                         technology_terms=terms,
-                        evidence_passage_id=_text(
-                            row["evidence_passage_id"], "evidence_passage_id"
-                        )
-                        or "",
+                        evidence_passage_id=passage_id,
                     )
                 )
             return tuple(records)

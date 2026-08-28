@@ -7,10 +7,14 @@ import time
 import unicodedata
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
 
 import requests
+
+from urllib.parse import quote
+
+from ..evidence import EvidenceIngestor
 
 from .base import (
     ConnectorCheckpoint,
@@ -19,7 +23,7 @@ from .base import (
     EmergingSignal,
     PacedJSONTransport,
     SignalConnectorBatch,
-    signal_document_id,
+    persist_signal_evidence,
     validated_api_base_url,
 )
 from .fmp import install_fmp_log_redaction
@@ -115,9 +119,9 @@ def _validate_transport_values(config: SBIRConfig | USASpendingConfig) -> None:
         raise ValueError("max_response_bytes must be positive")
     if (
         not isinstance(config.min_interval_seconds, (int, float))
-        or config.min_interval_seconds < 0
+        or config.min_interval_seconds <= 0
     ):
-        raise ValueError("min_interval_seconds must be nonnegative")
+        raise ValueError("min_interval_seconds must be positive")
 
 
 class _APIConnector:
@@ -164,13 +168,17 @@ class SBIRConnector(_APIConnector):
         *,
         session=None,
         query: str | None = None,
-        bulk_loader: Callable[[], str | bytes | Mapping[str, object]] | None = None,
+        bulk_loader: Callable[[], str | bytes] | None = None,
+        ingestor: EvidenceIngestor | None = None,
+        retrieved_clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
         clock: Callable[[], float] = time.monotonic,
         sleeper: Callable[[float], None] = time.sleep,
     ) -> None:
         self.config = config or SBIRConfig()
         self.query = _text(query, "query") if query is not None else None
         self.bulk_loader = bulk_loader
+        self.ingestor = ingestor
+        self._retrieved_clock = retrieved_clock
         install_fmp_log_redaction(self.config.api_key)
         self._init_transport(
             config=self.config,
@@ -217,26 +225,38 @@ class SBIRConnector(_APIConnector):
                     if stage_value is not None
                     else None
                 )
+                effective_date = date.fromisoformat(
+                    _text(
+                        row.get("proposal_award_date"),
+                        "proposal_award_date",
+                    )
+                )
+                company = _text(row.get("firm"), "firm")
+                amount = _amount(row.get("award_amount"))
+                document_id, passage_id = persist_signal_evidence(
+                    self.ingestor,
+                    connector=self.name,
+                    source_locator=locator,
+                    source_url=(
+                        f"{self.config.base_url}/awards?contract={quote(award_id)}"
+                    ),
+                    publisher="Small Business Innovation Research",
+                    effective_date=effective_date,
+                    raw_record=row,
+                    retrieved_at=self._retrieved_clock(),
+                )
                 records.append(
                     EmergingSignal(
-                        source_document_id=signal_document_id(self.name, locator),
+                        source_document_id=document_id,
                         source_locator=locator,
-                        company=_text(row.get("firm"), "firm"),
+                        company=company,
                         signal_type="grant",
-                        amount=_amount(row.get("award_amount")),
+                        amount=amount,
                         stage=stage,
-                        effective_date=date.fromisoformat(
-                            _text(
-                                row.get("proposal_award_date"),
-                                "proposal_award_date",
-                            )
-                        ),
+                        effective_date=effective_date,
                         geography=geography,
                         technology_terms=tuple(terms),
-                        evidence_passage_id=_text(
-                            row.get("evidence_passage_id"),
-                            "evidence_passage_id",
-                        ),
+                        evidence_passage_id=passage_id,
                     )
                 )
             return tuple(records)
@@ -256,7 +276,31 @@ class SBIRConnector(_APIConnector):
                 ConnectorStatus(False, True, "maintenance"),
             )
         try:
-            signals = self.parse(self.bulk_loader())
+            bulk = self.bulk_loader()
+            if isinstance(bulk, str):
+                try:
+                    raw = bulk.encode("utf-8", errors="strict")
+                except UnicodeError:
+                    raise ConnectorError(
+                        self.name,
+                        retryable=False,
+                        diagnostic_code="invalid_encoding",
+                    ) from None
+            elif isinstance(bulk, bytes):
+                raw = bulk
+            else:
+                raise ConnectorError(
+                    self.name,
+                    retryable=False,
+                    diagnostic_code="invalid_bulk_payload",
+                )
+            if len(raw) > self.config.max_response_bytes:
+                raise ConnectorError(
+                    self.name,
+                    retryable=False,
+                    diagnostic_code="bulk_too_large",
+                )
+            signals = self.parse(raw)
         except ConnectorError:
             raise
         except Exception:
@@ -322,11 +366,15 @@ class USASpendingConnector(_APIConnector):
         *,
         session=None,
         query: str | None = None,
+        ingestor: EvidenceIngestor | None = None,
+        retrieved_clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
         clock: Callable[[], float] = time.monotonic,
         sleeper: Callable[[float], None] = time.sleep,
     ) -> None:
         self.config = config or USASpendingConfig()
         self.query = _text(query, "query") if query is not None else None
+        self.ingestor = ingestor
+        self._retrieved_clock = retrieved_clock
         self._init_transport(
             config=self.config,
             session=session,
@@ -364,22 +412,35 @@ class USASpendingConnector(_APIConnector):
                     "Award ID",
                 )
                 locator = f"usaspending-award:{award_id}"
+                effective_date = date.fromisoformat(
+                    _text(row.get("Start Date"), "Start Date")
+                )
+                company = _text(row.get("Recipient Name"), "Recipient Name")
+                amount = _amount(row.get("Award Amount"))
+                document_id, passage_id = persist_signal_evidence(
+                    self.ingestor,
+                    connector=self.name,
+                    source_locator=locator,
+                    source_url=(
+                        f"{self.config.base_url}/awards/{quote(award_id, safe='')}/"
+                    ),
+                    publisher="USAspending.gov",
+                    effective_date=effective_date,
+                    raw_record=row,
+                    retrieved_at=self._retrieved_clock(),
+                )
                 records.append(
                     EmergingSignal(
-                        source_document_id=signal_document_id(self.name, locator),
+                        source_document_id=document_id,
                         source_locator=locator,
-                        company=_text(row.get("Recipient Name"), "Recipient Name"),
+                        company=company,
                         signal_type="contract",
-                        amount=_amount(row.get("Award Amount")),
+                        amount=amount,
                         stage=None,
-                        effective_date=date.fromisoformat(
-                            _text(row.get("Start Date"), "Start Date")
-                        ),
+                        effective_date=effective_date,
                         geography=geography,
                         technology_terms=tuple(terms),
-                        evidence_passage_id=_text(
-                            row.get("evidence_passage_id"), "evidence_passage_id"
-                        ),
+                        evidence_passage_id=passage_id,
                     )
                 )
             return tuple(records)

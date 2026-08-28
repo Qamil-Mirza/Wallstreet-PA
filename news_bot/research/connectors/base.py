@@ -3,19 +3,19 @@
 from __future__ import annotations
 
 import re
-import hashlib
 import json
 import threading
 import unicodedata
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, time, timezone
 from decimal import Decimal
 from typing import Protocol, runtime_checkable
 from urllib.parse import urlsplit
 
 from ..evidence import (
     DocumentInput,
+    EvidenceError,
     EvidenceIngestor,
     IngestedDocument,
     canonicalize_url,
@@ -46,13 +46,70 @@ def _normalized_text(value: str, field_name: str) -> str:
     return " ".join(unicodedata.normalize("NFC", value).split())
 
 
-def signal_document_id(connector: str, source_locator: str) -> str:
-    """Return a stable opaque source-document identity for one public record."""
+def persist_signal_evidence(
+    ingestor: EvidenceIngestor | None,
+    *,
+    connector: str,
+    source_locator: str,
+    source_url: str,
+    publisher: str,
+    effective_date: date,
+    raw_record: Mapping[str, object],
+    retrieved_at: datetime,
+) -> tuple[str, str]:
+    """Persist one exact raw signal record before exposing lineage IDs."""
     _connector_name(connector)
-    locator = _normalized_text(source_locator, "source_locator")
-    return "signal-" + hashlib.sha256(
-        f"{connector}\0{locator}".encode("utf-8")
-    ).hexdigest()
+    if ingestor is None:
+        raise ConnectorError(
+            connector, retryable=False, diagnostic_code="evidence_sink_missing"
+        )
+    if not isinstance(ingestor, EvidenceIngestor):
+        raise TypeError("ingestor must be EvidenceIngestor or None")
+    if not isinstance(raw_record, Mapping):
+        raise TypeError("raw_record must be a mapping")
+    if (
+        not isinstance(retrieved_at, datetime)
+        or retrieved_at.tzinfo is None
+        or retrieved_at.utcoffset() is None
+    ):
+        raise ValueError("retrieved_at must be timezone-aware")
+    try:
+        content = json.dumps(
+            dict(raw_record),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    except (TypeError, ValueError):
+        raise ConnectorError(
+            connector, retryable=False, diagnostic_code="invalid_payload"
+        ) from None
+    try:
+        document = ingestor.ingest(
+            DocumentInput(
+                source_type=connector,
+                url=source_url,
+                publisher=publisher,
+                published_at=datetime.combine(
+                    effective_date, time.min, tzinfo=timezone.utc
+                ),
+                retrieved_at=retrieved_at,
+                content=content,
+            )
+        )
+    except EvidenceError:
+        raise ConnectorError(
+            connector,
+            retryable=False,
+            diagnostic_code="evidence_persistence_failed",
+        ) from None
+    if not document.passages:
+        raise ConnectorError(
+            connector,
+            retryable=False,
+            diagnostic_code="evidence_persistence_failed",
+        )
+    return document.document_id, document.passages[0].passage_id
 
 
 @dataclass(frozen=True)
@@ -334,9 +391,9 @@ class PacedJSONTransport:
             raise ValueError("max_response_bytes must be positive")
         if (
             not isinstance(min_interval_seconds, (int, float))
-            or min_interval_seconds < 0
+            or min_interval_seconds <= 0
         ):
-            raise ValueError("min_interval_seconds must be nonnegative")
+            raise ValueError("min_interval_seconds must be positive")
         self.connector = connector
         self.host = host
         self.session = session

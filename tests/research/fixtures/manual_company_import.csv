@@ -1,2 +1,2 @@
-company,profile_date,geography,technology_terms,evidence_passage_id,source_locator,stage,amount
-Atlas Robotics Inc.,2026-08-15,California,Robotic Actuators|Harmonic Drives,passage-manual-1,licensed-export:atlas-2026-08-15,Series A,5000000
+company,profile_date,geography,technology_terms,source_locator,stage,amount
+Atlas Robotics Inc.,2026-08-15,California,Robotic Actuators|Harmonic Drives,licensed-export:atlas-2026-08-15,Series A,5000000

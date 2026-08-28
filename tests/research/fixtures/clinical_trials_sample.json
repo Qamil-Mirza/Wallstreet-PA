@@ -15,8 +15,7 @@
           "locations": [{"country": "United States", "state": "California"}]
         },
         "conditionsModule": {"conditions": ["Solid Tumor", "Gene Therapy"]}
-      },
-      "evidencePassageId": "passage-trial-1"
+      }
     }
   ],
   "nextPageToken": "trial-page-2"

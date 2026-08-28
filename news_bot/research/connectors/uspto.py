@@ -7,9 +7,11 @@ import time
 import unicodedata
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime, timezone
 
 import requests
+
+from ..evidence import EvidenceIngestor
 
 from .base import (
     ConnectorCheckpoint,
@@ -18,7 +20,7 @@ from .base import (
     EmergingSignal,
     PacedJSONTransport,
     SignalConnectorBatch,
-    signal_document_id,
+    persist_signal_evidence,
     validated_api_base_url,
 )
 from .fmp import install_fmp_log_redaction
@@ -78,9 +80,9 @@ class USPTOConfig:
             raise ValueError("max_response_bytes must be positive")
         if (
             not isinstance(self.min_interval_seconds, (int, float))
-            or self.min_interval_seconds < 0
+            or self.min_interval_seconds <= 0
         ):
-            raise ValueError("min_interval_seconds must be nonnegative")
+            raise ValueError("min_interval_seconds must be positive")
 
 
 class USPTOConnector:
@@ -94,11 +96,15 @@ class USPTOConnector:
         *,
         session=None,
         query: str | None = None,
+        ingestor: EvidenceIngestor | None = None,
+        retrieved_clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
         clock: Callable[[], float] = time.monotonic,
         sleeper: Callable[[float], None] = time.sleep,
     ) -> None:
         self.config = config or USPTOConfig()
         self.query = _text(query, "query") if query is not None else None
+        self.ingestor = ingestor
+        self._retrieved_clock = retrieved_clock
         install_fmp_log_redaction(self.config.api_key)
         self._owns_session = session is None
         self.session = session or requests.Session()
@@ -144,24 +150,34 @@ class USPTOConnector:
                     else ()
                 )
                 locator = f"uspto-application:{application}"
+                effective_date = date.fromisoformat(
+                    _text(metadata.get("filingDate"), "filingDate")
+                )
+                company = _text(
+                    metadata.get("firstApplicantName"), "firstApplicantName"
+                )
+                document_id, passage_id = persist_signal_evidence(
+                    self.ingestor,
+                    connector=self.name,
+                    source_locator=locator,
+                    source_url=f"{self.config.base_url}/{application}",
+                    publisher="United States Patent and Trademark Office",
+                    effective_date=effective_date,
+                    raw_record=row,
+                    retrieved_at=self._retrieved_clock(),
+                )
                 records.append(
                     EmergingSignal(
-                        source_document_id=signal_document_id(self.name, locator),
+                        source_document_id=document_id,
                         source_locator=locator,
-                        company=_text(
-                            metadata.get("firstApplicantName"), "firstApplicantName"
-                        ),
+                        company=company,
                         signal_type="patent",
                         amount=None,
                         stage=None,
-                        effective_date=date.fromisoformat(
-                            _text(metadata.get("filingDate"), "filingDate")
-                        ),
+                        effective_date=effective_date,
                         geography=None,
                         technology_terms=terms,
-                        evidence_passage_id=_text(
-                            row.get("evidencePassageId"), "evidencePassageId"
-                        ),
+                        evidence_passage_id=passage_id,
                     )
                 )
             return tuple(records)
