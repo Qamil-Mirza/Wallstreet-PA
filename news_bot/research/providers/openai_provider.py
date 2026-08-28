@@ -34,6 +34,10 @@ from .base import (
     ProviderUnavailable,
     ProviderValidationError,
     ReasoningEffort,
+    ValidationIssue,
+    _safe_text,
+    validated_provider_json,
+    validation_issues,
 )
 
 
@@ -43,16 +47,22 @@ class ModelRoute:
     reasoning_effort: ReasoningEffort
 
     def __post_init__(self) -> None:
-        if not isinstance(self.model, str) or not self.model.strip():
-            raise ProviderConfigurationError("route model must be nonblank")
+        model = _safe_text(
+            "route model",
+            self.model,
+            allow_multiline=False,
+            nonblank=True,
+            error_type=ProviderConfigurationError,
+        ).strip()
         try:
             effort = (
                 self.reasoning_effort
                 if isinstance(self.reasoning_effort, ReasoningEffort)
                 else ReasoningEffort(self.reasoning_effort)
             )
-        except (TypeError, ValueError) as exc:
-            raise ProviderConfigurationError("route reasoning effort is invalid") from exc
+        except (TypeError, ValueError):
+            raise ProviderConfigurationError("route reasoning effort is invalid") from None
+        object.__setattr__(self, "model", model)
         object.__setattr__(self, "reasoning_effort", effort)
 
 
@@ -111,7 +121,7 @@ class OpenAIProvider:
         except KeyError:
             raise ProviderConfigurationError("no approved OpenAI route for role") from None
         client = self._get_client()
-        prompt_for_estimate = f"{request.system_prompt}\n{request.canonical_evidence}"
+        prompt_for_estimate = f"{request.system_prompt}\n{request.provider_input}"
         estimated_input = self.token_estimator(prompt_for_estimate)
         if type(estimated_input) is not int or estimated_input < 0:
             raise ProviderConfigurationError("token estimator returned an invalid count")
@@ -133,15 +143,15 @@ class OpenAIProvider:
             provider_result = client.responses.create(
                 model=route.model,
                 instructions=request.system_prompt,
-                input=request.canonical_evidence,
+                input=request.provider_input,
                 max_output_tokens=request.max_output_tokens,
-                reasoning={"effort": route.reasoning_effort.value},
+                reasoning={"effort": request.reasoning_effort.value},
                 store=False,
                 text={
                     "format": {
                         "type": "json_schema",
-                        "name": request.output_schema.__name__,
-                        "schema": request.output_schema.model_json_schema(),
+                        "name": request.schema_name,
+                        "schema": request.schema_payload(),
                         "strict": True,
                     }
                 },
@@ -164,13 +174,30 @@ class OpenAIProvider:
         )
         self.budget.reconcile(reservation.id, actual, now=self.clock())
         try:
+            raw_bytes = raw.encode("utf-8", errors="strict")
+        except UnicodeError:
+            raise ProviderValidationError(
+                "OpenAI response failed the requested schema",
+                issues=(ValidationIssue("$", "invalid_utf8"),),
+            ) from None
+        try:
             parsed_json = json.loads(raw)
+        except json.JSONDecodeError:
+            raise ProviderValidationError(
+                "OpenAI response failed the requested schema",
+                issues=(ValidationIssue("$", "json_invalid"),),
+            ) from None
+        parsed_json = validated_provider_json(parsed_json)
+        try:
             parsed = request.output_schema.model_validate(parsed_json)
-        except (json.JSONDecodeError, ValidationError, TypeError, ValueError):
-            raise ProviderValidationError("OpenAI response failed the requested schema") from None
+        except ValidationError as exc:
+            raise ProviderValidationError(
+                "OpenAI response failed the requested schema",
+                issues=validation_issues(exc),
+            ) from None
         return ModelResponse(
             data=parsed,
-            raw_response_hash=hashlib.sha256(raw.encode("utf-8")).hexdigest(),
+            raw_response_hash=hashlib.sha256(raw_bytes).hexdigest(),
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             reasoning_tokens=reasoning_tokens,
@@ -232,8 +259,14 @@ def _extract_response(result: Any) -> tuple[str, int, int, int]:
     details = getattr(usage, "output_tokens_details", None)
     reasoning_tokens = getattr(details, "reasoning_tokens", 0)
     if not isinstance(raw, str):
-        raise ProviderValidationError("OpenAI response omitted structured output")
+        raise ProviderValidationError(
+            "OpenAI response omitted structured output",
+            issues=(ValidationIssue("$", "output_missing"),),
+        )
     for value in (input_tokens, output_tokens, reasoning_tokens):
         if type(value) is not int or value < 0:
-            raise ProviderValidationError("OpenAI response omitted valid usage metadata")
+            raise ProviderValidationError(
+                "OpenAI response omitted valid usage metadata",
+                issues=(ValidationIssue("usage", "invalid"),),
+            )
     return raw, input_tokens, output_tokens, reasoning_tokens

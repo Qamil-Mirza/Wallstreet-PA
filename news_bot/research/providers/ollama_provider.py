@@ -24,6 +24,10 @@ from .base import (
     ProviderRateLimitError,
     ProviderUnavailable,
     ProviderValidationError,
+    ValidationIssue,
+    _safe_text,
+    validated_provider_json,
+    validation_issues,
 )
 
 
@@ -79,8 +83,13 @@ class OllamaProvider:
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.base_url = _safe_private_base_url(base_url, allowed_private_hosts)
-        if not isinstance(model, str) or not model.strip():
-            raise ProviderConfigurationError("Ollama model must be nonblank")
+        safe_model = _safe_text(
+            "Ollama model",
+            model,
+            allow_multiline=False,
+            nonblank=True,
+            error_type=ProviderConfigurationError,
+        ).strip()
         if (
             not isinstance(timeout, tuple)
             or len(timeout) != 2
@@ -96,7 +105,7 @@ class OllamaProvider:
             raise ProviderConfigurationError("Ollama response bound must be positive")
         if not callable(clock):
             raise ProviderConfigurationError("Ollama clock must be callable")
-        self.model = model.strip()
+        self.model = safe_model
         self.timeout = timeout
         self.max_response_bytes = max_response_bytes
         self.clock = clock
@@ -128,23 +137,43 @@ class OllamaProvider:
         payload = {
             "model": self.model,
             "system": request.system_prompt,
-            "prompt": request.canonical_evidence,
+            "prompt": request.provider_input,
             "stream": False,
-            "format": request.output_schema.model_json_schema(),
+            "format": request.schema_payload(),
             "options": {"num_predict": request.max_output_tokens},
         }
         result = self._request_json("POST", "/api/generate", json_body=payload)
         raw = result.get("response")
         if not isinstance(raw, str):
-            raise ProviderValidationError("Ollama response did not contain structured text")
+            raise ProviderValidationError(
+                "Ollama response did not contain structured text",
+                issues=(ValidationIssue("$", "output_missing"),),
+            )
+        try:
+            raw_bytes = raw.encode("utf-8", errors="strict")
+        except UnicodeError:
+            raise ProviderValidationError(
+                "Ollama response failed the requested schema",
+                issues=(ValidationIssue("$", "invalid_utf8"),),
+            ) from None
         try:
             parsed_json = json.loads(raw)
+        except json.JSONDecodeError:
+            raise ProviderValidationError(
+                "Ollama response failed the requested schema",
+                issues=(ValidationIssue("$", "json_invalid"),),
+            ) from None
+        parsed_json = validated_provider_json(parsed_json)
+        try:
             parsed = request.output_schema.model_validate(parsed_json)
-        except (json.JSONDecodeError, ValidationError, TypeError, ValueError):
-            raise ProviderValidationError("Ollama response failed the requested schema") from None
+        except ValidationError as exc:
+            raise ProviderValidationError(
+                "Ollama response failed the requested schema",
+                issues=validation_issues(exc),
+            ) from None
         return ModelResponse(
             data=parsed,
-            raw_response_hash=hashlib.sha256(raw.encode("utf-8")).hexdigest(),
+            raw_response_hash=hashlib.sha256(raw_bytes).hexdigest(),
             input_tokens=_nonnegative_count(result.get("prompt_eval_count")),
             output_tokens=_nonnegative_count(result.get("eval_count")),
             reasoning_tokens=_nonnegative_count(result.get("reasoning_eval_count", 0)),
@@ -176,11 +205,15 @@ class OllamaProvider:
                     continue
                 raw.extend(chunk)
                 if len(raw) > self.max_response_bytes:
-                    raise ProviderValidationError("Ollama response exceeds configured byte limit")
+                    raise ProviderValidationError(
+                        issues=(ValidationIssue("$", "response_too_large"),)
+                    )
             decoded = bytes(raw).decode("utf-8", errors="strict")
             value = json.loads(decoded)
             if not isinstance(value, dict):
-                raise ProviderValidationError("Ollama response must be a JSON object")
+                raise ProviderValidationError(
+                    issues=(ValidationIssue("$", "object_required"),)
+                )
             return value
         except ProviderValidationError:
             raise
@@ -198,7 +231,9 @@ class OllamaProvider:
                 raise ProviderUnavailable("Ollama is unavailable") from None
             raise ProviderNonRetryableError("Ollama rejected the request") from None
         except (UnicodeError, json.JSONDecodeError, TypeError, ValueError):
-            raise ProviderValidationError("Ollama returned invalid JSON") from None
+            raise ProviderValidationError(
+                issues=(ValidationIssue("$", "json_invalid"),)
+            ) from None
         except requests.RequestException:
             raise ProviderUnavailable("Ollama request failed") from None
         finally:
@@ -208,5 +243,7 @@ class OllamaProvider:
 
 def _nonnegative_count(value: Any) -> int:
     if type(value) is not int or value < 0:
-        raise ProviderValidationError("provider usage metadata is invalid")
+        raise ProviderValidationError(
+            issues=(ValidationIssue("usage", "invalid"),)
+        )
     return value

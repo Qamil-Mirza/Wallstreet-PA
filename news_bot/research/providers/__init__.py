@@ -9,11 +9,13 @@ from .base import (
     ProviderConfigurationError,
     ProviderError,
     ProviderNonRetryableError,
+    ProviderRequestError,
     ProviderRateLimitError,
     ProviderUnavailable,
     ProviderValidationError,
     ReasoningEffort,
     TaskDeferred,
+    ValidationIssue,
 )
 from .ollama_provider import OllamaProvider
 from .openai_provider import ModelRoute, OpenAIProvider
@@ -31,10 +33,12 @@ __all__ = [
     "ProviderConfigurationError",
     "ProviderError",
     "ProviderNonRetryableError",
+    "ProviderRequestError",
     "ProviderRateLimitError",
     "ProviderRouter",
     "ProviderUnavailable",
     "ProviderValidationError",
     "ReasoningEffort",
     "TaskDeferred",
+    "ValidationIssue",
 ]
