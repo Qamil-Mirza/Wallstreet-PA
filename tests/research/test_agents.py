@@ -15,6 +15,7 @@ from news_bot.research.agents.contracts import (
     EvidenceUnavailable, FundamentalAnalystInput, IndustryStrategistInput,
     IneligibleSecurity,
     EventScoutOutput, ResearchEditorOutput, ReviewerInput, SecurityEligibility,
+    ValuationRange,
 )
 from news_bot.research.config import ResearchConfig
 from news_bot.research.agents.director import ResearchDirector
@@ -454,6 +455,24 @@ def test_fundamental_recommendation_has_complete_investment_case(tmp_path):
     ))
     assert result.rating.value == "hold"
     assert result.valuation.low == Decimal("90")
+
+
+def test_valuation_range_allows_zero_boundaries():
+    valuation = ValuationRange(
+        low=Decimal("0"), high=Decimal("0"), currency="USD", as_of=NOW
+    )
+
+    assert valuation.low == Decimal("0")
+    assert valuation.high == Decimal("0")
+
+
+@pytest.mark.parametrize(
+    "low,high",
+    [(Decimal("-1"), Decimal("0")), (Decimal("0"), Decimal("-1"))],
+)
+def test_valuation_range_rejects_negative_boundaries(low, high):
+    with pytest.raises(ValidationError):
+        ValuationRange(low=low, high=high, currency="USD", as_of=NOW)
 
 
 @pytest.mark.parametrize(

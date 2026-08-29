@@ -330,8 +330,8 @@ class FundamentalAnalystInput(EvidenceInput):
 
 
 class ValuationRange(FrozenContract):
-    low: Decimal = Field(gt=Decimal("0"), allow_inf_nan=False)
-    high: Decimal = Field(gt=Decimal("0"), allow_inf_nan=False)
+    low: Decimal = Field(ge=Decimal("0"), allow_inf_nan=False)
+    high: Decimal = Field(ge=Decimal("0"), allow_inf_nan=False)
     currency: str = Field(pattern=r"^[A-Z]{3}$")
     as_of: datetime
 
