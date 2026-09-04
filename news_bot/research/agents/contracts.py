@@ -109,7 +109,7 @@ class AgentTask(FrozenContract, Generic[InputT]):
 
 
 class AnalyticalOutput(FrozenContract):
-    schema_version: Literal["1"] = "1"
+    schema_version: Literal["1"]
     evidence_ids: tuple[str, ...] = Field(min_length=1)
     as_of: datetime
     confidence: float = Field(ge=0.0, le=1.0, allow_inf_nan=False)
@@ -219,8 +219,8 @@ class ClaimDraft(FrozenContract):
     claim_id: str
     text: str
     kind: ClaimKind
-    evidence_ids: tuple[str, ...] = ()
-    supporting_claim_ids: tuple[str, ...] = ()
+    evidence_ids: tuple[str, ...]
+    supporting_claim_ids: tuple[str, ...]
 
     _claim_id = field_validator("claim_id")(_safe_identifier)
     _text = field_validator("text")(_safe_text)

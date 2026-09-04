@@ -11,12 +11,13 @@ from pydantic import ValidationError
 
 from news_bot.research.agents.analysts import EvidenceAnalyst, FundamentalAnalyst, IndustryStrategist
 from news_bot.research.agents.contracts import (
-    AgentContractError, AgentTask, DirectorInput, EditorInput, EmergingScoutInput,
-    EmergingSignal, EventCandidate, EventScoutInput, EvidenceAnalystInput,
-    EvidenceUnavailable, FundamentalAnalystInput, IndustryStrategistInput,
-    IneligibleSecurity,
-    EventScoutOutput, ResearchEditorOutput, ReviewerInput, SecurityEligibility,
-    ValuationRange,
+    AgentContractError, AgentTask, DirectorInput, DirectorOutput, EditorInput,
+    EmergingScoutInput, EmergingScoutOutput, EmergingSignal, EventCandidate,
+    EventScoutInput, EventScoutOutput, EvidenceAnalystInput,
+    EvidenceAnalystOutput, EvidenceUnavailable, FundamentalAnalystInput,
+    FundamentalAnalystOutput, IndustryStrategistInput, IndustryStrategistOutput,
+    IneligibleSecurity, ResearchEditorOutput, ReviewerInput, ReviewerOutput,
+    SecurityEligibility, ValuationRange,
 )
 from news_bot.research.config import ResearchConfig
 from news_bot.research.agents.director import ResearchDirector
@@ -55,6 +56,29 @@ class FakeRouter:
             model="research:latest", provider="fake-provider",
             inference_mode=InferenceMode.EXTERNAL, fallback_reason=None,
         )
+
+
+@pytest.mark.parametrize("output_type", (
+    DirectorOutput, EventScoutOutput, EmergingScoutOutput,
+    EvidenceAnalystOutput, IndustryStrategistOutput, FundamentalAnalystOutput,
+    ReviewerOutput, ResearchEditorOutput,
+))
+def test_all_strict_output_schema_objects_require_every_declared_field(output_type):
+    schema = output_type.model_json_schema()
+
+    def assert_strict_objects(value):
+        if isinstance(value, dict):
+            if value.get("type") == "object" or "properties" in value:
+                assert value.get("additionalProperties") is False
+                assert set(value.get("required", ())) == set(value["properties"])
+            assert "default" not in value
+            for nested in value.values():
+                assert_strict_objects(nested)
+        elif isinstance(value, list):
+            for nested in value:
+                assert_strict_objects(nested)
+
+    assert_strict_objects(schema)
 
 
 def seed_store(
@@ -827,6 +851,44 @@ def test_different_tasks_in_one_workflow_have_distinct_agent_attempts(tmp_path):
         ).fetchone()
     assert attempts == (2, 2)
     assert len(router.calls) == 2
+
+
+def test_same_logical_task_runs_independently_in_distinct_workflows(tmp_path):
+    store = seed_store(tmp_path)
+    output = common_output(ranked_events=[{
+        "event_id": "event-1", "rank": 1, "reason": "Material",
+    }])
+    router = FakeRouter(output, output)
+    agent = EventScout(router, store, clock=lambda: NOW)
+    task_input = EventScoutInput(
+        events=(EventCandidate(event_id="event-1", headline="Filed"),),
+        evidence_ids=("passage-1",), as_of=NOW,
+    )
+
+    first = task(task_input, task_id="repeat-task", run_id="workflow-one")
+    second = task(task_input, task_id="repeat-task", run_id="workflow-two")
+    assert agent.run(first).ranked_events[0].event_id == "event-1"
+    assert agent.run(second).ranked_events[0].event_id == "event-1"
+    assert agent.run(first).ranked_events[0].event_id == "event-1"
+    assert agent.run(second).ranked_events[0].event_id == "event-1"
+
+    assert len(router.calls) == 2
+    executions = (
+        *store.list_agent_executions("workflow-one"),
+        *store.list_agent_executions("workflow-two"),
+    )
+    assert len(executions) == 2
+    assert len({execution.attempt_id for execution in executions}) == 2
+    assert {execution.status for execution in executions} == {"succeeded"}
+    with store.connect() as connection:
+        instances = connection.execute(
+            "SELECT workflow_run_id, task_id, state "
+            "FROM workflow_task_instances ORDER BY workflow_run_id"
+        ).fetchall()
+    assert instances == [
+        ("workflow-one", "repeat-task", "completed"),
+        ("workflow-two", "repeat-task", "completed"),
+    ]
 
 
 def test_different_roles_and_tasks_share_one_workflow_without_collision(tmp_path):

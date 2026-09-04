@@ -172,6 +172,9 @@ class AgentRunAudit:
     status: str = "succeeded"
     safe_failure_code: str | None = None
     usage_known: bool = True
+    provider_attempt_count: int = 0
+    reservation_state: str | None = None
+    reserved_cost_usd: Decimal | None = None
 
 
 @dataclass(frozen=True)
@@ -1387,6 +1390,9 @@ class ResearchStore:
         attempt_id = "agent_attempt_" + hashlib.sha256(
             identity.encode("utf-8")
         ).hexdigest()
+        task_instance_id = "task_instance_" + attempt_id.removeprefix(
+            "agent_attempt_"
+        )
         task_scope = _canonical_json({
             "contract_version": schema_version,
             "input_hash": input_hash,
@@ -1396,9 +1402,15 @@ class ResearchStore:
             existing_attempt = connection.execute(
                 "SELECT state, input_hash, prompt_hash, evidence_hash, "
                 "schema_version, output_json, output_hash, lease_token, "
-                "lease_expires_at "
+                "lease_expires_at, task_instance_id "
                 "FROM agent_executions WHERE attempt_id = ?",
                 (attempt_id,),
+            ).fetchone()
+            existing_instance = connection.execute(
+                "SELECT workflow_run_id, task_id, role, schema_version, "
+                "input_hash, prompt_hash, state, owns_research_task_state "
+                "FROM workflow_task_instances WHERE task_instance_id = ?",
+                (task_instance_id,),
             ).fetchone()
             existing_task = connection.execute(
                 "SELECT task_kind, scope_json, state FROM research_tasks "
@@ -1414,6 +1426,12 @@ class ResearchStore:
                         and existing_attempt[3] != evidence_hash
                     )
                     or existing_attempt[4] != schema_version
+                    or existing_attempt[9] != task_instance_id
+                    or existing_instance is None
+                    or existing_instance[:6] != (
+                        workflow_run_id, task_id, role.value, schema_version,
+                        input_hash, prompt_hash,
+                    )
                     or existing_task is None
                     or existing_task[0] != role.value
                     or existing_task[1] != task_scope
@@ -1427,7 +1445,7 @@ class ResearchStore:
                         existing_attempt[6],
                     )
                     if (
-                        existing_task[2] != "completed"
+                        existing_instance[6] != "completed"
                         or re.fullmatch(
                             r"[0-9a-f]{64}", evidence_digest or ""
                         ) is None
@@ -1445,7 +1463,10 @@ class ResearchStore:
                         replay_output_hash=output_hash,
                         replay_evidence_hash=evidence_digest,
                     )
-                if existing_attempt[0] != "running" or existing_task[2] != "running":
+                if (
+                    existing_attempt[0] != "running"
+                    or existing_instance[6] != "running"
+                ):
                     raise AgentExecutionConflict(
                         "agent execution is already terminal"
                     )
@@ -1480,33 +1501,55 @@ class ResearchStore:
                     "VALUES (?, ?, ?, 'running', 0, ?, ?)",
                     (task_id, role.value, task_scope, started_text, started_text),
                 )
+                owns_research_task_state = 1
             else:
                 if (
                     existing_task[0] != role.value
                     or existing_task[1] != task_scope
-                    or existing_task[2] != "pending"
                 ):
                     raise AgentExecutionConflict(
-                        "research task role, scope, or state conflicts"
+                        "research task role or scope conflicts"
                     )
-                cursor = connection.execute(
-                    "UPDATE research_tasks SET state = 'running', started_at = ? "
-                    "WHERE task_id = ? AND state = 'pending'",
-                    (started_text, task_id),
+                owner_exists = connection.execute(
+                    "SELECT 1 FROM workflow_task_instances "
+                    "WHERE task_id = ? AND owns_research_task_state = 1",
+                    (task_id,),
+                ).fetchone()
+                owns_research_task_state = int(
+                    owner_exists is None
+                    and existing_task[2] in {"pending", "running"}
                 )
-                if cursor.rowcount != 1:
-                    raise AgentExecutionConflict(
-                        "research task could not be claimed"
+                if owns_research_task_state and existing_task[2] == "pending":
+                    cursor = connection.execute(
+                        "UPDATE research_tasks SET state = 'running', "
+                        "started_at = ? WHERE task_id = ? AND state = 'pending'",
+                        (started_text, task_id),
                     )
+                    if cursor.rowcount != 1:
+                        raise AgentExecutionConflict(
+                            "research task could not be claimed"
+                        )
+            connection.execute(
+                "INSERT INTO workflow_task_instances (task_instance_id, "
+                "workflow_run_id, task_id, role, schema_version, input_hash, "
+                "prompt_hash, state, started_at, owns_research_task_state) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 'running', ?, ?)",
+                (
+                    task_instance_id, workflow_run_id, task_id, role.value,
+                    schema_version, input_hash, prompt_hash, started_text,
+                    owns_research_task_state,
+                ),
+            )
             connection.execute(
                 "INSERT INTO agent_executions (attempt_id, workflow_run_id, "
-                "task_id, role, schema_version, input_hash, prompt_hash, "
-                "evidence_hash, state, started_at, lease_token, lease_expires_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'running', ?, ?, ?)",
+                "task_id, task_instance_id, role, schema_version, input_hash, "
+                "prompt_hash, evidence_hash, state, started_at, lease_token, "
+                "lease_expires_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', ?, ?, ?)",
                 (
-                    attempt_id, workflow_run_id, task_id, role.value,
-                    schema_version, input_hash, prompt_hash, evidence_hash,
-                    started_text, lease_token, lease_expires_text,
+                    attempt_id, workflow_run_id, task_id, task_instance_id,
+                    role.value, schema_version, input_hash, prompt_hash,
+                    evidence_hash, started_text, lease_token, lease_expires_text,
                 ),
             )
         return AgentExecutionClaim(attempt_id, lease_token)
@@ -1649,6 +1692,65 @@ class ResearchStore:
                     recorded_text,
                 ),
             )
+            aggregate = self._provider_attempt_aggregate(connection, attempt_id)
+            cursor = connection.execute(
+                "UPDATE agent_executions SET provider_attempt_count = ?, "
+                "usage_known = ?, input_tokens = ?, output_tokens = ?, "
+                "reasoning_tokens = ?, reservation_state = ?, "
+                "reserved_cost_usd = ?, provider = ?, model = ?, "
+                "inference_mode = ?, fallback_reason = ? "
+                "WHERE attempt_id = ? AND state = 'running' "
+                "AND lease_token = ?",
+                (*aggregate, attempt_id, lease_token),
+            )
+            if cursor.rowcount != 1:
+                raise AgentExecutionConflict(
+                    "agent execution lease could not aggregate provider usage"
+                )
+
+    @staticmethod
+    def _provider_attempt_aggregate(
+        connection: sqlite3.Connection, attempt_id: str
+    ) -> tuple[
+        int, int, int | None, int | None, int | None, str | None,
+        str | None, str | None, str | None, str | None, str | None,
+    ]:
+        rows = connection.execute(
+            "SELECT usage_known, input_tokens, output_tokens, reasoning_tokens, "
+            "reservation_state, reserved_cost_usd, provider, model, "
+            "inference_mode, fallback_reason FROM provider_attempts "
+            "WHERE attempt_id = ? ORDER BY ordinal",
+            (attempt_id,),
+        ).fetchall()
+        if not rows:
+            return (0, 1, 0, 0, 0, None, None, None, None, None, None)
+        usage_known = int(all(row[0] == 1 for row in rows))
+        token_sums: tuple[int | None, int | None, int | None]
+        if usage_known:
+            token_sums = tuple(
+                sum(row[index] for row in rows) for index in (1, 2, 3)
+            )
+        else:
+            token_sums = (None, None, None)
+        reservation_rows = [row for row in rows if row[4] is not None]
+        reservation_state = (
+            "usage_unknown"
+            if any(row[4] == "usage_unknown" for row in reservation_rows)
+            else (reservation_rows[-1][4] if reservation_rows else None)
+        )
+        reserved_cost = (
+            sum(
+                (Decimal(row[5]) for row in reservation_rows), Decimal("0")
+            )
+            if reservation_rows
+            else None
+        )
+        last = rows[-1]
+        return (
+            len(rows), usage_known, *token_sums, reservation_state,
+            None if reserved_cost is None else _decimal_text(reserved_cost),
+            last[6], last[7], last[8], last[9],
+        )
 
     def provider_attempt_count(self, attempt_id: str) -> int:
         """Return the number of immutable physical calls under an execution."""
@@ -1704,39 +1806,25 @@ class ResearchStore:
             raise ValueError("failed execution requires a safe failure code")
         with self.transaction() as connection:
             execution = connection.execute(
-                "SELECT task_id, state, lease_token FROM agent_executions "
+                "SELECT task_id, task_instance_id, state, lease_token "
+                "FROM agent_executions "
                 "WHERE attempt_id = ?",
                 (attempt_id,),
             ).fetchone()
             if (
                 execution is None
-                or execution[1] != "running"
-                or execution[2] != lease_token
+                or execution[2] != "running"
+                or execution[3] != lease_token
             ):
                 raise AgentExecutionConflict(
                     "agent execution lease is not current"
                 )
-            aggregate = connection.execute(
-                "SELECT COUNT(*), "
-                "CASE WHEN COUNT(*) = 0 OR MIN(usage_known) = 1 THEN 1 ELSE 0 END, "
-                "SUM(input_tokens), SUM(output_tokens), SUM(reasoning_tokens) "
-                "FROM provider_attempts WHERE attempt_id = ?",
-                (attempt_id,),
-            ).fetchone()
-            attempt_count, usage_known, *token_sums = aggregate
-            if attempt_count == 0:
-                token_sums = [0, 0, 0]
-            elif not usage_known:
-                token_sums = [None, None, None]
-            last = connection.execute(
-                "SELECT provider, model, inference_mode, fallback_reason "
-                "FROM provider_attempts WHERE attempt_id = ? "
-                "ORDER BY ordinal DESC LIMIT 1",
-                (attempt_id,),
-            ).fetchone()
-            provider, model, inference_mode, fallback_reason = (
-                last if last is not None else (None, None, None, None)
-            )
+            aggregate = self._provider_attempt_aggregate(connection, attempt_id)
+            (
+                attempt_count, usage_known, input_tokens, output_tokens,
+                reasoning_tokens, reservation_state, reserved_cost_usd,
+                provider, model, inference_mode, fallback_reason,
+            ) = aggregate
             state = "succeeded" if succeeded else "failed"
             cursor = connection.execute(
                 "UPDATE agent_executions SET state = ?, completed_at = ?, "
@@ -1744,13 +1832,15 @@ class ResearchStore:
                 "provider = ?, model = ?, "
                 "inference_mode = ?, fallback_reason = ?, "
                 "provider_attempt_count = ?, input_tokens = ?, output_tokens = ?, "
-                "reasoning_tokens = ?, usage_known = ? "
+                "reasoning_tokens = ?, usage_known = ?, reservation_state = ?, "
+                "reserved_cost_usd = ? "
                 "WHERE attempt_id = ? AND state = 'running' AND lease_token = ?",
                 (
                     state, completed_text, failure_code, output_hash,
                     canonical_output if succeeded else None, provider, model,
-                    inference_mode, fallback_reason, attempt_count, *token_sums,
-                    usage_known, attempt_id, lease_token,
+                    inference_mode, fallback_reason, attempt_count, input_tokens,
+                    output_tokens, reasoning_tokens, usage_known,
+                    reservation_state, reserved_cost_usd, attempt_id, lease_token,
                 ),
             )
             if cursor.rowcount != 1:
@@ -1758,15 +1848,35 @@ class ResearchStore:
                     "agent execution lease could not terminalize"
                 )
             task_state = "completed" if succeeded else "failed"
+            instance = connection.execute(
+                "SELECT state, owns_research_task_state "
+                "FROM workflow_task_instances WHERE task_instance_id = ?",
+                (execution[1],),
+            ).fetchone()
+            if instance is None or instance[0] != "running":
+                raise AgentExecutionConflict(
+                    "workflow task instance state conflicts"
+                )
             cursor = connection.execute(
-                "UPDATE research_tasks SET state = ?, completed_at = ?, "
-                "error_text = ? WHERE task_id = ? AND state = 'running'",
-                (task_state, completed_text, failure_code, execution[0]),
+                "UPDATE workflow_task_instances SET state = ?, "
+                "completed_at = ?, safe_failure_code = ? "
+                "WHERE task_instance_id = ? AND state = 'running'",
+                (task_state, completed_text, failure_code, execution[1]),
             )
             if cursor.rowcount != 1:
                 raise AgentExecutionConflict(
-                    "research task terminal state conflicts"
+                    "workflow task instance terminal state conflicts"
                 )
+            if instance[1]:
+                cursor = connection.execute(
+                    "UPDATE research_tasks SET state = ?, completed_at = ?, "
+                    "error_text = ? WHERE task_id = ? AND state = 'running'",
+                    (task_state, completed_text, failure_code, execution[0]),
+                )
+                if cursor.rowcount != 1:
+                    raise AgentExecutionConflict(
+                        "research task terminal state conflicts"
+                    )
 
     def record_agent_run_audit(self, audit: AgentRunAudit) -> None:
         """Atomically retain hashes and usage, never prompt/evidence/output bodies."""
@@ -1835,6 +1945,10 @@ class ResearchStore:
             reasoning_tokens=row[15], fallback_reason=row[16],
             attempt_id=row[0], status=row[4], safe_failure_code=row[17],
             usage_known=bool(row[18]),
+            provider_attempt_count=row[19], reservation_state=row[20],
+            reserved_cost_usd=(
+                None if row[21] is None else Decimal(row[21])
+            ),
         )
 
     @staticmethod
@@ -1843,7 +1957,8 @@ class ResearchStore:
             "SELECT attempt_id, workflow_run_id, task_id, role, state, started_at, "
             "completed_at, provider, model, inference_mode, prompt_hash, "
             "evidence_hash, output_hash, input_tokens, output_tokens, "
-            "reasoning_tokens, fallback_reason, safe_failure_code, usage_known "
+            "reasoning_tokens, fallback_reason, safe_failure_code, usage_known, "
+            "provider_attempt_count, reservation_state, reserved_cost_usd "
             "FROM agent_executions "
         )
 
@@ -1914,13 +2029,24 @@ class ResearchStore:
                 + "WHERE attempt_id = ? AND state IN ('succeeded', 'failed')",
                 (run_id,),
             ).fetchone()
+            executions = connection.execute(
+                self._agent_execution_select()
+                + "WHERE workflow_run_id = ? "
+                "ORDER BY task_id, role, attempt_id",
+                (run_id,),
+            ).fetchall()
+            if execution is not None and (
+                len(executions) != 0
+                and not (
+                    len(executions) == 1
+                    and executions[0][0] == execution[0]
+                )
+            ):
+                raise AgentExecutionConflict(
+                    "agent audit lookup is ambiguous across attempt and workflow "
+                    "namespaces; use explicit getters"
+                )
             if execution is None:
-                executions = connection.execute(
-                    self._agent_execution_select()
-                    + "WHERE workflow_run_id = ? "
-                    "ORDER BY task_id, role, attempt_id",
-                    (run_id,),
-                ).fetchall()
                 if len(executions) > 1:
                     raise AgentExecutionConflict(
                         "workflow audit lookup is ambiguous; use explicit list APIs"
