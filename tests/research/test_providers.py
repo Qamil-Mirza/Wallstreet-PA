@@ -702,6 +702,42 @@ def test_router_trace_retains_reconciled_terminal_openai_usage(migrated_store):
     ) == (4, 3, 1)
 
 
+def test_missing_paid_usage_is_nonretryable_and_conservatively_traced(
+    migrated_store,
+):
+    client = FakeOpenAIClient(openai_result(input_tokens=None))
+    external, ledger = make_openai_provider(migrated_store, client)
+    local = StubProvider("ollama", [response("ollama")])
+    traces = []
+    router = ProviderRouter(
+        make_config(external=True), external, local
+    )
+
+    with pytest.raises(Exception) as raised:
+        router.generate(make_request(
+            policy=FallbackPolicy.ANY_FAILURE,
+            attempt_recorder=traces.append,
+        ))
+
+    assert type(raised.value).__name__ == "ProviderUsageUnavailable"
+    assert len(client.responses.calls) == 1
+    assert local.calls == []
+    assert ledger.month_total(2026, 8) == Decimal("0.000234")
+    with migrated_store.connect() as connection:
+        reservation = connection.execute(
+            "SELECT reservation_id, amount_usd, state FROM budget_reservations"
+        ).fetchone()
+    assert reservation[2] == "usage_unknown"
+    assert len(traces) == 1
+    assert traces[0].usage_known is False
+    assert traces[0].input_tokens is None
+    assert traces[0].output_tokens is None
+    assert traces[0].reasoning_tokens is None
+    assert traces[0].reservation_id == reservation[0]
+    assert traces[0].reservation_state == "usage_unknown"
+    assert traces[0].reserved_cost_usd == Decimal(reservation[1])
+
+
 def test_openai_refusal_is_nonretryable_redacted_and_usage_is_reconciled(
     migrated_store,
 ):
@@ -784,6 +820,34 @@ def test_openai_timeout_keeps_pessimistic_reservation_counted(migrated_store):
         provider.generate(make_request())
     assert "prompt secret" not in str(raised.value)
     assert ledger.month_total(2026, 8) == Decimal("0.000234")
+
+
+def test_router_trace_marks_indeterminate_openai_timeout_usage_unknown(
+    migrated_store,
+):
+    external, _ = make_openai_provider(
+        migrated_store, FakeOpenAIClient(TimeoutError("prompt secret"))
+    )
+    traces = []
+    router = ProviderRouter(
+        make_config(external=True), external,
+        StubProvider("ollama", [response("ollama")]),
+    )
+
+    routed = router.generate(make_request(
+        policy=FallbackPolicy.OUTAGES, attempt_recorder=traces.append
+    ))
+
+    assert routed.provider == "ollama"
+    assert len(traces) == 2
+    assert traces[0].usage_known is False
+    assert (
+        traces[0].input_tokens,
+        traces[0].output_tokens,
+        traces[0].reasoning_tokens,
+    ) == (None, None, None)
+    assert traces[0].reservation_state == "usage_unknown"
+    assert traces[0].reserved_cost_usd == Decimal("0.000234")
 
 
 def test_openai_reservation_covers_canonical_full_request_envelope(

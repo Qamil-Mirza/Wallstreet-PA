@@ -19,6 +19,7 @@ from .base import (
     ProviderAttemptTrace,
     ProviderRequestError,
     ProviderUnavailable,
+    ProviderUsageUnavailable,
     ProviderValidationError,
     TaskDeferred,
     _safe_text,
@@ -138,6 +139,8 @@ class ProviderRouter:
                 return self._generate_local(
                     request, "external_unavailable", attempt_budget
                 )
+            except ProviderUsageUnavailable:
+                raise
             except ProviderNonRetryableError:
                 if request.fallback_policy is not FallbackPolicy.ANY_FAILURE:
                     raise
@@ -216,6 +219,10 @@ class ProviderRouter:
                 inference_mode=inference_mode, fallback_reason=fallback_reason,
                 response_hash=getattr(error, "response_hash", None),
                 failure_code=provider_failure_code(error), recorded_at=self.clock(),
+                usage_known=getattr(error, "usage_known", True),
+                reservation_id=getattr(error, "reservation_id", None),
+                reservation_state=getattr(error, "reservation_state", None),
+                reserved_cost_usd=getattr(error, "reserved_cost_usd", None),
             ))
             raise
         self._record_attempt(request, ProviderAttemptTrace(

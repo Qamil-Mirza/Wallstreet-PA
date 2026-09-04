@@ -35,6 +35,7 @@ from .base import (
     ProviderRefusalError,
     ProviderTerminalUnavailable,
     ProviderUnavailable,
+    ProviderUsageUnavailable,
     ProviderValidationError,
     ReasoningEffort,
     ValidationIssue,
@@ -191,8 +192,30 @@ class OpenAIProvider:
                 provider_result
             )
         except ProviderValidationError:
-            self.budget.mark_usage_unknown(reservation.id, now=self.clock())
-            raise
+            unknown = self.budget.mark_usage_unknown(
+                reservation.id, now=self.clock()
+            )
+            error = ProviderUsageUnavailable(
+                "paid provider usage metadata is unavailable"
+            )
+            error.usage_known = False
+            error.input_tokens = None
+            error.output_tokens = None
+            error.reasoning_tokens = None
+            error.reservation_id = unknown.id
+            error.reservation_state = unknown.state
+            error.reserved_cost_usd = unknown.amount
+            raw_candidate = _response_field(
+                provider_result, "output_text", None
+            )
+            if isinstance(raw_candidate, str):
+                try:
+                    error.response_hash = hashlib.sha256(
+                        raw_candidate.encode("utf-8", errors="strict")
+                    ).hexdigest()
+                except UnicodeError:
+                    error.response_hash = None
+            raise error from None
 
         actual = self.prices.estimate(
             route.model,
@@ -278,16 +301,25 @@ class OpenAIProvider:
         if status == 429:
             self.budget.release(reservation_id, now=self.clock())
             raise ProviderRateLimitError("OpenAI rate limit reached") from None
-        if isinstance(exc, (TimeoutError, ConnectionError)) or status in {408, 409} or (
-            isinstance(status, int) and status >= 500
+        if (
+            isinstance(status, int)
+            and 400 <= status < 500
+            and status not in {408, 409}
         ):
-            self.budget.mark_usage_unknown(reservation_id, now=self.clock())
-            raise ProviderUnavailable("OpenAI request outcome is unavailable") from None
-        if isinstance(status, int) and 400 <= status < 500:
             self.budget.release(reservation_id, now=self.clock())
             raise ProviderNonRetryableError("OpenAI rejected the request") from None
-        self.budget.mark_usage_unknown(reservation_id, now=self.clock())
-        raise ProviderUnavailable("OpenAI request outcome is unavailable") from None
+        unknown = self.budget.mark_usage_unknown(
+            reservation_id, now=self.clock()
+        )
+        error = ProviderUnavailable("OpenAI request outcome is unavailable")
+        error.usage_known = False
+        error.input_tokens = None
+        error.output_tokens = None
+        error.reasoning_tokens = None
+        error.reservation_id = unknown.id
+        error.reservation_state = unknown.state
+        error.reserved_cost_usd = unknown.amount
+        raise error from None
 
 
 def _status_code(exc: Exception) -> int | None:

@@ -10,6 +10,7 @@ import unicodedata
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import datetime
+from decimal import Decimal
 from enum import Enum
 from types import MappingProxyType
 from typing import Any, Protocol, runtime_checkable
@@ -92,6 +93,10 @@ class ProviderNonRetryableError(ProviderError):
     """Raised for a redacted provider rejection that must not be retried."""
 
 
+class ProviderUsageUnavailable(ProviderNonRetryableError):
+    """A completed paid response whose exact usage cannot be accounted for."""
+
+
 class ProviderRefusalError(ProviderNonRetryableError):
     """Raised when a completed provider response contains a refusal."""
 
@@ -119,14 +124,18 @@ class ProviderAttemptTrace:
     provider: str
     model: str
     latency_ms: int
-    input_tokens: int
-    output_tokens: int
-    reasoning_tokens: int
+    input_tokens: int | None
+    output_tokens: int | None
+    reasoning_tokens: int | None
     inference_mode: InferenceMode
     recorded_at: datetime
     fallback_reason: str | None = None
     response_hash: str | None = None
     failure_code: str | None = None
+    usage_known: bool = True
+    reservation_id: str | None = None
+    reservation_state: str | None = None
+    reserved_cost_usd: Decimal | None = None
 
 
 class FallbackPolicy(str, Enum):
@@ -563,6 +572,7 @@ def provider_failure_code(error: Exception) -> str:
     if isinstance(error, ProviderTerminalUnavailable):
         return error.reason_code
     mapping = (
+        (ProviderUsageUnavailable, "provider_usage_unavailable"),
         (ProviderAuthenticationError, "provider_authentication"),
         (ProviderRateLimitError, "provider_rate_limit"),
         (ProviderValidationError, "provider_validation"),

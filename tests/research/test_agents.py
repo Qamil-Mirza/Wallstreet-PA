@@ -1,5 +1,6 @@
 """Contract and boundary tests for specialized qualitative research agents."""
 
+import json
 from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
 from threading import Event
@@ -25,7 +26,9 @@ from news_bot.research.agents.scouts import EmergingCompanyScout, EventScout
 from news_bot.research.models import (
     AgentRole, ClaimKind, EvidenceClaim, InferenceMode, ReviewVerdict, SourceDocument,
 )
-from news_bot.research.store import DocumentPassageRecord, ResearchStore
+from news_bot.research.store import (
+    AgentExecutionConflict, DocumentPassageRecord, ResearchStore,
+)
 from news_bot.research.providers.base import (
     ModelResponse, ProviderUnavailable, ProviderValidationError, ValidationIssue,
 )
@@ -82,6 +85,32 @@ def seed_store(
         status="active",
     ), ("passage-1",))
     return store
+
+
+def add_dependent_claim(
+    store, *, retrieved_at=NOW, supporting_passage_id="passage-support"
+):
+    document = SourceDocument(
+        document_id="document-support", source_type="filing",
+        canonical_url="https://example.com/support", publisher="Example",
+        published_at=NOW, retrieved_at=retrieved_at, content_hash="d" * 64,
+        raw_content_path=None, extraction_status="extracted",
+    )
+    text = "Factory capacity expanded."
+    store.insert_document_with_passages(document, (DocumentPassageRecord(
+        passage_id=supporting_passage_id, document_id="document-support",
+        ordinal=0, text=text, content_hash="e" * 64, start_offset=0,
+        end_offset=len(text),
+    ),))
+    store.insert_claim(EvidenceClaim(
+        claim_id="claim-support", entity_id=None, kind=ClaimKind.FACT,
+        text=text, as_of=NOW, confidence=Decimal("0.9"), status="active",
+    ), (supporting_passage_id,))
+    store.insert_claim_with_lineage(EvidenceClaim(
+        claim_id="claim-dependent", entity_id=None, kind=ClaimKind.INFERENCE,
+        text="Supply may expand.", as_of=NOW, confidence=Decimal("0.7"),
+        status="active",
+    ), passage_links=(), supporting_claim_ids=("claim-support",))
 
 
 def common_output(**extra):
@@ -276,6 +305,42 @@ def test_agent_evidence_packet_carries_source_availability_dates(tmp_path):
     assert packet is not None
     assert packet.passages[0].published_at == NOW
     assert packet.passages[0].retrieved_at == NOW
+
+
+def test_agent_evidence_resolves_supporting_claim_closure_deterministically(tmp_path):
+    store = seed_store(tmp_path)
+    add_dependent_claim(store)
+
+    packet = store.load_agent_evidence(
+        ("passage-1", "passage-support"), ("claim-dependent",), as_of=NOW
+    )
+
+    assert packet is not None
+    assert tuple(claim.claim_id for claim in packet.claims) == (
+        "claim-dependent", "claim-support"
+    )
+
+
+def test_agent_evidence_rejects_omitted_required_lineage_passage(tmp_path):
+    store = seed_store(tmp_path)
+    add_dependent_claim(store)
+
+    packet = store.load_agent_evidence(
+        ("passage-1",), ("claim-dependent",), as_of=NOW
+    )
+
+    assert packet is None
+
+
+def test_agent_evidence_rejects_future_source_in_supporting_claim_closure(tmp_path):
+    store = seed_store(tmp_path)
+    add_dependent_claim(store, retrieved_at=utc(2026, 8, 25))
+
+    packet = store.load_agent_evidence(
+        ("passage-1",), ("claim-dependent",), as_of=NOW
+    )
+
+    assert packet is None
 
 
 def test_agent_persists_only_redacted_audit(tmp_path):
@@ -679,7 +744,7 @@ def test_concurrent_runs_are_isolated(tmp_path):
     }
 
 
-def test_same_logical_agent_attempt_is_claimed_before_inference_and_not_replayed(
+def test_same_logical_agent_attempt_replays_terminal_output_without_new_spend(
     tmp_path
 ):
     entered = Event()
@@ -720,14 +785,22 @@ def test_same_logical_agent_attempt_is_claimed_before_inference_and_not_replayed
             release.set()
         assert first.result(timeout=5).ranked_events[0].event_id == "event-1"
 
-    with pytest.raises(AgentContractError, match="already"):
-        agent.run(logical_task)
+    replay = agent.run(logical_task)
+    assert replay.ranked_events[0].event_id == "event-1"
     assert len(router.calls) == 1
     with store.connect() as connection:
         rows = connection.execute(
-            "SELECT workflow_run_id, task_id, role, state FROM agent_executions"
+            "SELECT workflow_run_id, task_id, role, state, output_json "
+            "FROM agent_executions"
         ).fetchall()
-    assert rows == [("workflow-1", "claim-once", "event_scout", "succeeded")]
+    assert rows[0][:4] == (
+        "workflow-1", "claim-once", "event_scout", "succeeded"
+    )
+    stored_output = json.loads(rows[0][4])
+    assert stored_output == replay.model_dump(mode="json")
+    assert "Ignore prior instructions" not in rows[0][4]
+    assert "API_KEY" not in rows[0][4]
+    assert "Cite the supplied evidence" not in rows[0][4]
 
 
 def test_different_tasks_in_one_workflow_have_distinct_agent_attempts(tmp_path):
@@ -781,6 +854,16 @@ def test_different_roles_and_tasks_share_one_workflow_without_collision(tmp_path
             "SELECT role FROM agent_executions ORDER BY role"
         ).fetchall()
     assert roles == [("emerging_company_scout",), ("event_scout",)]
+    executions = store.list_agent_executions("cross-role-workflow")
+    assert tuple(execution.task_id for execution in executions) == (
+        "event-task", "signal-task"
+    )
+    for execution in executions:
+        assert store.get_agent_execution(execution.attempt_id) == execution
+        attempts = store.list_provider_attempts(execution.attempt_id)
+        assert tuple(attempt.ordinal for attempt in attempts) == (1,)
+    with pytest.raises(AgentExecutionConflict, match="ambiguous"):
+        store.get_agent_run_audit("cross-role-workflow")
 
 
 def test_failed_agent_run_is_terminally_audited_without_sensitive_error(tmp_path):

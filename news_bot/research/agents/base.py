@@ -9,7 +9,7 @@ from datetime import datetime
 from importlib import resources
 from typing import Generic, TypeVar
 
-from pydantic import BaseModel, ValidationError
+from pydantic import ValidationError
 
 from ..models import AgentRole, InferenceMode
 from ..providers.base import (
@@ -190,7 +190,7 @@ class BoundedAgent(Generic[InputT, OutputT]):
                 sort_keys=True,
                 separators=(",", ":"),
             )
-            attempt_id = self.store.claim_agent_execution(
+            execution_claim = self.store.claim_agent_execution(
                 workflow_run_id=validated_task.run_id,
                 task_id=validated_task.task_id,
                 role=self.role,
@@ -205,6 +205,8 @@ class BoundedAgent(Generic[InputT, OutputT]):
         except AgentExecutionConflict as error:
             raise AgentContractError(str(error)) from None
 
+        attempt_id = execution_claim.attempt_id
+        lease_token = execution_claim.lease_token
         provider_called = False
         try:
             self._preflight(validated_task.input)
@@ -217,8 +219,25 @@ class BoundedAgent(Generic[InputT, OutputT]):
                 raise EvidenceUnavailable("agent evidence is unavailable")
             self._validate_evidence_packet(validated_task.input, packet)
             request = self._request(validated_task, packet)
+            if execution_claim.replay_output_json is not None:
+                if request.evidence_hash != execution_claim.replay_evidence_hash:
+                    raise AgentContractError(
+                        "terminal agent replay evidence hash conflicts"
+                    )
+                try:
+                    output = self.output_type.model_validate_json(
+                        execution_claim.replay_output_json
+                    )
+                    self._validate_semantics(validated_task.input, output)
+                except (AgentContractError, ValidationError, ValueError):
+                    raise AgentContractError(
+                        "terminal agent replay failed current contract validation"
+                    ) from None
+                return output
+            if lease_token is None:
+                raise AgentContractError("agent execution lease is unavailable")
             self.store.set_agent_execution_evidence_hash(
-                attempt_id, request.evidence_hash
+                attempt_id, request.evidence_hash, lease_token=lease_token
             )
 
             def record_attempt(trace: ProviderAttemptTrace) -> None:
@@ -235,7 +254,12 @@ class BoundedAgent(Generic[InputT, OutputT]):
                         fallback_reason=trace.fallback_reason,
                         response_hash=trace.response_hash,
                         failure_code=trace.failure_code,
+                        usage_known=trace.usage_known,
+                        reservation_id=trace.reservation_id,
+                        reservation_state=trace.reservation_state,
+                        reserved_cost_usd=trace.reserved_cost_usd,
                     ),
+                    lease_token=lease_token,
                 )
 
             request = replace(
@@ -258,6 +282,7 @@ class BoundedAgent(Generic[InputT, OutputT]):
                         fallback_reason=response.fallback_reason,
                         response_hash=response.raw_response_hash,
                     ),
+                    lease_token=lease_token,
                 )
             try:
                 output = self._validate_response(validated_task.input, response)
@@ -271,13 +296,17 @@ class BoundedAgent(Generic[InputT, OutputT]):
                 sort_keys=True, separators=(",", ":"),
             )
             self.store.finalize_agent_execution(
-                attempt_id, succeeded=True, completed_at=completed_at,
+                attempt_id, lease_token=lease_token, succeeded=True,
+                completed_at=completed_at,
                 output_hash=hashlib.sha256(
                     canonical_output.encode("utf-8")
                 ).hexdigest(),
+                output_json=canonical_output,
             )
             return output
         except Exception as error:
+            if lease_token is None:
+                raise
             if provider_called and self.store.provider_attempt_count(attempt_id) == 0:
                 self.store.record_provider_attempt(
                     attempt_id,
@@ -293,9 +322,10 @@ class BoundedAgent(Generic[InputT, OutputT]):
                             else "provider_error"
                         ),
                     ),
+                    lease_token=lease_token,
                 )
             self.store.finalize_agent_execution(
-                attempt_id, succeeded=False,
+                attempt_id, lease_token=lease_token, succeeded=False,
                 completed_at=self._completed_at(started_at),
                 failure_code=self._failure_code(error),
             )
