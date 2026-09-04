@@ -22,7 +22,11 @@ from news_bot.research.quality import (
     PublicationVerdict,
     QualityGateInput,
     QualityGatePolicy,
+    QualityGate,
+    RecommendationGate,
+    SourceReference,
     evaluate_quality_gates,
+    price_is_fresh,
 )
 
 
@@ -49,6 +53,7 @@ def source(source_id: str = "sec-10q", **changes) -> EvidenceReference:
     values = {
         "evidence_id": f"passage-{source_id}",
         "canonical_source_id": source_id,
+        "source_family": source_id,
         "source_type": "sec_filing",
         "stored": True,
         "primary": True,
@@ -250,6 +255,14 @@ def test_holiday_price_and_unknown_exchange_fail_closed():
     assert GateReasonCode.PRICE_SESSION_UNKNOWN in unknown.reason_codes
 
 
+def test_exchange_close_time_must_be_naive_local_wall_time():
+    with pytest.raises(ValidationError, match="local wall time"):
+        ExchangeCalendar(
+            exchange="BAD", timezone_name="UTC",
+            close_time=time(16, tzinfo=UTC), holidays=(),
+        )
+
+
 def test_calendar_override_controls_latest_completed_session():
     calendar = ExchangeCalendar(
         exchange="X24", timezone_name="UTC", close_time=time(23, 59),
@@ -305,6 +318,16 @@ def test_search_snippets_are_inadmissible_even_when_stored():
     result = evaluate_quality_gates(request(claims=(claim(evidence=(snippet,)),)))
     assert GateReasonCode.SEARCH_SNIPPET_INADMISSIBLE in result.reason_codes
     assert GateReasonCode.MISSING_CLAIM_LINEAGE in result.reason_codes
+
+
+def test_mixed_search_snippet_blocks_its_affected_section():
+    result = evaluate_quality_gates(request(claims=(claim(evidence=(
+        source(),
+        source("search-1", source_type="search_snippet", primary=False),
+    )),)))
+    assert GateReasonCode.SEARCH_SNIPPET_INADMISSIBLE in result.reason_codes
+    assert result.allowed_sections == ()
+    assert result.effective_rating is RecommendationRating.NO_RATING
 
 
 def test_unstored_evidence_does_not_establish_lineage():
@@ -461,11 +484,51 @@ def test_event_window_defaults_to_seven_days_and_supports_source_override():
     assert evaluate_quality_gates(old, policy=policy).allow_event_report is True
 
 
+@pytest.mark.parametrize(
+    "source_type,published_at",
+    [(None, None), ("sec_filing", None), (None, AS_OF - timedelta(days=1))],
+)
+def test_event_report_missing_or_partial_freshness_fails_closed(
+    source_type, published_at
+):
+    result = evaluate_quality_gates(request(
+        publication_kind=PublicationKind.EVENT_REPORT,
+        requested_rating=RecommendationRating.NO_RATING,
+        event_source_type=source_type,
+        event_published_at=published_at,
+    ))
+    assert result.publication_verdict is PublicationVerdict.DRAFT
+    assert result.allow_event_report is False
+    assert GateReasonCode.EVENT_FRESHNESS_UNKNOWN in result.reason_codes
+
+
+def test_future_event_timestamp_is_rejected_and_window_boundary_is_exact():
+    with pytest.raises(ValidationError, match="UTC|as_of"):
+        request(
+            publication_kind=PublicationKind.EVENT_REPORT,
+            event_source_type="news",
+            event_published_at=AS_OF + timedelta(microseconds=1),
+        )
+    exact = request(
+        publication_kind=PublicationKind.EVENT_REPORT,
+        requested_rating=RecommendationRating.NO_RATING,
+        event_source_type="news",
+        event_published_at=AS_OF - timedelta(days=7),
+    )
+    expired = exact.model_copy(update={
+        "event_published_at": AS_OF - timedelta(days=7, microseconds=1)
+    })
+    assert evaluate_quality_gates(exact).allow_event_report is True
+    assert evaluate_quality_gates(expired).allow_event_report is False
+
+
 def test_event_report_with_stale_portfolio_can_still_be_final():
     result = evaluate_quality_gates(request(
         publication_kind=PublicationKind.EVENT_REPORT,
         requested_rating=RecommendationRating.NO_RATING,
         portfolio_snapshot_at=AS_OF - timedelta(hours=40),
+        event_source_type="news",
+        event_published_at=AS_OF - timedelta(days=1),
     ))
     assert result.allow_event_report is True
     assert result.allow_sizing is False
@@ -477,14 +540,16 @@ def test_event_report_with_bad_event_lineage_is_not_allowed():
         publication_kind=PublicationKind.EVENT_REPORT,
         requested_rating=RecommendationRating.NO_RATING,
         claims=(claim(section="event", evidence=()),),
+        event_source_type="news",
+        event_published_at=AS_OF - timedelta(days=1),
     ))
     assert result.allow_event_report is False
     assert result.publication_verdict is PublicationVerdict.DRAFT
 
 
 def test_deterministic_failures_override_model_rating_and_order_is_stable():
-    bad_claim_1 = claim("z", section="z-section", evidence=())
-    bad_claim_2 = claim("a", section="a-section", evidence=())
+    bad_claim_1 = claim("z", section="recommendation", evidence=())
+    bad_claim_2 = claim("a", section="recommendation", evidence=())
     left = evaluate_quality_gates(request(
         claims=(bad_claim_1, bad_claim_2),
         reviewer_approved_claim_ids=("a", "z"), editor_claim_ids=("a", "z"),
@@ -498,6 +563,207 @@ def test_deterministic_failures_override_model_rating_and_order_is_stable():
     assert reason_values(left) == reason_values(right)
     assert left.allowed_sections == right.allowed_sections == ()
     assert left.effective_rating is right.effective_rating is RecommendationRating.NO_RATING
+
+
+@pytest.mark.parametrize(
+    "rating",
+    [RecommendationRating.BUY, RecommendationRating.HOLD,
+     RecommendationRating.SELL_REDUCE],
+)
+def test_claimless_rated_recommendation_is_draft_no_rating(rating):
+    result = evaluate_quality_gates(request(
+        requested_rating=rating, claims=(),
+        reviewer_approved_claim_ids=(), editor_claim_ids=(),
+    ))
+    assert GateReasonCode.RESEARCH_CLAIMS_MISSING in result.reason_codes
+    assert result.publication_verdict is PublicationVerdict.DRAFT
+    assert result.effective_rating is RecommendationRating.NO_RATING
+    assert result.allow_sizing is False
+
+
+def test_claimless_no_rating_research_is_retained_as_draft():
+    result = evaluate_quality_gates(request(
+        requested_rating=RecommendationRating.NO_RATING, claims=(),
+        reviewer_approved_claim_ids=(), editor_claim_ids=(),
+    ))
+    assert result.publication_verdict is PublicationVerdict.DRAFT
+    assert GateReasonCode.RESEARCH_CLAIMS_MISSING in result.reason_codes
+
+
+def test_matching_fabricated_reviewer_and_editor_claim_ids_fail_closed():
+    result = evaluate_quality_gates(request(
+        reviewer_approved_claim_ids=("claim-1", "ghost"),
+        editor_claim_ids=("claim-1", "ghost"),
+    ))
+    assert GateReasonCode.APPROVED_CLAIM_UNKNOWN in result.reason_codes
+    assert GateReasonCode.EDITOR_CLAIM_UNKNOWN in result.reason_codes
+    assert result.publication_verdict is PublicationVerdict.DRAFT
+    assert result.effective_rating is RecommendationRating.NO_RATING
+
+
+@pytest.mark.parametrize("offset", [timedelta(hours=-5), timedelta(minutes=17)])
+def test_all_quality_datetimes_require_exact_utc(offset):
+    hostile = timezone(offset)
+    with pytest.raises(ValidationError, match="datetime must be UTC"):
+        request(as_of=AS_OF.astimezone(hostile))
+    with pytest.raises(ValidationError, match="datetime must be UTC"):
+        request(portfolio_snapshot_at=(AS_OF - timedelta(hours=1)).astimezone(hostile))
+    with pytest.raises(ValidationError, match="datetime must be UTC"):
+        MarketPrice(
+            exchange="NASDAQ", session_date=date(2026, 8, 24),
+            observed_at=AS_OF.astimezone(hostile), value=Decimal("1"), currency="USD",
+        )
+    with pytest.raises(ValidationError, match="datetime must be UTC"):
+        FilingAvailability(
+            filing_due=True, available_as_of=True,
+            filed_at=(AS_OF - timedelta(days=1)).astimezone(hostile),
+        )
+    with pytest.raises(ValidationError, match="datetime must be UTC"):
+        request(
+            event_source_type="news",
+            event_published_at=(AS_OF - timedelta(days=1)).astimezone(hostile),
+        )
+
+
+def test_source_identifiers_are_nfc_normalized_and_family_defines_independence():
+    composed = "caf\N{LATIN SMALL LETTER E WITH ACUTE}"
+    decomposed = "cafe\N{COMBINING ACUTE ACCENT}"
+    first = source("doc-1", primary=False, source_type="news", source_family=composed)
+    second_same_origin = source(
+        "doc-2", primary=False, source_type="NEWS", source_family=decomposed.upper()
+    )
+    same = evaluate_quality_gates(request(
+        claims=(claim(evidence=(first, second_same_origin)),),
+    ))
+    distinct = evaluate_quality_gates(request(claims=(claim(evidence=(
+        first,
+        source("doc-3", primary=False, source_type="news", source_family="wire-2"),
+    )),)))
+    assert first.source_family == second_same_origin.source_family
+    assert second_same_origin.source_type == "news"
+    assert EvidenceReference(
+        evidence_id="evidence",
+        canonical_source_id=decomposed,
+        source_family="family",
+        source_type="news",
+        stored=True,
+        primary=False,
+    ).canonical_source_id == composed
+    assert GateReasonCode.INSUFFICIENT_CORROBORATION in same.reason_codes
+    assert GateReasonCode.INSUFFICIENT_CORROBORATION not in distinct.reason_codes
+    assert SourceReference is EvidenceReference
+
+
+def test_primary_source_is_sufficient_regardless_of_family_count():
+    result = evaluate_quality_gates(request(claims=(claim(evidence=(source(
+        "primary", primary=True, source_family="issuer"
+    ),)),)))
+    assert GateReasonCode.INSUFFICIENT_CORROBORATION not in result.reason_codes
+
+
+def test_unsupported_industry_claim_isolated_from_valid_recommendation():
+    unsupported = claim("claim-industry", section="industry", evidence=())
+    result = evaluate_quality_gates(request(
+        claims=(claim(), unsupported),
+        reviewer_approved_claim_ids=("claim-1", "claim-industry"),
+        editor_claim_ids=("claim-1",),
+    ))
+    assert result.allowed_sections == ("recommendation",)
+    assert result.publication_verdict is PublicationVerdict.FINAL
+    assert result.effective_rating is RecommendationRating.BUY
+    assert result.allow_sizing is True
+
+
+def test_industry_contradiction_isolated_from_valid_recommendation():
+    industry = claim("claim-industry", section="industry")
+    result = evaluate_quality_gates(request(
+        claims=(claim(), industry),
+        contradictory_claim_ids=("claim-industry",),
+        reviewer_approved_claim_ids=("claim-1", "claim-industry"),
+        editor_claim_ids=("claim-1",),
+    ))
+    assert result.allowed_sections == ("recommendation",)
+    assert result.publication_verdict is PublicationVerdict.FINAL
+    assert result.effective_rating is RecommendationRating.BUY
+
+
+def test_zero_admissible_claims_cannot_support_a_rating():
+    empty = claim(material=False, quantitative=False, consequential=False, evidence=())
+    result = evaluate_quality_gates(request(claims=(empty,)))
+    assert GateReasonCode.RESEARCH_CLAIMS_MISSING in result.reason_codes
+    assert result.publication_verdict is PublicationVerdict.DRAFT
+    assert result.effective_rating is RecommendationRating.NO_RATING
+
+
+def test_mismatched_calculated_exhibit_blocks_final_release():
+    exhibit = CalculatedExhibit(
+        exhibit_id="valuation",
+        normalized_rows=(CalculatedRow(row_id="x", values={"v": Decimal("1")}),),
+        rendered_rows=(CalculatedRow(row_id="x", values={"v": Decimal("2")}),),
+    )
+    result = evaluate_quality_gates(request(exhibits=(exhibit,)))
+    assert GateReasonCode.EXHIBIT_MISMATCH in result.reason_codes
+    assert result.publication_verdict is PublicationVerdict.DRAFT
+    assert result.effective_rating is RecommendationRating.NO_RATING
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [PublicationKind.FOUNDATIONAL_REPORT, PublicationKind.PORTFOLIO_BRIEF],
+)
+def test_foundational_and_portfolio_artifacts_require_all_sections(kind):
+    unsupported = claim("claim-industry", section="industry", evidence=())
+    result = evaluate_quality_gates(request(
+        publication_kind=kind,
+        claims=(claim(), unsupported),
+        reviewer_approved_claim_ids=("claim-1", "claim-industry"),
+        editor_claim_ids=("claim-1",),
+    ))
+    assert result.publication_verdict is PublicationVerdict.DRAFT
+    assert result.allowed_sections == ("recommendation",)
+
+
+def test_event_report_can_publish_supported_event_section_without_bad_industry():
+    event_claim = claim("claim-event", section="event")
+    unsupported = claim("claim-industry", section="industry", evidence=())
+    result = evaluate_quality_gates(request(
+        publication_kind=PublicationKind.EVENT_REPORT,
+        requested_rating=RecommendationRating.NO_RATING,
+        claims=(event_claim, unsupported),
+        reviewer_approved_claim_ids=("claim-event", "claim-industry"),
+        editor_claim_ids=("claim-event",),
+        event_source_type="news",
+        event_published_at=AS_OF - timedelta(days=1),
+    ))
+    assert result.allowed_sections == ("event",)
+    assert result.allow_event_report is True
+    assert result.publication_verdict is PublicationVerdict.FINAL
+
+
+def test_documented_gate_wrappers_delegate_to_one_engine():
+    context = request()
+    direct = evaluate_quality_gates(context)
+    assert QualityGate().evaluate(context) == direct
+    recommendation = RecommendationGate().evaluate(context)
+    assert recommendation == direct
+    assert recommendation.rating is RecommendationRating.BUY
+
+
+def test_price_is_fresh_public_api_supports_default_and_override_calendars():
+    assert price_is_fresh(
+        date(2026, 8, 21), date(2026, 8, 24), exchange="NASDAQ"
+    ) is True
+    assert price_is_fresh(
+        date(2026, 8, 23), date(2026, 8, 24), exchange="NASDAQ"
+    ) is False
+    override = ExchangeCalendar(
+        exchange="ALWAYS", timezone_name="UTC", close_time=time(0),
+        weekend_days=(), holidays=(),
+    )
+    assert price_is_fresh(
+        date(2026, 8, 23), date(2026, 8, 24),
+        exchange="ALWAYS", calendar=override,
+    ) is True
 
 
 @pytest.mark.parametrize(

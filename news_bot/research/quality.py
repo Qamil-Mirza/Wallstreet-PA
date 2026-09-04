@@ -7,6 +7,7 @@ from decimal import Decimal
 from enum import Enum
 from types import MappingProxyType
 from typing import Mapping
+import unicodedata
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -54,24 +55,39 @@ class GateReasonCode(str, Enum):
     INFERENCE_DISCLOSURE_MISSING = "inference_disclosure_missing"
     LOCAL_CONFIDENCE_WEAK = "local_confidence_weak"
     EVENT_OUTSIDE_MATERIALITY_WINDOW = "event_outside_materiality_window"
+    EVENT_FRESHNESS_UNKNOWN = "event_freshness_unknown"
+    RESEARCH_CLAIMS_MISSING = "research_claims_missing"
+    APPROVED_CLAIM_UNKNOWN = "approved_claim_unknown"
+    EDITOR_CLAIM_UNKNOWN = "editor_claim_unknown"
 
 
 def _aware(value: datetime) -> datetime:
-    if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
-        raise ValueError("datetime must be timezone-aware")
+    if (
+        not isinstance(value, datetime)
+        or value.tzinfo is None
+        or value.utcoffset() != timedelta(0)
+    ):
+        raise ValueError("datetime must be UTC")
     return value
 
 
 def _identifier(value: str) -> str:
-    if not isinstance(value, str) or not value.strip() or any(char.isspace() for char in value):
+    if not isinstance(value, str):
         raise ValueError("identifier must be nonblank and contain no whitespace")
-    return value
+    normalized = unicodedata.normalize("NFC", value)
+    if not normalized.strip() or any(char.isspace() for char in normalized):
+        raise ValueError("identifier must be nonblank and contain no whitespace")
+    return normalized
 
 
 def _text(value: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError("text must be nonblank")
     return value.strip()
+
+
+def _source_category(value: str) -> str:
+    return _identifier(value).casefold()
 
 
 def _sorted_unique(values: tuple[str, ...]) -> tuple[str, ...]:
@@ -94,17 +110,22 @@ class EvidenceReference(FrozenQualityContract):
 
     evidence_id: str
     canonical_source_id: str
+    source_family: str
     source_type: str
     stored: bool
     primary: bool
 
     _evidence_id = field_validator("evidence_id")(_identifier)
     _source_id = field_validator("canonical_source_id")(_identifier)
-    _source_type = field_validator("source_type")(_identifier)
+    _source_family = field_validator("source_family")(_source_category)
+    _source_type = field_validator("source_type")(_source_category)
 
     @property
     def admissible(self) -> bool:
         return self.stored and self.source_type != "search_snippet"
+
+
+SourceReference = EvidenceReference
 
 
 class ClaimQualityInput(FrozenQualityContract):
@@ -265,6 +286,13 @@ class ExchangeCalendar(FrozenQualityContract):
     _exchange = field_validator("exchange")(_identifier)
     _timezone = field_validator("timezone_name")(_identifier)
 
+    @field_validator("close_time")
+    @classmethod
+    def _local_close_time(cls, value: time) -> time:
+        if value.tzinfo is not None and value.utcoffset() is not None:
+            raise ValueError("exchange close must be a naive local wall time")
+        return value
+
     @field_validator("weekend_days")
     @classmethod
     def _weekends(cls, values: tuple[int, ...]) -> tuple[int, ...]:
@@ -411,8 +439,6 @@ class QualityGateInput(FrozenQualityContract):
         ):
             if value is not None and value > self.as_of:
                 raise ValueError(f"{field_name} cannot be after as_of")
-        if (self.event_source_type is None) != (self.event_published_at is None):
-            raise ValueError("event source type and publication time must be supplied together")
         claim_ids = {claim.claim_id for claim in self.claims}
         if not set(self.contradictory_claim_ids) <= claim_ids:
             raise ValueError("contradictory claims must be included in claims")
@@ -434,6 +460,75 @@ class QualityGateResult(FrozenQualityContract):
     inference_provider: str | None
     inference_model: str | None
 
+    @property
+    def rating(self) -> RecommendationRating:
+        """Compatibility name used by recommendation orchestration."""
+        return self.effective_rating
+
+
+class QualityGate:
+    """Reusable facade over the single deterministic quality evaluator."""
+
+    __slots__ = ("_calendars", "_policy")
+
+    def __init__(
+        self,
+        *,
+        policy: QualityGatePolicy | None = None,
+        calendars: Mapping[str, ExchangeCalendar] | None = None,
+    ) -> None:
+        self._policy = QualityGatePolicy.model_validate(policy or QualityGatePolicy())
+        self._calendars = (
+            None if calendars is None else MappingProxyType(dict(calendars))
+        )
+
+    def evaluate(self, context: QualityGateInput) -> QualityGateResult:
+        return evaluate_quality_gates(
+            context, policy=self._policy, calendars=self._calendars
+        )
+
+
+class RecommendationGate(QualityGate):
+    """Recommendation-facing facade whose result exposes ``rating``."""
+
+
+def price_is_fresh(
+    price_date: date,
+    as_of_date: date,
+    *,
+    exchange: str = "NASDAQ",
+    calendar: ExchangeCalendar | None = None,
+) -> bool:
+    """Check a dated close against the latest prior session and four-day limit."""
+    if (
+        not isinstance(price_date, date)
+        or isinstance(price_date, datetime)
+        or not isinstance(as_of_date, date)
+        or isinstance(as_of_date, datetime)
+    ):
+        raise TypeError("price_date and as_of_date must be dates")
+    exchange_id = _identifier(exchange)
+    supplied = DEFAULT_EXCHANGE_CALENDARS.get(exchange_id) if calendar is None else calendar
+    try:
+        schedule = (
+            None if supplied is None else ExchangeCalendar.model_validate(supplied)
+        )
+    except (TypeError, ValueError):
+        return False
+    if schedule is None or schedule.exchange != exchange_id:
+        return False
+    if not schedule.is_session(price_date):
+        return False
+    age = (as_of_date - price_date).days
+    if age < 0 or age > 4:
+        return False
+    candidate = as_of_date - timedelta(days=1)
+    for _ in range(15):
+        if schedule.is_session(candidate):
+            return candidate == price_date
+        candidate -= timedelta(days=1)
+    return False
+
 
 def _canonical_rows(exhibit: CalculatedExhibit) -> bool:
     return exhibit.reconciles
@@ -453,6 +548,7 @@ def evaluate_quality_gates(
     blocked_sections: set[str] = set()
     rating_blocked = False
     allow_sizing = True
+    global_release_failure = False
 
     portfolio_age: Decimal | None = None
     if data.portfolio_snapshot_at is None:
@@ -537,10 +633,22 @@ def evaluate_quality_gates(
         rating_blocked = True
 
     hard_content_failure = False
+    has_admissible_research_claim = any(
+        reference.admissible
+        for item in data.claims
+        for reference in item.evidence
+    )
+    if not has_admissible_research_claim:
+        reasons.add(GateReasonCode.RESEARCH_CLAIMS_MISSING)
+        hard_content_failure = True
+        global_release_failure = True
+        rating_blocked = True
     for item in data.claims:
         admissible = tuple(reference for reference in item.evidence if reference.admissible)
         if any(reference.source_type == "search_snippet" for reference in item.evidence):
             reasons.add(GateReasonCode.SEARCH_SNIPPET_INADMISSIBLE)
+            blocked_sections.add(item.section)
+            hard_content_failure = True
         if (item.material or item.quantitative) and not admissible:
             reasons.add(GateReasonCode.MISSING_CLAIM_LINEAGE)
             blocked_sections.add(item.section)
@@ -548,9 +656,9 @@ def evaluate_quality_gates(
             if item.section == "recommendation":
                 rating_blocked = True
         if item.consequential:
-            canonical = {reference.canonical_source_id for reference in admissible}
+            origins = {reference.source_family for reference in admissible}
             has_primary = any(reference.primary for reference in admissible)
-            if not has_primary and len(canonical) < 2:
+            if not has_primary and len(origins) < 2:
                 reasons.add(GateReasonCode.INSUFFICIENT_CORROBORATION)
                 blocked_sections.add(item.section)
                 hard_content_failure = True
@@ -574,11 +682,28 @@ def evaluate_quality_gates(
     if requires_pass and data.reviewer_verdict is not ReviewVerdict.PASS:
         reasons.add(GateReasonCode.REVIEWER_NOT_PASSED)
         rating_blocked = True
+        global_release_failure = True
         blocked_sections.update(item.section for item in data.claims)
 
+    actual_claim_ids = set(claim_sections)
+    unknown_approved = set(data.reviewer_approved_claim_ids) - actual_claim_ids
+    unknown_editor = set(data.editor_claim_ids) - actual_claim_ids
+    if unknown_approved:
+        reasons.add(GateReasonCode.APPROVED_CLAIM_UNKNOWN)
+        hard_content_failure = True
+        global_release_failure = True
+        rating_blocked = True
+        blocked_sections.update(item.section for item in data.claims)
+    if unknown_editor:
+        reasons.add(GateReasonCode.EDITOR_CLAIM_UNKNOWN)
+        hard_content_failure = True
+        global_release_failure = True
+        rating_blocked = True
+        blocked_sections.update(item.section for item in data.claims)
     if not set(data.editor_claim_ids) <= set(data.reviewer_approved_claim_ids):
         reasons.add(GateReasonCode.EDITOR_UNAPPROVED_CLAIM)
         hard_content_failure = True
+        global_release_failure = True
         rating_blocked = True
 
     for exhibit in data.exhibits:
@@ -586,19 +711,28 @@ def evaluate_quality_gates(
             reasons.add(GateReasonCode.EXHIBIT_MISMATCH)
             blocked_sections.add(exhibit.section)
             hard_content_failure = True
+            global_release_failure = True
+            rating_blocked = True
 
     if data.inference_disclosure is None:
         reasons.add(GateReasonCode.INFERENCE_DISCLOSURE_MISSING)
         rating_blocked = True
+        global_release_failure = True
     elif (
         data.inference_disclosure.mode is InferenceMode.LOCAL_ONLY
         and data.inference_disclosure.confidence < rules.local_min_confidence
     ):
         reasons.add(GateReasonCode.LOCAL_CONFIDENCE_WEAK)
         rating_blocked = True
+        global_release_failure = True
 
     event_in_window = True
-    if data.event_published_at is not None and data.event_source_type is not None:
+    if data.publication_kind is PublicationKind.EVENT_REPORT and (
+        data.event_published_at is None or data.event_source_type is None
+    ):
+        reasons.add(GateReasonCode.EVENT_FRESHNESS_UNKNOWN)
+        event_in_window = False
+    elif data.event_published_at is not None and data.event_source_type is not None:
         window = rules.event_window_days_by_source.get(
             data.event_source_type, rules.event_window_days
         )
@@ -608,7 +742,12 @@ def evaluate_quality_gates(
 
     allowed_sections = tuple(sorted({item.section for item in data.claims} - blocked_sections))
     effective_review = ReviewVerdict.BLOCK if hard_content_failure else data.reviewer_verdict
-    if hard_content_failure:
+    content_blocks_rating = "recommendation" in blocked_sections
+    all_sections_critical = data.publication_kind in {
+        PublicationKind.FOUNDATIONAL_REPORT,
+        PublicationKind.PORTFOLIO_BRIEF,
+    }
+    if content_blocks_rating or (all_sections_critical and blocked_sections):
         rating_blocked = True
     effective_rating = (
         RecommendationRating.NO_RATING if rating_blocked
@@ -619,7 +758,8 @@ def evaluate_quality_gates(
     )
     event_release_blocked = (
         not event_in_window
-        or hard_content_failure
+        or global_release_failure
+        or "event" in blocked_sections
         or data.reviewer_verdict is not ReviewVerdict.PASS
         or GateReasonCode.EDITOR_UNAPPROVED_CLAIM in reasons
         or GateReasonCode.INFERENCE_DISCLOSURE_MISSING in reasons
@@ -630,8 +770,12 @@ def evaluate_quality_gates(
     )
     if data.publication_kind is PublicationKind.EVENT_REPORT:
         publication_blocked = event_release_blocked
+    elif data.publication_kind is PublicationKind.RECOMMENDATION:
+        publication_blocked = global_release_failure or content_blocks_rating or rating_blocked
+    elif all_sections_critical:
+        publication_blocked = global_release_failure or bool(blocked_sections) or rating_blocked
     else:
-        publication_blocked = bool(reasons)
+        publication_blocked = global_release_failure or bool(blocked_sections)
     publication_verdict = (
         PublicationVerdict.DRAFT if publication_blocked else PublicationVerdict.FINAL
     )
@@ -655,6 +799,7 @@ __all__ = [
     "CalculatedExhibit", "CalculatedRow", "ClaimQualityInput",
     "DEFAULT_EXCHANGE_CALENDARS", "EvidenceReference", "ExchangeCalendar",
     "FilingAvailability", "GateReasonCode", "InferenceDisclosure", "MarketPrice",
-    "PublicationKind", "PublicationVerdict", "QualityGateInput",
-    "QualityGatePolicy", "QualityGateResult", "evaluate_quality_gates",
+    "PublicationKind", "PublicationVerdict", "QualityGate", "QualityGateInput",
+    "QualityGatePolicy", "QualityGateResult", "RecommendationGate",
+    "SourceReference", "evaluate_quality_gates", "price_is_fresh",
 ]
