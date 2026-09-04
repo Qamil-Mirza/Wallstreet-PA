@@ -453,6 +453,9 @@ class ModelResponse:
     inference_mode: InferenceMode
     run_id: str
     fallback_reason: str | None = None
+    reservation_id: str | None = None
+    reservation_state: str | None = None
+    reserved_cost_usd: Decimal | None = None
     _data_schema: type[BaseModel] = field(repr=False)
     _canonical_data: str = field(repr=False)
 
@@ -469,6 +472,9 @@ class ModelResponse:
         inference_mode: InferenceMode,
         run_id: str,
         fallback_reason: str | None = None,
+        reservation_id: str | None = None,
+        reservation_state: str | None = None,
+        reserved_cost_usd: Decimal | None = None,
     ) -> None:
         if not isinstance(data, BaseModel):
             raise TypeError("data must be a validated Pydantic model")
@@ -525,6 +531,30 @@ class ModelResponse:
                 error_type=ProviderRequestError,
             )
         object.__setattr__(self, "fallback_reason", fallback_reason)
+        reservation = (reservation_id, reservation_state, reserved_cost_usd)
+        if any(value is not None for value in reservation):
+            if any(value is None for value in reservation):
+                raise ProviderRequestError(
+                    "reservation metadata must be complete"
+                )
+            reservation_id = _safe_text(
+                "reservation_id", reservation_id, allow_multiline=False,
+                nonblank=True, error_type=ProviderRequestError,
+            )
+            if reservation_state not in {
+                "reserved", "usage_unknown", "reconciled", "released",
+                "consumed", "expired",
+            }:
+                raise ProviderRequestError("reservation state is invalid")
+            if (
+                not isinstance(reserved_cost_usd, Decimal)
+                or not reserved_cost_usd.is_finite()
+                or reserved_cost_usd < 0
+            ):
+                raise ProviderRequestError("reserved cost is invalid")
+        object.__setattr__(self, "reservation_id", reservation_id)
+        object.__setattr__(self, "reservation_state", reservation_state)
+        object.__setattr__(self, "reserved_cost_usd", reserved_cost_usd)
 
     @property
     def data(self) -> BaseModel:
@@ -556,6 +586,9 @@ class ModelResponse:
             inference_mode=inference_mode,
             run_id=run_id,
             fallback_reason=fallback_reason,
+            reservation_id=self.reservation_id,
+            reservation_state=self.reservation_state,
+            reserved_cost_usd=self.reserved_cost_usd,
         )
 
 

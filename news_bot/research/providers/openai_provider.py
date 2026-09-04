@@ -223,7 +223,9 @@ class OpenAIProvider:
             output_tokens,
             as_of=self.clock().date(),
         )
-        self.budget.reconcile(reservation.id, actual, now=self.clock())
+        reconciled = self.budget.reconcile(
+            reservation.id, actual, now=self.clock()
+        )
         try:
             response_hash = None
             raw_candidate = _response_field(provider_result, "output_text", None)
@@ -264,6 +266,7 @@ class OpenAIProvider:
             error.output_tokens = output_tokens
             error.reasoning_tokens = reasoning_tokens
             error.response_hash = locals().get("response_hash")
+            _attach_reservation(error, reconciled)
             raise
         return ModelResponse(
             data=parsed,
@@ -276,6 +279,9 @@ class OpenAIProvider:
             provider=self.name,
             inference_mode=InferenceMode.EXTERNAL,
             run_id=request.run_id,
+            reservation_id=reconciled.id,
+            reservation_state=reconciled.state,
+            reserved_cost_usd=reconciled.amount,
         )
 
     def _get_client(self) -> Any:
@@ -296,22 +302,30 @@ class OpenAIProvider:
     def _handle_call_failure(self, reservation_id: str, exc: Exception) -> None:
         status = _status_code(exc)
         if status in {401, 403}:
-            self.budget.release(reservation_id, now=self.clock())
-            raise ProviderAuthenticationError("OpenAI authentication failed") from None
+            released = self.budget.release(reservation_id, now=self.clock())
+            error = ProviderAuthenticationError("OpenAI authentication failed")
+            _attach_reservation(error, released)
+            raise error from None
         if status == 429:
-            self.budget.release(reservation_id, now=self.clock())
-            raise ProviderRateLimitError("OpenAI rate limit reached") from None
+            released = self.budget.release(reservation_id, now=self.clock())
+            error = ProviderRateLimitError("OpenAI rate limit reached")
+            _attach_reservation(error, released)
+            raise error from None
         if (
             isinstance(status, int)
             and 400 <= status < 500
             and status not in {408, 409}
         ):
-            self.budget.release(reservation_id, now=self.clock())
-            raise ProviderNonRetryableError("OpenAI rejected the request") from None
+            released = self.budget.release(reservation_id, now=self.clock())
+            error = ProviderNonRetryableError("OpenAI rejected the request")
+            _attach_reservation(error, released)
+            raise error from None
         unknown = self.budget.mark_usage_unknown(
             reservation_id, now=self.clock()
         )
-        error = ProviderUnavailable("OpenAI request outcome is unavailable")
+        error = ProviderUsageUnavailable(
+            "OpenAI request outcome and paid usage are unavailable"
+        )
         error.usage_known = False
         error.input_tokens = None
         error.output_tokens = None
@@ -320,6 +334,13 @@ class OpenAIProvider:
         error.reservation_state = unknown.state
         error.reserved_cost_usd = unknown.amount
         raise error from None
+
+
+def _attach_reservation(error: ProviderError, reservation: Any) -> None:
+    """Attach only typed budget metadata to an already-redacted failure."""
+    error.reservation_id = reservation.id
+    error.reservation_state = reservation.state
+    error.reserved_cost_usd = reservation.amount
 
 
 def _status_code(exc: Exception) -> int | None:

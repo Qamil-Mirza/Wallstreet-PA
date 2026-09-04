@@ -233,6 +233,9 @@ class ProviderRouter:
             inference_mode=inference_mode, fallback_reason=fallback_reason,
             response_hash=response.raw_response_hash, failure_code=None,
             recorded_at=self.clock(),
+            reservation_id=response.reservation_id,
+            reservation_state=response.reservation_state,
+            reserved_cost_usd=response.reserved_cost_usd,
         ))
         return response
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import replace
 from datetime import datetime
 from importlib import resources
@@ -40,6 +41,45 @@ from .contracts import (
 
 InputT = TypeVar("InputT", bound=EvidenceInput)
 OutputT = TypeVar("OutputT", bound=AnalyticalOutput)
+
+_IBKR_ACCOUNT_ID = re.compile(
+    r"(?<![A-Za-z0-9])(?:DU|U)[0-9]{6,}(?![A-Za-z0-9])",
+    re.IGNORECASE,
+)
+_EXPLICIT_ACCOUNT_ID = re.compile(
+    r"\b((?:IBKR[\s_-]+)?account[\s_-]+(?:id|identifier|number|no\.?))"
+    r"\s*[:#=]?\s*[A-Za-z0-9][A-Za-z0-9._-]{2,}",
+    re.IGNORECASE,
+)
+_NAV_VALUE = re.compile(
+    r"\b(nav|net[\s_-]+liquidation(?:[\s_-]+value)?)\s*[:#=]?\s*"
+    r"(?:[$€£]\s*)?[-+]?(?:[0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)"
+    r"(?:\.[0-9]+)?",
+    re.IGNORECASE,
+)
+_REDACTION = "[REDACTED]"
+
+
+def _redact_sensitive_text(value: str) -> str:
+    redacted = _EXPLICIT_ACCOUNT_ID.sub(
+        lambda match: f"{match.group(1)} {_REDACTION}", value
+    )
+    redacted = _IBKR_ACCOUNT_ID.sub(_REDACTION, redacted)
+    return _NAV_VALUE.sub(
+        lambda match: f"{match.group(1)} {_REDACTION}", redacted
+    )
+
+
+def _redact_sensitive_json(value: object) -> object:
+    if isinstance(value, str):
+        return _redact_sensitive_text(value)
+    if isinstance(value, list):
+        return [_redact_sensitive_json(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: _redact_sensitive_json(item) for key, item in value.items()
+        }
+    return value
 
 
 class BoundedAgent(Generic[InputT, OutputT]):
@@ -157,6 +197,28 @@ class BoundedAgent(Generic[InputT, OutputT]):
         self._validate_semantics(task_input, output)
         return output
 
+    def _privacy_safe_output(
+        self,
+        task_input: InputT,
+        output: OutputT,
+        *,
+        reject_if_changed: bool = False,
+    ) -> OutputT:
+        payload = output.model_dump(mode="json", warnings="error")
+        sanitized = _redact_sensitive_json(payload)
+        if reject_if_changed and sanitized != payload:
+            raise AgentContractError(
+                "terminal agent replay failed current privacy validation"
+            )
+        try:
+            validated = self.output_type.model_validate(sanitized)
+            self._validate_semantics(task_input, validated)
+        except (AgentContractError, TypeError, ValueError, ValidationError):
+            raise AgentContractError(
+                "agent output failed privacy validation"
+            ) from None
+        return validated
+
     @staticmethod
     def _repair_issues(error: Exception) -> tuple[ValidationIssue, ...]:
         return validation_issues(error)
@@ -229,6 +291,9 @@ class BoundedAgent(Generic[InputT, OutputT]):
                         execution_claim.replay_output_json
                     )
                     self._validate_semantics(validated_task.input, output)
+                    output = self._privacy_safe_output(
+                        validated_task.input, output, reject_if_changed=True
+                    )
                 except (AgentContractError, ValidationError, ValueError):
                     raise AgentContractError(
                         "terminal agent replay failed current contract validation"
@@ -281,11 +346,19 @@ class BoundedAgent(Generic[InputT, OutputT]):
                         recorded_at=self._completed_at(started_at),
                         fallback_reason=response.fallback_reason,
                         response_hash=response.raw_response_hash,
+                        reservation_id=getattr(response, "reservation_id", None),
+                        reservation_state=getattr(
+                            response, "reservation_state", None
+                        ),
+                        reserved_cost_usd=getattr(
+                            response, "reserved_cost_usd", None
+                        ),
                     ),
                     lease_token=lease_token,
                 )
             try:
                 output = self._validate_response(validated_task.input, response)
+                output = self._privacy_safe_output(validated_task.input, output)
             except (AgentContractError, ValidationError):
                 raise AgentContractError(
                     "agent output failed contract validation"

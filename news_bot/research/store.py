@@ -7,11 +7,11 @@ import secrets
 import sqlite3
 from importlib import resources
 from importlib.resources.abc import Traversable
-from collections.abc import Generator, Mapping, Sequence
+from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal
+from decimal import Decimal, localcontext
 from pathlib import Path
 
 from .models import (
@@ -27,6 +27,45 @@ from .models import (
 
 _MIGRATION_NAME = re.compile(r"^(?P<version>[0-9]+)_.+\.sql$")
 _AGENT_EXECUTION_LEASE = timedelta(minutes=15)
+
+
+def _system_utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+class _ExactDecimalSum:
+    """SQLite aggregate that preserves arbitrary Decimal text precision."""
+
+    def __init__(self) -> None:
+        self.values: list[Decimal] = []
+
+    def step(self, value: object) -> None:
+        if value is None:
+            return
+        if not isinstance(value, str):
+            raise ValueError("decimal aggregate requires text")
+        amount = Decimal(value)
+        if not amount.is_finite() or amount < 0:
+            raise ValueError(
+                "decimal aggregate requires a finite non-negative value"
+            )
+        self.values.append(amount)
+
+    def finalize(self) -> str | None:
+        if not self.values:
+            return None
+        nonzero = [value for value in self.values if value]
+        if not nonzero:
+            return "0"
+        highest_place = max(value.adjusted() for value in nonzero)
+        lowest_place = min(value.as_tuple().exponent for value in nonzero)
+        with localcontext() as context:
+            context.prec = max(
+                28,
+                highest_place - lowest_place + len(self.values).bit_length() + 2,
+            )
+            total = sum(self.values, Decimal("0"))
+        return _decimal_text(total)
 
 
 class ResearchStoreError(RuntimeError):
@@ -227,16 +266,25 @@ class ProviderAttemptRecord:
 class ResearchStore:
     """Connection-per-operation SQLite research store."""
 
-    def __init__(self, database_path: Path) -> None:
+    def __init__(
+        self,
+        database_path: Path,
+        *,
+        clock: Callable[[], datetime] = _system_utc_now,
+    ) -> None:
         if not isinstance(database_path, Path):
             raise TypeError("database_path must be Path")
+        if not callable(clock):
+            raise TypeError("clock must be callable")
         self.database_path = database_path
+        self.clock = clock
 
     def connect(self) -> sqlite3.Connection:
         """Open one configured SQLite connection owned by the caller."""
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
         connection = sqlite3.connect(self.database_path, isolation_level=None)
         try:
+            self._register_sql_functions(connection)
             connection.execute("PRAGMA foreign_keys = ON")
             connection.execute("PRAGMA journal_mode = WAL")
             connection.execute("PRAGMA busy_timeout = 5000")
@@ -244,6 +292,10 @@ class ResearchStore:
             connection.close()
             raise
         return connection
+
+    @staticmethod
+    def _register_sql_functions(connection: sqlite3.Connection) -> None:
+        connection.create_aggregate("decimal_sum_exact", 1, _ExactDecimalSum)
 
     @contextmanager
     def transaction(self) -> Generator[sqlite3.Connection, None, None]:
@@ -1653,10 +1705,12 @@ class ResearchStore:
                 raise ValueError("provider reserved cost is invalid")
         recorded_text = _utc_text(attempt.recorded_at, "provider attempt recorded_at")
         with self.transaction() as connection:
+            now_text = _utc_text(self.clock(), "research store clock")
             execution = connection.execute(
-                "SELECT state, lease_token FROM agent_executions "
-                "WHERE attempt_id = ?",
-                (attempt_id,),
+                "SELECT state, lease_token FROM agent_executions WHERE "
+                "attempt_id = ? AND state = 'running' AND lease_token = ? "
+                "AND lease_expires_at > ?",
+                (attempt_id, lease_token, now_text),
             ).fetchone()
             if execution != ("running", lease_token):
                 raise AgentExecutionConflict(
@@ -1700,8 +1754,8 @@ class ResearchStore:
                 "reserved_cost_usd = ?, provider = ?, model = ?, "
                 "inference_mode = ?, fallback_reason = ? "
                 "WHERE attempt_id = ? AND state = 'running' "
-                "AND lease_token = ?",
-                (*aggregate, attempt_id, lease_token),
+                "AND lease_token = ? AND lease_expires_at > ?",
+                (*aggregate, attempt_id, lease_token, now_text),
             )
             if cursor.rowcount != 1:
                 raise AgentExecutionConflict(
@@ -1805,11 +1859,13 @@ class ResearchStore:
         ):
             raise ValueError("failed execution requires a safe failure code")
         with self.transaction() as connection:
+            now_text = _utc_text(self.clock(), "research store clock")
             execution = connection.execute(
                 "SELECT task_id, task_instance_id, state, lease_token "
-                "FROM agent_executions "
-                "WHERE attempt_id = ?",
-                (attempt_id,),
+                "FROM agent_executions WHERE attempt_id = ? "
+                "AND state = 'running' AND lease_token = ? "
+                "AND lease_expires_at > ?",
+                (attempt_id, lease_token, now_text),
             ).fetchone()
             if (
                 execution is None
@@ -1834,13 +1890,15 @@ class ResearchStore:
                 "provider_attempt_count = ?, input_tokens = ?, output_tokens = ?, "
                 "reasoning_tokens = ?, usage_known = ?, reservation_state = ?, "
                 "reserved_cost_usd = ? "
-                "WHERE attempt_id = ? AND state = 'running' AND lease_token = ?",
+                "WHERE attempt_id = ? AND state = 'running' AND lease_token = ? "
+                "AND lease_expires_at > ?",
                 (
                     state, completed_text, failure_code, output_hash,
                     canonical_output if succeeded else None, provider, model,
                     inference_mode, fallback_reason, attempt_count, input_tokens,
                     output_tokens, reasoning_tokens, usage_known,
                     reservation_state, reserved_cost_usd, attempt_id, lease_token,
+                    now_text,
                 ),
             )
             if cursor.rowcount != 1:

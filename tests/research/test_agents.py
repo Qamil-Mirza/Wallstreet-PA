@@ -1,5 +1,6 @@
 """Contract and boundary tests for specialized qualitative research agents."""
 
+import hashlib
 import json
 from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
@@ -89,7 +90,7 @@ def seed_store(
     retrieved_at=NOW,
     claim_as_of=NOW,
 ):
-    store = ResearchStore(tmp_path / "research.db")
+    store = ResearchStore(tmp_path / "research.db", clock=lambda: NOW)
     store.migrate()
     document = SourceDocument(
         document_id="document-1", source_type="filing",
@@ -388,6 +389,68 @@ def test_agent_persists_only_redacted_audit(tmp_path):
     assert not hasattr(audit, "prompt")
     assert not hasattr(audit, "evidence")
     assert not hasattr(audit, "output")
+
+
+def test_agent_redacts_account_and_nav_before_return_storage_and_replay(tmp_path):
+    account_id = "U123456"
+    labeled_account_id = "BROKER-999"
+    nav = "4321"
+    reason = (
+        f"ACCOUNT {account_id}; account id {labeled_account_id}; NAV {nav}; "
+        "NVIDIA valuation range is $100-$120."
+    )
+    router = FakeRouter(common_output(ranked_events=[{
+        "event_id": "event-1", "rank": 1, "reason": reason,
+    }]))
+    store = seed_store(tmp_path)
+    agent = EventScout(router, store, clock=lambda: NOW)
+    logical_task = task(EventScoutInput(
+        events=(EventCandidate(event_id="event-1", headline="Filed results"),),
+        evidence_ids=("passage-1",), as_of=NOW,
+    ), task_id="privacy-task", run_id="privacy-workflow")
+
+    first = agent.run(logical_task)
+    replay = agent.run(logical_task)
+
+    assert len(router.calls) == 1
+    assert first == replay
+    assert account_id not in first.ranked_events[0].reason
+    assert labeled_account_id not in first.ranked_events[0].reason
+    assert nav not in first.ranked_events[0].reason
+    assert "NVIDIA valuation range is $100-$120" in first.ranked_events[0].reason
+    with store.connect() as connection:
+        output_json, output_hash = connection.execute(
+            "SELECT output_json, output_hash FROM agent_executions "
+            "WHERE workflow_run_id = 'privacy-workflow'"
+        ).fetchone()
+    assert account_id not in output_json
+    assert labeled_account_id not in output_json
+    assert nav not in output_json
+    assert hashlib.sha256(output_json.encode()).hexdigest() == output_hash
+    assert json.loads(output_json) == first.model_dump(mode="json")
+
+
+def test_agent_rejects_unsanitizable_identifier_without_disclosure(tmp_path):
+    account_id = "U123456"
+    router = FakeRouter(common_output(ranked_events=[{
+        "event_id": account_id, "rank": 1, "reason": "Material filing",
+    }]))
+    store = seed_store(tmp_path)
+    agent = EventScout(router, store, clock=lambda: NOW)
+
+    with pytest.raises(AgentContractError) as raised:
+        agent.run(task(EventScoutInput(
+            events=(EventCandidate(event_id=account_id, headline="Filed"),),
+            evidence_ids=("passage-1",), as_of=NOW,
+        ), task_id="privacy-reject", run_id="privacy-reject-workflow"))
+
+    assert account_id not in str(raised.value)
+    with store.connect() as connection:
+        execution = connection.execute(
+            "SELECT state, output_json, safe_failure_code FROM agent_executions "
+            "WHERE workflow_run_id = 'privacy-reject-workflow'"
+        ).fetchone()
+    assert execution == ("failed", None, "agent_contract")
 
 
 def test_agent_and_router_share_one_validation_repair_budget(tmp_path):

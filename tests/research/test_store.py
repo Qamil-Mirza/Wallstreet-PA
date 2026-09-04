@@ -677,7 +677,7 @@ def test_populated_v6_database_upgrades_workflow_instances_without_data_loss(
             "failure_code, reservation_id, reservation_state, reserved_cost_usd, "
             "recorded_at) VALUES (?, ?, 1, 'failed', 'openai', 'gpt-test', 7, "
             "NULL, NULL, NULL, 0, 'external', 'provider_usage_unavailable', "
-            "'reservation-v6-1', 'usage_unknown', '0.01', ?)",
+            "'reservation-v6-1', 'usage_unknown', '0.123456789123456789', ?)",
             ("provider_attempt_" + "e" * 64, first_attempt, completed_at),
         )
         connection.execute(
@@ -686,7 +686,8 @@ def test_populated_v6_database_upgrades_workflow_instances_without_data_loss(
             "output_tokens, reasoning_tokens, usage_known, inference_mode, "
             "reservation_id, reservation_state, reserved_cost_usd, recorded_at) "
             "VALUES (?, ?, 2, 'succeeded', 'openai', 'gpt-test', 5, 3, 2, 1, "
-            "1, 'external', 'reservation-v6-2', 'reconciled', '0.02', ?)",
+            "1, 'external', 'reservation-v6-2', 'reconciled', "
+            "'0.000000000000000001', ?)",
             ("provider_attempt_" + "f" * 64, first_attempt, completed_at),
         )
         connection.execute(
@@ -755,7 +756,7 @@ def test_populated_v6_database_upgrades_workflow_instances_without_data_loss(
             0,
             None,
             "usage_unknown",
-            "0.03",
+            "0.123456789123456790",
         ),
         (
             second_attempt,
@@ -769,10 +770,57 @@ def test_populated_v6_database_upgrades_workflow_instances_without_data_loss(
         ),
     ]
     assert provider_attempts == [
-        (0, None, "reservation-v6-1", "usage_unknown", "0.01"),
-        (1, 3, "reservation-v6-2", "reconciled", "0.02"),
+        (
+            0, None, "reservation-v6-1", "usage_unknown",
+            "0.123456789123456789",
+        ),
+        (
+            1, 3, "reservation-v6-2", "reconciled",
+            "0.000000000000000001",
+        ),
     ]
     assert foreign_key_errors == []
+
+
+def test_migration_007_rolls_back_without_exact_decimal_aggregate(
+    tmp_path, monkeypatch
+):
+    database_path = tmp_path / "research.db"
+    migration_root = (
+        Path(__file__).resolve().parents[2] / "news_bot/research/migrations"
+    )
+    legacy_migrations = []
+    for migration_name in (
+        "001_initial.sql",
+        "002_nullable_portfolio_freshness.sql",
+        "003_claim_dependencies.sql",
+        "004_entity_resolution.sql",
+        "005_agent_execution_audit.sql",
+        "006_agent_replay_lease.sql",
+    ):
+        copied = tmp_path / migration_name
+        shutil.copyfile(migration_root / migration_name, copied)
+        legacy_migrations.append(copied)
+    old_store = ResearchStore(database_path)
+    monkeypatch.setattr(
+        old_store, "_migration_files", lambda: tuple(legacy_migrations)
+    )
+    old_store.migrate()
+
+    upgraded = ResearchStore(database_path)
+    monkeypatch.setattr(
+        upgraded, "_register_sql_functions", lambda connection: None,
+        raising=False,
+    )
+    with pytest.raises(sqlite3.OperationalError, match="decimal_sum_exact"):
+        upgraded.migrate()
+
+    with upgraded.connect() as connection:
+        versions = connection.execute(
+            "SELECT version FROM schema_migrations ORDER BY version"
+        ).fetchall()
+    assert versions == [(1,), (2,), (3,), (4,), (5,), (6,)]
+    assert "workflow_task_instances" not in upgraded.table_names()
 
 
 def test_agent_execution_terminal_rows_and_provider_attempts_are_immutable(tmp_path):
@@ -915,6 +963,50 @@ def test_stale_agent_execution_lease_is_reclaimed_by_one_new_owner(tmp_path):
     ) == (None, None, None)
     assert audit.reservation_state == "usage_unknown"
     assert audit.reserved_cost_usd == Decimal("0.01")
+
+
+@pytest.mark.parametrize("late_by", (timedelta(), timedelta(hours=1)))
+def test_provider_attempt_rejects_current_token_at_or_after_lease_expiry(
+    tmp_path, late_by
+):
+    now = [utc(2026, 8, 24)]
+    store = ResearchStore(tmp_path / "research.db", clock=lambda: now[0])
+    store.migrate()
+    claim = claim_execution(store, now=now[0])
+    now[0] += timedelta(minutes=15) + late_by
+    attempt = ProviderAttemptAudit(
+        status="failed", provider="openai", model="gpt-test", latency_ms=1,
+        input_tokens=0, output_tokens=0, reasoning_tokens=0,
+        inference_mode=InferenceMode.EXTERNAL, recorded_at=now[0],
+        failure_code="provider_unavailable",
+    )
+
+    with pytest.raises(AgentExecutionConflict, match="lease"):
+        store.record_provider_attempt(
+            claim.attempt_id, attempt, lease_token=claim.lease_token
+        )
+
+    assert store.list_provider_attempts(claim.attempt_id) == ()
+
+
+@pytest.mark.parametrize("late_by", (timedelta(), timedelta(hours=1)))
+def test_finalize_rejects_current_token_at_or_after_lease_expiry(
+    tmp_path, late_by
+):
+    now = [utc(2026, 8, 24)]
+    store = ResearchStore(tmp_path / "research.db", clock=lambda: now[0])
+    store.migrate()
+    claim = claim_execution(store, now=now[0])
+    now[0] += timedelta(minutes=15) + late_by
+
+    with pytest.raises(AgentExecutionConflict, match="lease"):
+        store.finalize_agent_execution(
+            claim.attempt_id, lease_token=claim.lease_token, succeeded=False,
+            completed_at=now[0], failure_code="agent_execution",
+        )
+
+    execution = store.get_agent_execution(claim.attempt_id)
+    assert execution is not None and execution.status == "running"
 
 
 def test_agent_terminalization_rolls_back_if_task_state_diverged(tmp_path):

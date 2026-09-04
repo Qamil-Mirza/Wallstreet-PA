@@ -30,6 +30,7 @@ from news_bot.research.providers.base import (
     ProviderNonRetryableError,
     ProviderRequestError,
     ProviderUnavailable,
+    ProviderUsageUnavailable,
     ProviderValidationError,
     ReasoningEffort,
     TaskDeferred,
@@ -621,7 +622,28 @@ def test_openai_uses_request_reasoning_effort_and_reconciles(migrated_store):
     }
     assert result.data == ResearchOutput(answer="supported")
     assert result.reasoning_tokens == 1
+    assert result.reservation_id is not None
+    assert result.reservation_state == "reconciled"
+    assert result.reserved_cost_usd == Decimal("0.000010")
     assert ledger.month_total(2026, 8) == Decimal("0.000010")
+
+
+def test_router_trace_retains_reconciled_success_reservation(migrated_store):
+    provider, _ = make_openai_provider(
+        migrated_store, FakeOpenAIClient(openai_result())
+    )
+    traces = []
+    router = ProviderRouter(
+        make_config(external=True), provider, StubProvider("ollama", [])
+    )
+
+    router.generate(make_request(attempt_recorder=traces.append))
+
+    assert len(traces) == 1
+    assert traces[0].status == "succeeded"
+    assert traces[0].reservation_id is not None
+    assert traces[0].reservation_state == "reconciled"
+    assert traces[0].reserved_cost_usd == Decimal("0.000010")
 
 
 def test_openai_deliberately_accepts_completed_or_absent_compatibility_status(
@@ -700,6 +722,9 @@ def test_router_trace_retains_reconciled_terminal_openai_usage(migrated_store):
         traces[0].output_tokens,
         traces[0].reasoning_tokens,
     ) == (4, 3, 1)
+    assert traces[0].reservation_id is not None
+    assert traces[0].reservation_state == "reconciled"
+    assert traces[0].reserved_cost_usd == Decimal("0.000010")
 
 
 def test_missing_paid_usage_is_nonretryable_and_conservatively_traced(
@@ -814,32 +839,68 @@ def test_openai_auth_failure_releases_reservation_and_redacts(migrated_store):
     assert ledger.month_total(2026, 8) == Decimal("0")
 
 
+@pytest.mark.parametrize(
+    ("status_code", "expected_error"),
+    (
+        (400, ProviderNonRetryableError),
+        (401, TaskDeferred),
+        (429, TaskDeferred),
+    ),
+)
+def test_router_trace_retains_released_reservation_without_hostile_detail(
+    migrated_store, status_code, expected_error
+):
+    marker = "hostile-account-U123456"
+    client = FakeOpenAIClient(FakeRemoteError(status_code, marker))
+    external, ledger = make_openai_provider(migrated_store, client)
+    local = StubProvider("ollama", [response("ollama")])
+    traces = []
+    router = ProviderRouter(make_config(external=True), external, local)
+
+    with pytest.raises(expected_error) as raised:
+        router.generate(make_request(
+            policy=FallbackPolicy.NEVER, attempt_recorder=traces.append
+        ))
+
+    assert marker not in str(raised.value)
+    assert len(client.responses.calls) == 1
+    assert local.calls == []
+    assert len(traces) == 1
+    assert traces[0].reservation_id is not None
+    assert traces[0].reservation_state == "released"
+    assert traces[0].reserved_cost_usd == Decimal("0.000234")
+    assert ledger.month_total(2026, 8) == Decimal("0")
+
+
 def test_openai_timeout_keeps_pessimistic_reservation_counted(migrated_store):
     provider, ledger = make_openai_provider(migrated_store, FakeOpenAIClient(TimeoutError("prompt secret")))
-    with pytest.raises(ProviderUnavailable) as raised:
+    with pytest.raises(ProviderUsageUnavailable) as raised:
         provider.generate(make_request())
     assert "prompt secret" not in str(raised.value)
+    assert raised.value.reservation_state == "usage_unknown"
+    assert raised.value.reserved_cost_usd == Decimal("0.000234")
     assert ledger.month_total(2026, 8) == Decimal("0.000234")
 
 
 def test_router_trace_marks_indeterminate_openai_timeout_usage_unknown(
     migrated_store,
 ):
-    external, _ = make_openai_provider(
-        migrated_store, FakeOpenAIClient(TimeoutError("prompt secret"))
-    )
+    client = FakeOpenAIClient(TimeoutError("prompt secret"))
+    external, ledger = make_openai_provider(migrated_store, client)
     traces = []
+    local = StubProvider("ollama", [response("ollama")])
     router = ProviderRouter(
-        make_config(external=True), external,
-        StubProvider("ollama", [response("ollama")]),
+        make_config(external=True), external, local,
     )
 
-    routed = router.generate(make_request(
-        policy=FallbackPolicy.OUTAGES, attempt_recorder=traces.append
-    ))
+    with pytest.raises(ProviderUsageUnavailable):
+        router.generate(make_request(
+            policy=FallbackPolicy.ANY_FAILURE, attempt_recorder=traces.append
+        ))
 
-    assert routed.provider == "ollama"
-    assert len(traces) == 2
+    assert len(client.responses.calls) == 1
+    assert local.calls == []
+    assert len(traces) == 1
     assert traces[0].usage_known is False
     assert (
         traces[0].input_tokens,
@@ -848,6 +909,8 @@ def test_router_trace_marks_indeterminate_openai_timeout_usage_unknown(
     ) == (None, None, None)
     assert traces[0].reservation_state == "usage_unknown"
     assert traces[0].reserved_cost_usd == Decimal("0.000234")
+    assert traces[0].reservation_id is not None
+    assert ledger.month_total(2026, 8) == Decimal("0.000234")
 
 
 def test_openai_reservation_covers_canonical_full_request_envelope(
@@ -866,7 +929,7 @@ def test_openai_reservation_covers_canonical_full_request_envelope(
     )
     request = make_request(effort=ReasoningEffort.HIGH)
 
-    with pytest.raises(ProviderUnavailable):
+    with pytest.raises(ProviderUsageUnavailable):
         provider.generate(request)
 
     assert len(estimated_text) == 1
@@ -968,8 +1031,11 @@ def test_giant_schema_exceeds_hard_budget_before_openai_client_call(
 
 def test_openai_schema_failure_reconciles_reported_usage(migrated_store):
     provider, ledger = make_openai_provider(migrated_store, FakeOpenAIClient(openai_result(output='{"wrong":1}')))
-    with pytest.raises(ProviderValidationError):
+    with pytest.raises(ProviderValidationError) as raised:
         provider.generate(make_request())
+    assert raised.value.reservation_id is not None
+    assert raised.value.reservation_state == "reconciled"
+    assert raised.value.reserved_cost_usd == Decimal("0.000010")
     assert ledger.month_total(2026, 8) == Decimal("0.000010")
 
 

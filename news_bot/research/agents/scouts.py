@@ -46,4 +46,3 @@ class EmergingCompanyScout(BoundedAgent[EmergingScoutInput, EmergingScoutOutput]
             (item.signal_id for item in task_input.signals),
             ((item.signal_id, item.rank) for item in output.ranked_signals),
         )
-

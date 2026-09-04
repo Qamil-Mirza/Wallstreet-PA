@@ -129,7 +129,7 @@ SET
         )
     END,
     reserved_cost_usd = (
-        SELECT CAST(SUM(CAST(attempt.reserved_cost_usd AS REAL)) AS TEXT)
+        SELECT decimal_sum_exact(attempt.reserved_cost_usd)
         FROM provider_attempts AS attempt
         WHERE attempt.attempt_id = execution.attempt_id
             AND attempt.reserved_cost_usd IS NOT NULL

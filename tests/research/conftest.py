@@ -28,7 +28,9 @@ def fixture_json(name: str) -> dict[str, object]:
 
 def make_migrated_store(tmp_path: Path) -> ResearchStore:
     """Create a migrated store backed by a deterministic temporary path."""
-    store = ResearchStore(tmp_path / "research.db")
+    store = ResearchStore(
+        tmp_path / "research.db", clock=lambda: utc(2026, 8, 24)
+    )
     store.migrate()
     return store
 

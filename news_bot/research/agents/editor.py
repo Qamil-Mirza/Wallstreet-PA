@@ -23,4 +23,3 @@ class ResearchEditor(BoundedAgent[EditorInput, ResearchEditorOutput]):
             for section in output.sections
         ):
             raise AgentContractError("editor introduced an unapproved claim")
-
