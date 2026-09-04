@@ -674,10 +674,20 @@ def test_populated_v6_database_upgrades_workflow_instances_without_data_loss(
             "INSERT INTO provider_attempts (provider_attempt_id, attempt_id, "
             "ordinal, status, provider, model, latency_ms, input_tokens, "
             "output_tokens, reasoning_tokens, usage_known, inference_mode, "
-            "reservation_id, reservation_state, reserved_cost_usd, recorded_at) "
-            "VALUES (?, ?, 1, 'succeeded', 'openai', 'gpt-test', 7, NULL, NULL, "
-            "NULL, 0, 'external', 'reservation-v6', 'usage_unknown', '0.01', ?)",
+            "failure_code, reservation_id, reservation_state, reserved_cost_usd, "
+            "recorded_at) VALUES (?, ?, 1, 'failed', 'openai', 'gpt-test', 7, "
+            "NULL, NULL, NULL, 0, 'external', 'provider_usage_unavailable', "
+            "'reservation-v6-1', 'usage_unknown', '0.01', ?)",
             ("provider_attempt_" + "e" * 64, first_attempt, completed_at),
+        )
+        connection.execute(
+            "INSERT INTO provider_attempts (provider_attempt_id, attempt_id, "
+            "ordinal, status, provider, model, latency_ms, input_tokens, "
+            "output_tokens, reasoning_tokens, usage_known, inference_mode, "
+            "reservation_id, reservation_state, reserved_cost_usd, recorded_at) "
+            "VALUES (?, ?, 2, 'succeeded', 'openai', 'gpt-test', 5, 3, 2, 1, "
+            "1, 'external', 'reservation-v6-2', 'reconciled', '0.02', ?)",
+            ("provider_attempt_" + "f" * 64, first_attempt, completed_at),
         )
         connection.execute(
             "UPDATE agent_executions SET evidence_hash = ? WHERE attempt_id = ?",
@@ -687,7 +697,7 @@ def test_populated_v6_database_upgrades_workflow_instances_without_data_loss(
             "UPDATE agent_executions SET state = 'succeeded', completed_at = ?, "
             "output_hash = ?, output_json = ?, provider = 'openai', "
             "model = 'gpt-test', inference_mode = 'external', "
-            "provider_attempt_count = 1, input_tokens = NULL, "
+            "provider_attempt_count = 2, input_tokens = NULL, "
             "output_tokens = NULL, reasoning_tokens = NULL, usage_known = 0 "
             "WHERE attempt_id = ?",
             (completed_at, "f" * 64, output_json, first_attempt),
@@ -717,14 +727,16 @@ def test_populated_v6_database_upgrades_workflow_instances_without_data_loss(
         ).fetchall()
         executions = connection.execute(
             "SELECT attempt_id, task_instance_id, state, output_json, usage_known, "
-            "input_tokens FROM agent_executions WHERE task_id = 'v6-task' "
+            "input_tokens, reservation_state, reserved_cost_usd "
+            "FROM agent_executions WHERE task_id = 'v6-task' "
             "ORDER BY started_at, attempt_id"
         ).fetchall()
-        provider_attempt = connection.execute(
+        provider_attempts = connection.execute(
             "SELECT usage_known, input_tokens, reservation_id, reservation_state, "
-            "reserved_cost_usd FROM provider_attempts WHERE attempt_id = ?",
+            "reserved_cost_usd FROM provider_attempts WHERE attempt_id = ? "
+            "ORDER BY ordinal",
             (first_attempt,),
-        ).fetchone()
+        ).fetchall()
         foreign_key_errors = connection.execute(
             "PRAGMA foreign_key_check"
         ).fetchall()
@@ -742,6 +754,8 @@ def test_populated_v6_database_upgrades_workflow_instances_without_data_loss(
             output_json,
             0,
             None,
+            "usage_unknown",
+            "0.03",
         ),
         (
             second_attempt,
@@ -750,15 +764,14 @@ def test_populated_v6_database_upgrades_workflow_instances_without_data_loss(
             None,
             1,
             0,
+            None,
+            None,
         ),
     ]
-    assert provider_attempt == (
-        0,
-        None,
-        "reservation-v6",
-        "usage_unknown",
-        "0.01",
-    )
+    assert provider_attempts == [
+        (0, None, "reservation-v6-1", "usage_unknown", "0.01"),
+        (1, 3, "reservation-v6-2", "reconciled", "0.02"),
+    ]
     assert foreign_key_errors == []
 
 

@@ -110,6 +110,37 @@ ALTER TABLE agent_executions ADD COLUMN reserved_cost_usd TEXT;
 UPDATE agent_executions
 SET task_instance_id = 'task_instance_' || substr(attempt_id, 15);
 
+UPDATE agent_executions AS execution
+SET
+    reservation_state = CASE
+        WHEN EXISTS (
+            SELECT 1
+            FROM provider_attempts AS attempt
+            WHERE attempt.attempt_id = execution.attempt_id
+                AND attempt.reservation_state = 'usage_unknown'
+        ) THEN 'usage_unknown'
+        ELSE (
+            SELECT attempt.reservation_state
+            FROM provider_attempts AS attempt
+            WHERE attempt.attempt_id = execution.attempt_id
+                AND attempt.reservation_state IS NOT NULL
+            ORDER BY attempt.ordinal DESC
+            LIMIT 1
+        )
+    END,
+    reserved_cost_usd = (
+        SELECT CAST(SUM(CAST(attempt.reserved_cost_usd AS REAL)) AS TEXT)
+        FROM provider_attempts AS attempt
+        WHERE attempt.attempt_id = execution.attempt_id
+            AND attempt.reserved_cost_usd IS NOT NULL
+    )
+WHERE EXISTS (
+    SELECT 1
+    FROM provider_attempts AS attempt
+    WHERE attempt.attempt_id = execution.attempt_id
+        AND attempt.reservation_state IS NOT NULL
+);
+
 CREATE INDEX idx_agent_executions_task_instance_id
     ON agent_executions(task_instance_id);
 
