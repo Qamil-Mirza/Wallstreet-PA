@@ -901,14 +901,20 @@ def test_agent_execution_terminal_rows_and_provider_attempts_are_immutable(tmp_p
 
 
 def test_stale_agent_execution_lease_is_reclaimed_by_one_new_owner(tmp_path):
-    store = make_migrated_store(tmp_path)
-    first = claim_execution(store)
+    authoritative_now = [utc(2026, 8, 24)]
+    store = ResearchStore(
+        tmp_path / "research.db", clock=lambda: authoritative_now[0]
+    )
+    store.migrate()
+    first = claim_execution(store, now=authoritative_now[0])
 
+    authoritative_now[0] += timedelta(minutes=14)
     with pytest.raises(AgentExecutionConflict, match="already"):
-        claim_execution(store, now=utc(2026, 8, 24) + timedelta(minutes=14))
+        claim_execution(store, now=utc(2026, 8, 24) + timedelta(hours=2))
 
+    authoritative_now[0] += timedelta(minutes=1)
     recovered = claim_execution(
-        store, now=utc(2026, 8, 24) + timedelta(minutes=16)
+        store, now=utc(2026, 8, 24)
     )
     assert recovered.attempt_id == first.attempt_id
     assert recovered.lease_token != first.lease_token
@@ -963,6 +969,31 @@ def test_stale_agent_execution_lease_is_reclaimed_by_one_new_owner(tmp_path):
     ) == (None, None, None)
     assert audit.reservation_state == "usage_unknown"
     assert audit.reserved_cost_usd == Decimal("0.01")
+
+
+def test_future_caller_timestamp_cannot_steal_live_agent_lease(tmp_path):
+    authoritative_now = utc(2026, 8, 24)
+    store = ResearchStore(
+        tmp_path / "research.db", clock=lambda: authoritative_now
+    )
+    store.migrate()
+    first = claim_execution(store, now=authoritative_now)
+
+    with pytest.raises(AgentExecutionConflict, match="live lease"):
+        claim_execution(
+            store, now=authoritative_now + timedelta(hours=1)
+        )
+
+    with store.connect() as connection:
+        lease = connection.execute(
+            "SELECT lease_token, lease_expires_at FROM agent_executions "
+            "WHERE attempt_id = ?",
+            (first.attempt_id,),
+        ).fetchone()
+    assert lease == (
+        first.lease_token,
+        "2026-08-24T00:15:00.000000Z",
+    )
 
 
 @pytest.mark.parametrize("late_by", (timedelta(), timedelta(hours=1)))

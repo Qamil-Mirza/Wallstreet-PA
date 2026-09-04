@@ -1428,10 +1428,6 @@ class ResearchStore:
         ) is None:
             raise ValueError("agent execution evidence hash must be SHA-256")
         started_text = _utc_text(started_at, "agent execution started_at")
-        lease_expires_text = _utc_text(
-            started_at + _AGENT_EXECUTION_LEASE,
-            "agent execution lease expiry",
-        )
         lease_token = secrets.token_hex(32)
         identity = _canonical_json({
             "role": role.value,
@@ -1451,6 +1447,11 @@ class ResearchStore:
             "role": role.value,
         })
         with self.transaction() as connection:
+            lease_now_text = _utc_text(self.clock(), "research store clock")
+            lease_expires_text = _utc_text(
+                _parse_utc(lease_now_text) + _AGENT_EXECUTION_LEASE,
+                "agent execution lease expiry",
+            )
             existing_attempt = connection.execute(
                 "SELECT state, input_hash, prompt_hash, evidence_hash, "
                 "schema_version, output_json, output_hash, lease_token, "
@@ -1525,7 +1526,7 @@ class ResearchStore:
                 lease_expiry = existing_attempt[8]
                 if (
                     isinstance(lease_expiry, str)
-                    and _parse_utc(lease_expiry) > _parse_utc(started_text)
+                    and _parse_utc(lease_expiry) > _parse_utc(lease_now_text)
                 ):
                     raise AgentExecutionConflict(
                         "agent execution is already claimed by a live lease"
@@ -1538,7 +1539,7 @@ class ResearchStore:
                     "AND lease_expires_at IS ?",
                     (
                         lease_token, lease_expires_text, attempt_id,
-                        started_text, existing_attempt[7], existing_attempt[8],
+                        lease_now_text, existing_attempt[7], existing_attempt[8],
                     ),
                 )
                 if cursor.rowcount != 1:
