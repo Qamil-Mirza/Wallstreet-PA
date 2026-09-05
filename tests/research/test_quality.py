@@ -695,6 +695,58 @@ def test_zero_admissible_claims_cannot_support_a_rating():
     assert result.effective_rating is RecommendationRating.NO_RATING
 
 
+@pytest.mark.parametrize(
+    "rating",
+    [
+        RecommendationRating.BUY,
+        RecommendationRating.HOLD,
+        RecommendationRating.SELL_REDUCE,
+    ],
+)
+def test_rated_output_requires_approved_and_edited_recommendation_evidence(rating):
+    industry = claim("claim-industry", section="industry")
+    result = evaluate_quality_gates(request(
+        requested_rating=rating,
+        claims=(industry,),
+        reviewer_approved_claim_ids=("claim-industry",),
+        editor_claim_ids=("claim-industry",),
+    ))
+    assert GateReasonCode.RECOMMENDATION_EVIDENCE_MISSING in result.reason_codes
+    assert result.publication_verdict is PublicationVerdict.DRAFT
+    assert result.effective_rating is RecommendationRating.NO_RATING
+    assert result.allow_sizing is False
+    assert result.allowed_sections == ("industry",)
+
+
+@pytest.mark.parametrize(
+    "recommendation,approved,edited,contradictions",
+    [
+        (claim(material=False, consequential=False), ("claim-1",), ("claim-1",), ()),
+        (claim(), (), (), ()),
+        (claim(), ("claim-1",), (), ()),
+        (claim(), ("claim-1",), ("claim-1",), ("claim-1",)),
+        (
+            claim(evidence=(source("only-secondary", primary=False),)),
+            ("claim-1",),
+            ("claim-1",),
+            (),
+        ),
+    ],
+)
+def test_recommendation_evidence_must_pass_every_required_gate(
+    recommendation, approved, edited, contradictions
+):
+    result = evaluate_quality_gates(request(
+        claims=(recommendation,),
+        reviewer_approved_claim_ids=approved,
+        editor_claim_ids=edited,
+        contradictory_claim_ids=contradictions,
+    ))
+    assert GateReasonCode.RECOMMENDATION_EVIDENCE_MISSING in result.reason_codes
+    assert result.effective_rating is RecommendationRating.NO_RATING
+    assert result.allow_sizing is False
+
+
 def test_mismatched_calculated_exhibit_blocks_final_release():
     exhibit = CalculatedExhibit(
         exhibit_id="valuation",

@@ -59,6 +59,7 @@ class GateReasonCode(str, Enum):
     RESEARCH_CLAIMS_MISSING = "research_claims_missing"
     APPROVED_CLAIM_UNKNOWN = "approved_claim_unknown"
     EDITOR_CLAIM_UNKNOWN = "editor_claim_unknown"
+    RECOMMENDATION_EVIDENCE_MISSING = "recommendation_evidence_missing"
 
 
 def _aware(value: datetime) -> datetime:
@@ -712,6 +713,41 @@ def evaluate_quality_gates(
             blocked_sections.add(exhibit.section)
             hard_content_failure = True
             global_release_failure = True
+            rating_blocked = True
+
+    if data.requested_rating is not RecommendationRating.NO_RATING:
+        approved = set(data.reviewer_approved_claim_ids)
+        edited = set(data.editor_claim_ids)
+        contradicted = set(data.contradictory_claim_ids)
+        recommendation_supported = False
+        for item in data.claims:
+            if (
+                item.section != "recommendation"
+                or not (item.material or item.consequential)
+                or item.claim_id in contradicted
+                or item.claim_id not in approved
+                or item.claim_id not in edited
+            ):
+                continue
+            admissible = tuple(
+                reference for reference in item.evidence if reference.admissible
+            )
+            if not admissible or any(
+                reference.source_type == "search_snippet"
+                for reference in item.evidence
+            ):
+                continue
+            if item.consequential:
+                has_primary = any(reference.primary for reference in admissible)
+                independent_origins = {
+                    reference.source_family for reference in admissible
+                }
+                if not has_primary and len(independent_origins) < 2:
+                    continue
+            recommendation_supported = True
+            break
+        if not recommendation_supported:
+            reasons.add(GateReasonCode.RECOMMENDATION_EVIDENCE_MISSING)
             rating_blocked = True
 
     if data.inference_disclosure is None:
