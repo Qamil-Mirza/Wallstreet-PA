@@ -37,10 +37,12 @@ from news_bot.research.quality import (
     QualityGatePolicy,
     QualityGateResult,
     QualityGate,
+    ReasonSeverity,
     RecommendationGate,
     SourceReference,
     evaluate_quality_gates,
     price_is_fresh,
+    reason_severity,
 )
 
 
@@ -1423,6 +1425,7 @@ def test_quality_result_canonicalizes_collections_and_roundtrips_json():
         ),
         allowed_claim_ids=("CLAIM-1", "claim-1"),
         allowed_sections=("Recommendation",),
+        allow_event_report=False,
     )
     canonical = QualityGateResult.model_validate(payload)
     assert canonical.reason_codes == (
@@ -1593,3 +1596,46 @@ def test_optional_omission_is_partial_but_keeps_safe_rating_subset():
     assert result.publication_verdict is PublicationVerdict.PARTIAL
     assert result.allowed_claim_ids == ("claim-1",)
     assert result.effective_rating is RecommendationRating.BUY
+
+
+def test_event_reason_severity_is_exhaustive_and_typed():
+    assert all(
+        isinstance(reason_severity(reason), ReasonSeverity) for reason in GateReasonCode
+    )
+    for reason in (
+        GateReasonCode.EVENT_FRESHNESS_UNKNOWN,
+        GateReasonCode.EVENT_OUTSIDE_MATERIALITY_WINDOW,
+    ):
+        assert reason_severity(reason) & ReasonSeverity.EVENT_BLOCK
+
+
+def test_quality_result_rejects_event_block_reason_with_event_permission():
+    payload = evaluate_quality_gates(request()).model_dump()
+    payload["reason_codes"] = (GateReasonCode.EVENT_FRESHNESS_UNKNOWN,)
+    payload["allow_event_report"] = True
+    with pytest.raises(ValidationError):
+        QualityGateResult.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"block_event": True},
+        {"reason_codes": (GateReasonCode.EVENT_FRESHNESS_UNKNOWN,)},
+    ],
+)
+def test_component_event_flag_cannot_diverge_from_reason_severity(changes):
+    with pytest.raises(ValidationError):
+        GateDecision(**changes)
+
+
+def test_stale_event_metadata_blocks_only_event_permission_on_non_event_report():
+    result = evaluate_quality_gates(
+        request(
+            event_source_type="news",
+            event_published_at=AS_OF - timedelta(days=8),
+        )
+    )
+    assert result.publication_verdict is PublicationVerdict.FINAL
+    assert result.effective_rating is RecommendationRating.BUY
+    assert result.allow_event_report is False

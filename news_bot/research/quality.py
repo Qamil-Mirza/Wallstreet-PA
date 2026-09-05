@@ -84,6 +84,7 @@ class ReasonSeverity(IntFlag):
     PUBLICATION_BLOCK = 1
     RATING_BLOCK = 2
     OMISSION = 4
+    EVENT_BLOCK = 8
 
 
 _GLOBAL_AND_RATING = ReasonSeverity.PUBLICATION_BLOCK | ReasonSeverity.RATING_BLOCK
@@ -112,8 +113,8 @@ _REASON_SEVERITY: Mapping[GateReasonCode, ReasonSeverity] = MappingProxyType(
         GateReasonCode.EXHIBIT_MISMATCH: _GLOBAL_AND_RATING,
         GateReasonCode.INFERENCE_DISCLOSURE_MISSING: _GLOBAL_AND_RATING,
         GateReasonCode.LOCAL_CONFIDENCE_WEAK: _GLOBAL_AND_RATING,
-        GateReasonCode.EVENT_OUTSIDE_MATERIALITY_WINDOW: ReasonSeverity.NONE,
-        GateReasonCode.EVENT_FRESHNESS_UNKNOWN: ReasonSeverity.NONE,
+        GateReasonCode.EVENT_OUTSIDE_MATERIALITY_WINDOW: ReasonSeverity.EVENT_BLOCK,
+        GateReasonCode.EVENT_FRESHNESS_UNKNOWN: ReasonSeverity.EVENT_BLOCK,
         GateReasonCode.RESEARCH_CLAIMS_MISSING: _GLOBAL_AND_RATING,
         GateReasonCode.APPROVED_CLAIM_UNKNOWN: _GLOBAL_AND_RATING,
         GateReasonCode.EDITOR_CLAIM_UNKNOWN: _GLOBAL_AND_RATING,
@@ -777,6 +778,8 @@ class QualityGateResult(FrozenQualityContract):
             or self.allow_sizing
         ):
             raise ValueError("rating-blocking reason requires no rating or sizing")
+        if severity & ReasonSeverity.EVENT_BLOCK and self.allow_event_report:
+            raise ValueError("event-blocking reason forbids event publication")
         if self.publication_verdict is PublicationVerdict.FINAL and severity & (
             ReasonSeverity.PUBLICATION_BLOCK
             | ReasonSeverity.RATING_BLOCK
@@ -831,6 +834,15 @@ class GateDecision(FrozenQualityContract):
 
     _sections = field_validator("affected_sections")(_canonical_categories)
     _claims = field_validator("rejected_claim_ids")(_canonical_values)
+
+    @model_validator(mode="after")
+    def _event_flag_matches_reason(self) -> "GateDecision":
+        mapped = bool(
+            combined_reason_severity(self.reason_codes) & ReasonSeverity.EVENT_BLOCK
+        )
+        if self.block_event != mapped:
+            raise ValueError("event block flag must match reason severity")
+        return self
 
 
 class ComponentGate(Protocol):
@@ -1269,6 +1281,7 @@ def _merge_decisions(
     data: QualityGateInput, decisions: tuple[GateDecision, ...]
 ) -> QualityGateResult:
     """Merge component outputs with set operations, independent of gate order."""
+    decisions = tuple(GateDecision.model_validate(decision) for decision in decisions)
     reasons = {reason for decision in decisions for reason in decision.reason_codes}
     blocked_sections = {
         _comparison_key(section)
@@ -1314,7 +1327,7 @@ def _merge_decisions(
     global_failure = any(decision.block_publication for decision in decisions) or bool(
         reason_effects & ReasonSeverity.PUBLICATION_BLOCK
     )
-    event_failure = any(decision.block_event for decision in decisions)
+    event_failure = bool(reason_effects & ReasonSeverity.EVENT_BLOCK)
     critical_failure = False
     if data.publication_kind is PublicationKind.RECOMMENDATION:
         critical_failure = "recommendation" in blocked_sections or block_rating
