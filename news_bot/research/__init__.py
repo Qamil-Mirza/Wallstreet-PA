@@ -8,6 +8,17 @@ from .models import (
     RecommendationRating,
     ReviewVerdict,
 )
+from .orchestrator import (
+    DurableTaskView,
+    RecommendationTrigger,
+    ResearchOrchestrator,
+    StageContext,
+    StageOutcome,
+    WorkflowKind,
+    WorkflowRunResult,
+    WorkflowRunState,
+    WorkflowTaskState,
+)
 
 __all__ = [
     "AgentRole",
@@ -17,4 +28,13 @@ __all__ = [
     "ResearchConfig",
     "ResearchConfigError",
     "ReviewVerdict",
+    "DurableTaskView",
+    "RecommendationTrigger",
+    "ResearchOrchestrator",
+    "StageContext",
+    "StageOutcome",
+    "WorkflowKind",
+    "WorkflowRunResult",
+    "WorkflowRunState",
+    "WorkflowTaskState",
 ]
