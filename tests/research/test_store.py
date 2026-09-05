@@ -148,7 +148,7 @@ def test_migration_is_idempotent_and_recorded_once(tmp_path):
         rows = connection.execute(
             "SELECT version, name, applied_at FROM schema_migrations"
         ).fetchall()
-    assert len(rows) == 8
+    assert len(rows) == 9
     assert rows[0][0:2] == (1, "001_initial.sql")
     assert rows[1][0:2] == (2, "002_nullable_portfolio_freshness.sql")
     assert rows[2][0:2] == (3, "003_claim_dependencies.sql")
@@ -157,6 +157,7 @@ def test_migration_is_idempotent_and_recorded_once(tmp_path):
     assert rows[5][0:2] == (6, "006_agent_replay_lease.sql")
     assert rows[6][0:2] == (7, "007_workflow_task_instances.sql")
     assert rows[7][0:2] == (8, "008_durable_workflow_orchestration.sql")
+    assert rows[8][0:2] == (9, "009_workflow_recovery_publication.sql")
     assert all(row[2].endswith("Z") for row in rows)
 
 
@@ -261,7 +262,7 @@ def test_existing_v1_database_upgrades_nullable_freshness_without_data_loss(
             "WHERE type = 'index' AND name LIKE 'idx_positions_%' ORDER BY name"
         ).fetchall()
 
-    assert versions == [(1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,)]
+    assert versions == [(1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,)]
     assert stored_snapshot == snapshot_row
     assert stored_security == security_row
     assert stored_position == position_row
@@ -331,7 +332,7 @@ def test_existing_v2_claims_upgrade_with_lineage_anchor_without_data_loss(
             (claim.claim_id,),
         ).fetchall()
         foreign_key_errors = connection.execute("PRAGMA foreign_key_check").fetchall()
-    assert versions == [(1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,)]
+    assert versions == [(1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,)]
     assert retained_evidence == [("passage-1", stance)]
     if stance == "supports":
         assert upgraded.get_claim(claim.claim_id) == claim
@@ -429,7 +430,7 @@ def test_populated_v3_relationship_upgrade_preserves_and_quarantines_legacy_data
         }
         foreign_key_errors = connection.execute("PRAGMA foreign_key_check").fetchall()
 
-    assert versions == [(1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,)]
+    assert versions == [(1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,)]
     assert relationship == (
         source_entity_id,
         target_entity_id,
@@ -520,7 +521,7 @@ def test_populated_v4_database_upgrades_agent_audit_without_data_loss(
         foreign_key_errors = connection.execute(
             "PRAGMA foreign_key_check"
         ).fetchall()
-    assert versions == [(1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,)]
+    assert versions == [(1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,)]
     assert legacy == [("legacy-run", "legacy-task", "completed")]
     assert {"agent_executions", "provider_attempts"} <= upgraded.table_names()
     assert foreign_key_errors == []
@@ -608,7 +609,7 @@ def test_populated_v5_database_upgrades_replay_lease_without_data_loss(
         foreign_key_errors = connection.execute(
             "PRAGMA foreign_key_check"
         ).fetchall()
-    assert versions == [(1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,)]
+    assert versions == [(1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,)]
     assert execution == ("succeeded", "e" * 64, None, None, None)
     assert provider_attempt == ("ollama", "legacy", 3, 2, 1, 1)
     assert foreign_key_errors == []
@@ -743,7 +744,7 @@ def test_populated_v6_database_upgrades_workflow_instances_without_data_loss(
             "PRAGMA foreign_key_check"
         ).fetchall()
 
-    assert versions == [(1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,)]
+    assert versions == [(1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,)]
     assert instances == [
         ("v6-workflow-one", "completed", 1),
         ("v6-workflow-two", "failed", 0),
@@ -1143,6 +1144,7 @@ def test_built_wheel_contains_and_applies_all_migrations(tmp_path):
         "news_bot/research/migrations/006_agent_replay_lease.sql",
         "news_bot/research/migrations/007_workflow_task_instances.sql",
         "news_bot/research/migrations/008_durable_workflow_orchestration.sql",
+        "news_bot/research/migrations/009_workflow_recovery_publication.sql",
     }
     prompt_names = {
         "news_bot/research/prompts/director.md",
@@ -1168,7 +1170,8 @@ def test_built_wheel_contains_and_applies_all_migrations(tmp_path):
         "'003_claim_dependencies.sql', '004_entity_resolution.sql', "
         "'005_agent_execution_audit.sql', '006_agent_replay_lease.sql', "
         "'007_workflow_task_instances.sql', "
-        "'008_durable_workflow_orchestration.sql'}; "
+        "'008_durable_workflow_orchestration.sql', "
+        "'009_workflow_recovery_publication.sql'}; "
         "prompt_dir = resources.files('news_bot.research').joinpath('prompts'); "
         "assert {p.name for p in prompt_dir.iterdir()} >= "
         "{'director.md', 'emerging_scout.md', 'event_scout.md', "
@@ -1181,7 +1184,7 @@ def test_built_wheel_contains_and_applies_all_migrations(tmp_path):
         "connection = sqlite3.connect(db); "
         "assert connection.execute('SELECT version FROM schema_migrations "
         "ORDER BY version').fetchall() == "
-        "[(1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,)]; "
+        "[(1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,)]; "
         "connection.close()"
     )
     subprocess.run(
@@ -1195,7 +1198,7 @@ def test_built_wheel_contains_and_applies_all_migrations(tmp_path):
 
 def test_failed_multi_statement_migration_is_atomic(tmp_path, monkeypatch):
     store = make_migrated_store(tmp_path)
-    bad_migration = tmp_path / "009_broken.sql"
+    bad_migration = tmp_path / "010_broken.sql"
     bad_migration.write_text(
         "CREATE TABLE should_roll_back (id INTEGER);\n"
         "INSERT INTO missing_table (id) VALUES (1);\n",
@@ -1214,7 +1217,7 @@ def test_failed_multi_statement_migration_is_atomic(tmp_path, monkeypatch):
         versions = connection.execute(
             "SELECT version FROM schema_migrations ORDER BY version"
         ).fetchall()
-    assert versions == [(1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,)]
+    assert versions == [(1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,)]
 
 
 def test_migrations_are_sorted_by_numeric_version(tmp_path, monkeypatch):

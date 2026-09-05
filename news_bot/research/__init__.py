@@ -10,6 +10,8 @@ from .models import (
 )
 from .orchestrator import (
     DurableTaskView,
+    PublicationEffectState,
+    PublicationEffectView,
     RecommendationTrigger,
     ResearchOrchestrator,
     StageContext,
@@ -29,6 +31,8 @@ __all__ = [
     "ResearchConfigError",
     "ReviewVerdict",
     "DurableTaskView",
+    "PublicationEffectState",
+    "PublicationEffectView",
     "RecommendationTrigger",
     "ResearchOrchestrator",
     "StageContext",

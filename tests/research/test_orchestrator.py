@@ -63,6 +63,7 @@ class RecordingRunner:
                 value = StageOutcome(
                     result_ref=f"report-{context.workflow_id[-12:]}",
                     report_id=f"report-{context.workflow_id[-12:]}",
+                    publication_receipt_hash="e" * 64,
                 )
             else:
                 value = StageOutcome(result_ref=f"result-{context.task_id[-12:]}")
@@ -157,7 +158,7 @@ def test_weekly_revise_returns_task_to_fundamental_analyst(store: ResearchStore)
     returned = result.pending_tasks[0]
     assert returned.assigned_role is AgentRole.FUNDAMENTAL_ANALYST
     assert returned.originating_role is AgentRole.FUNDAMENTAL_ANALYST
-    assert returned.defer_reason == "strengthen valuation support"
+    assert returned.defer_reason == "review_revise"
     assert returned.dependency_ids
     assert "publish" not in [call.stage for call in runner.calls]
 
@@ -540,7 +541,7 @@ def test_populated_v7_database_upgrades_without_data_loss(
         ).fetchone()
         fk_errors = connection.execute("PRAGMA foreign_key_check").fetchall()
 
-    assert versions == [(1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,)]
+    assert versions == [(1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,)]
     assert legacy_row == ("evidence", "pending")
     assert fk_errors == []
 
@@ -578,3 +579,306 @@ def test_migration_008_failure_rolls_back_all_new_tables(
         assert connection.execute(
             "SELECT version FROM schema_migrations ORDER BY version"
         ).fetchall() == [(1,), (2,), (3,), (4,), (5,), (6,), (7,)]
+
+
+def test_publish_expiry_records_unknown_outcome_and_never_repeats_effect(
+    tmp_path: Path,
+) -> None:
+    now = [utc()]
+    store = ResearchStore(tmp_path / "research.db", clock=lambda: now[0])
+    store.migrate()
+
+    class ExpiringPublisher(RecordingRunner):
+        def run(self, context: StageContext) -> StageOutcome:
+            outcome = super().run(context)
+            if context.stage == "publish":
+                assert context.publication_effect_key
+                now[0] += timedelta(minutes=15)
+            return outcome
+
+    runner = ExpiringPublisher()
+    first = ResearchOrchestrator(store, runner, owner_id="owner-a")
+    result = first.run_weekly(as_of=utc(), source_hashes=("a" * 64,))
+    second = ResearchOrchestrator(store, runner, owner_id="owner-b")
+    replay = second.run_weekly(as_of=utc(), source_hashes=("a" * 64,))
+
+    assert result.status is WorkflowRunState.DEFERRED
+    assert replay.status is WorkflowRunState.DEFERRED
+    assert [call.stage for call in runner.calls].count("publish") == 1
+    assert "publication_outcome_unknown" in {
+        task.defer_reason for task in second.list_tasks(result.workflow_id)
+    }
+
+
+def test_material_event_crash_resume_hydrates_safe_completed_outcomes(
+    tmp_path: Path,
+) -> None:
+    now = [utc()]
+    store = ResearchStore(tmp_path / "research.db", clock=lambda: now[0])
+    store.migrate()
+    runner = RecordingRunner({
+        "materiality": StageOutcome(
+            material_event=True, new_agent_runs=2,
+            omissions=("pre_crash_omission",), result_ref="material-1",
+        ),
+        "event_analysis": [KeyboardInterrupt(), StageOutcome(
+            result_ref="analysis-1", new_agent_runs=3,
+        )],
+    })
+    first = ResearchOrchestrator(store, runner, owner_id="owner-a")
+    with pytest.raises(KeyboardInterrupt):
+        first.run_daily(as_of=utc(), source_hashes=("a" * 64,))
+
+    now[0] += timedelta(minutes=15)
+    resumed = ResearchOrchestrator(store, runner, owner_id="owner-b")
+    result = resumed.run_daily(as_of=utc(), source_hashes=("a" * 64,))
+
+    stages = [call.stage for call in runner.calls]
+    assert stages.count("portfolio") == 1
+    assert stages.count("materiality") == 1
+    assert stages.count("event_analysis") == 2
+    assert "event_update" in stages and "publish" in stages
+    assert result.new_agent_runs == 5
+    assert result.status is WorkflowRunState.PARTIAL
+    assert result.omissions == ("omission_sanitized",)
+    assert len(result.report_ids) == 1
+
+
+def test_daily_event_update_persistently_depends_on_event_analysis(
+    store: ResearchStore,
+) -> None:
+    runner = RecordingRunner({"materiality": StageOutcome(material_event=True)})
+    orchestrator = ResearchOrchestrator(store, runner, owner_id="owner-a")
+    result = orchestrator.run_daily(as_of=utc(), source_hashes=("a" * 64,))
+    tasks = {task.stage: task for task in orchestrator.list_tasks(result.workflow_id)}
+
+    assert tasks["event_analysis"].task_id in tasks["event_update"].dependency_ids
+
+
+def test_monthly_revision_returns_to_industry_strategist(store: ResearchStore) -> None:
+    runner = RecordingRunner({"review": StageOutcome(
+        reviewer_verdict=ReviewVerdict.REVISE,
+        defer_reason="refresh industry assumptions",
+    )})
+    orchestrator = ResearchOrchestrator(store, runner, owner_id="owner-a")
+
+    result = orchestrator.run_monthly(
+        as_of=utc(), source_hashes=("a" * 64,), industry_key="robotic-actuators"
+    )
+
+    assert result.pending_tasks[0].assigned_role is AgentRole.INDUSTRY_STRATEGIST
+    assert result.pending_tasks[0].originating_role is AgentRole.INDUSTRY_STRATEGIST
+    assert result.pending_tasks[0].defer_reason == "review_revise"
+
+
+def test_untrusted_reason_text_is_never_persisted_or_returned(tmp_path: Path) -> None:
+    store = ResearchStore(tmp_path / "research.db")
+    store.migrate()
+    private = "account U1234567 NAV 4999 api key sk-private"
+    runner = RecordingRunner({"review": StageOutcome(
+        reviewer_verdict=ReviewVerdict.BLOCK,
+        defer_reason=private,
+        omissions=(private,),
+    )})
+    orchestrator = ResearchOrchestrator(store, runner, owner_id="owner-a")
+
+    result = orchestrator.run_weekly(as_of=utc(), source_hashes=("a" * 64,))
+    with store.connect() as connection:
+        stored = " ".join(
+            str(value) for row in connection.execute(
+                "SELECT defer_reason, outcome_json FROM workflow_tasks"
+            ).fetchall() for value in row if value is not None
+        )
+
+    assert private not in stored
+    assert private not in result.model_dump_json()
+    assert result.pending_tasks[0].defer_reason == "review_block"
+    assert result.omissions == ("omission_sanitized",)
+
+
+def test_unknown_publication_requires_explicit_idempotent_reconciliation(
+    tmp_path: Path,
+) -> None:
+    now = [utc()]
+    store = ResearchStore(tmp_path / "research.db", clock=lambda: now[0])
+    store.migrate()
+
+    class UnknownPublisher(RecordingRunner):
+        def run(self, context: StageContext) -> StageOutcome:
+            outcome = super().run(context)
+            if context.stage == "publish":
+                now[0] += timedelta(minutes=15)
+            return outcome
+
+    runner = UnknownPublisher()
+    orchestrator = ResearchOrchestrator(store, runner, owner_id="owner-a")
+    deferred = orchestrator.run_weekly(as_of=utc(), source_hashes=("a" * 64,))
+    effect_key = next(
+        call.publication_effect_key for call in runner.calls if call.stage == "publish"
+    )
+    assert effect_key is not None
+
+    receipt = orchestrator.reconcile_publication(
+        effect_key, report_id="report-reconciled", receipt_hash="f" * 64
+    )
+    assert orchestrator.reconcile_publication(
+        effect_key, report_id="report-reconciled", receipt_hash="f" * 64
+    ) == receipt
+    with pytest.raises(WorkflowConflict, match="conflicts"):
+        orchestrator.reconcile_publication(
+            effect_key, report_id="report-conflict", receipt_hash="a" * 64
+        )
+    resumed = ResearchOrchestrator(store, runner, owner_id="owner-b").run_weekly(
+        as_of=utc(), source_hashes=("a" * 64,)
+    )
+
+    assert deferred.status is WorkflowRunState.DEFERRED
+    assert resumed.report_ids == ("report-reconciled",)
+    assert [call.stage for call in runner.calls].count("publish") == 1
+
+
+def test_v9_triggers_reject_terminal_and_identity_rewrites(
+    store: ResearchStore,
+) -> None:
+    orchestrator = ResearchOrchestrator(store, RecordingRunner(), owner_id="owner-a")
+    result = orchestrator.run_weekly(as_of=utc(), source_hashes=("a" * 64,))
+    tasks = orchestrator.list_tasks(result.workflow_id)
+    with store.connect() as connection:
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "UPDATE workflow_runs SET state = 'running' WHERE workflow_id = ?",
+                (result.workflow_id,),
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "UPDATE workflow_tasks SET assigned_role = 'research_editor' "
+                "WHERE task_id = ?", (tasks[0].task_id,),
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "UPDATE workflow_tasks SET result_hash = ? WHERE task_id = ?",
+                ("a" * 64, tasks[0].task_id),
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "UPDATE publication_effects SET report_id = 'changed' "
+                "WHERE workflow_id = ?", (result.workflow_id,),
+            )
+
+
+def test_v9_publication_schema_has_foreign_keys_and_indexes(store: ResearchStore) -> None:
+    with store.connect() as connection:
+        version = connection.execute(
+            "SELECT name FROM schema_migrations WHERE version = 9"
+        ).fetchone()
+        foreign_keys = connection.execute(
+            "PRAGMA foreign_key_list(publication_effects)"
+        ).fetchall()
+        indexes = connection.execute(
+            "PRAGMA index_list(publication_effects)"
+        ).fetchall()
+        errors = connection.execute("PRAGMA foreign_key_check").fetchall()
+
+    assert version == ("009_workflow_recovery_publication.sql",)
+    assert len({row[0] for row in foreign_keys}) == 2
+    assert any(row[1] == "idx_publication_effects_workflow_state" for row in indexes)
+    assert errors == []
+
+
+def test_daily_revision_returns_to_event_scout(store: ResearchStore) -> None:
+    runner = RecordingRunner({
+        "materiality": StageOutcome(material_event=True),
+        "review": StageOutcome(reviewer_verdict=ReviewVerdict.REVISE),
+    })
+    result = ResearchOrchestrator(store, runner, owner_id="owner-a").run_daily(
+        as_of=utc(), source_hashes=("a" * 64,)
+    )
+
+    assert result.pending_tasks[0].assigned_role is AgentRole.EVENT_SCOUT
+
+
+def test_populated_v8_workflow_upgrades_to_v9_without_data_loss(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = tmp_path / "v8.db"
+    root = Path(__file__).resolve().parents[2] / "news_bot/research/migrations"
+    files = tuple(root / name for name in (
+        "001_initial.sql", "002_nullable_portfolio_freshness.sql",
+        "003_claim_dependencies.sql", "004_entity_resolution.sql",
+        "005_agent_execution_audit.sql", "006_agent_replay_lease.sql",
+        "007_workflow_task_instances.sql", "008_durable_workflow_orchestration.sql",
+    ))
+    legacy = ResearchStore(database)
+    monkeypatch.setattr(legacy, "_migration_files", lambda: files)
+    legacy.migrate()
+    with legacy.transaction() as connection:
+        connection.execute(
+            "INSERT INTO workflow_runs (workflow_id, idempotency_key, workflow_kind, "
+            "period_key, as_of, source_hashes_json, definition_hash, state, dry_run, "
+            "authorize_analysis, completed_stages_json, report_ids_json, omissions_json, "
+            "created_at, updated_at, completed_at) VALUES ('wf_legacy', ?, 'daily', "
+            "'2026-08-24', '2026-08-24T00:00:00.000000Z', '[]', ?, 'completed', "
+            "0, 0, '[]', '[]', '[]', ?, ?, ?)",
+            ("a" * 64, "b" * 64, *("2026-08-24T00:00:00.000000Z",) * 3),
+        )
+    upgraded = ResearchStore(database)
+    upgraded.migrate()
+    with upgraded.connect() as connection:
+        row = connection.execute(
+            "SELECT workflow_kind, state FROM workflow_runs WHERE workflow_id = 'wf_legacy'"
+        ).fetchone()
+        versions = connection.execute(
+            "SELECT version FROM schema_migrations ORDER BY version"
+        ).fetchall()
+
+    assert row == ("daily", "completed")
+    assert versions[-1] == (9,)
+
+
+def test_migration_009_failure_rolls_back_publication_schema(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = tmp_path / "v9-rollback.db"
+    root = Path(__file__).resolve().parents[2] / "news_bot/research/migrations"
+    files = tuple(root / name for name in (
+        "001_initial.sql", "002_nullable_portfolio_freshness.sql",
+        "003_claim_dependencies.sql", "004_entity_resolution.sql",
+        "005_agent_execution_audit.sql", "006_agent_replay_lease.sql",
+        "007_workflow_task_instances.sql", "008_durable_workflow_orchestration.sql",
+    ))
+    legacy = ResearchStore(database)
+    monkeypatch.setattr(legacy, "_migration_files", lambda: files)
+    legacy.migrate()
+    broken = tmp_path / "009_broken.sql"
+    broken.write_text(
+        "CREATE TABLE publication_effects (id TEXT);\n"
+        "INSERT INTO missing_table VALUES (1);\n", encoding="utf-8",
+    )
+    attempted = ResearchStore(database)
+    monkeypatch.setattr(attempted, "_migration_files", lambda: (*files, broken))
+
+    with pytest.raises(sqlite3.OperationalError):
+        attempted.migrate()
+    assert "publication_effects" not in attempted.table_names()
+    with attempted.connect() as connection:
+        assert connection.execute(
+            "SELECT MAX(version) FROM schema_migrations"
+        ).fetchone() == (8,)
+
+
+def test_failed_task_reason_is_immutable_until_repository_retry(
+    store: ResearchStore,
+) -> None:
+    runner = RecordingRunner({
+        "changed_theses": [RuntimeError("private"), RuntimeError("private")]
+    })
+    orchestrator = ResearchOrchestrator(store, runner, owner_id="owner-a")
+    result = orchestrator.run_weekly(as_of=utc(), source_hashes=("a" * 64,))
+    failed = next(task for task in orchestrator.list_tasks(result.workflow_id)
+                  if task.state is WorkflowTaskState.FAILED)
+
+    with store.connect() as connection, pytest.raises(sqlite3.IntegrityError):
+        connection.execute(
+            "UPDATE workflow_tasks SET defer_reason = 'changed' WHERE task_id = ?",
+            (failed.task_id,),
+        )
