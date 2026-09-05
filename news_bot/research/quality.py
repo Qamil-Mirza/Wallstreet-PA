@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
-from enum import Enum
+from enum import Enum, IntFlag
 from types import MappingProxyType
-from typing import Mapping, Protocol
+from typing import Iterable, Mapping, Protocol
 import unicodedata
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -75,6 +75,68 @@ class GateReasonCode(str, Enum):
     APPROVED_CLAIM_UNKNOWN = "approved_claim_unknown"
     EDITOR_CLAIM_UNKNOWN = "editor_claim_unknown"
     RECOMMENDATION_EVIDENCE_MISSING = "recommendation_evidence_missing"
+
+
+class ReasonSeverity(IntFlag):
+    """Safety effects carried by a stable gate reason."""
+
+    NONE = 0
+    PUBLICATION_BLOCK = 1
+    RATING_BLOCK = 2
+    OMISSION = 4
+
+
+_GLOBAL_AND_RATING = ReasonSeverity.PUBLICATION_BLOCK | ReasonSeverity.RATING_BLOCK
+_REASON_SEVERITY: Mapping[GateReasonCode, ReasonSeverity] = MappingProxyType(
+    {
+        GateReasonCode.PORTFOLIO_MISSING: ReasonSeverity.RATING_BLOCK,
+        GateReasonCode.PORTFOLIO_STALE: ReasonSeverity.RATING_BLOCK,
+        GateReasonCode.PRICE_MISSING: ReasonSeverity.RATING_BLOCK,
+        GateReasonCode.PRICE_SESSION_UNKNOWN: ReasonSeverity.RATING_BLOCK,
+        GateReasonCode.PRICE_NOT_TRADING_SESSION: ReasonSeverity.RATING_BLOCK,
+        GateReasonCode.PRICE_NOT_LATEST_SESSION: ReasonSeverity.RATING_BLOCK,
+        GateReasonCode.PRICE_STALE: ReasonSeverity.RATING_BLOCK,
+        GateReasonCode.PRICE_CURRENCY_MISMATCH: ReasonSeverity.RATING_BLOCK,
+        GateReasonCode.CALENDAR_COVERAGE_UNKNOWN: ReasonSeverity.RATING_BLOCK,
+        GateReasonCode.FILING_STATUS_UNKNOWN: ReasonSeverity.RATING_BLOCK,
+        GateReasonCode.REQUIRED_FILING_UNAVAILABLE: ReasonSeverity.RATING_BLOCK,
+        GateReasonCode.SECURITY_INELIGIBLE: ReasonSeverity.RATING_BLOCK,
+        GateReasonCode.MISSING_CLAIM_LINEAGE: ReasonSeverity.OMISSION,
+        GateReasonCode.SEARCH_SNIPPET_INADMISSIBLE: ReasonSeverity.OMISSION,
+        GateReasonCode.INSUFFICIENT_CORROBORATION: ReasonSeverity.OMISSION,
+        GateReasonCode.UNRESOLVED_CONTRADICTION: ReasonSeverity.OMISSION,
+        GateReasonCode.REVIEWER_NOT_PASSED: _GLOBAL_AND_RATING,
+        GateReasonCode.REVIEWER_APPROVAL_MISSING: _GLOBAL_AND_RATING,
+        GateReasonCode.EDITOR_UNAPPROVED_CLAIM: _GLOBAL_AND_RATING,
+        GateReasonCode.EDITOR_SELECTION_MISSING: _GLOBAL_AND_RATING,
+        GateReasonCode.EXHIBIT_MISMATCH: _GLOBAL_AND_RATING,
+        GateReasonCode.INFERENCE_DISCLOSURE_MISSING: _GLOBAL_AND_RATING,
+        GateReasonCode.LOCAL_CONFIDENCE_WEAK: _GLOBAL_AND_RATING,
+        GateReasonCode.EVENT_OUTSIDE_MATERIALITY_WINDOW: ReasonSeverity.NONE,
+        GateReasonCode.EVENT_FRESHNESS_UNKNOWN: ReasonSeverity.NONE,
+        GateReasonCode.RESEARCH_CLAIMS_MISSING: _GLOBAL_AND_RATING,
+        GateReasonCode.APPROVED_CLAIM_UNKNOWN: _GLOBAL_AND_RATING,
+        GateReasonCode.EDITOR_CLAIM_UNKNOWN: _GLOBAL_AND_RATING,
+        GateReasonCode.RECOMMENDATION_EVIDENCE_MISSING: ReasonSeverity.RATING_BLOCK,
+    }
+)
+if set(_REASON_SEVERITY) != set(GateReasonCode):  # pragma: no cover - import guard
+    raise RuntimeError("quality reason severity taxonomy is incomplete")
+
+
+def reason_severity(reason: GateReasonCode) -> ReasonSeverity:
+    """Return the authoritative safety effects for a stable reason code."""
+    return _REASON_SEVERITY[GateReasonCode(reason)]
+
+
+def combined_reason_severity(
+    reasons: Iterable[GateReasonCode],
+) -> ReasonSeverity:
+    """Combine reason effects without depending on evaluation order."""
+    result = ReasonSeverity.NONE
+    for reason in reasons:
+        result |= reason_severity(reason)
+    return result
 
 
 def _aware(value: datetime) -> datetime:
@@ -681,6 +743,7 @@ class QualityGateResult(FrozenQualityContract):
 
     @model_validator(mode="after")
     def _safety_invariants(self) -> "QualityGateResult":
+        severity = combined_reason_severity(self.reason_codes)
         publishable = self.publication_verdict in {
             PublicationVerdict.FINAL,
             PublicationVerdict.PARTIAL,
@@ -704,6 +767,31 @@ class QualityGateResult(FrozenQualityContract):
             raise ValueError("inference metadata is inconsistent")
         if publishable and self.inference_mode is None:
             raise ValueError("publishable result requires inference disclosure")
+        if (
+            severity & ReasonSeverity.PUBLICATION_BLOCK
+            and self.publication_verdict is not PublicationVerdict.DRAFT
+        ):
+            raise ValueError("publication-blocking reason requires draft")
+        if severity & ReasonSeverity.RATING_BLOCK and (
+            self.effective_rating is not RecommendationRating.NO_RATING
+            or self.allow_sizing
+        ):
+            raise ValueError("rating-blocking reason requires no rating or sizing")
+        if self.publication_verdict is PublicationVerdict.FINAL and severity & (
+            ReasonSeverity.PUBLICATION_BLOCK
+            | ReasonSeverity.RATING_BLOCK
+            | ReasonSeverity.OMISSION
+        ):
+            raise ValueError("final result cannot contain a blocking reason")
+        if self.publication_verdict is PublicationVerdict.PARTIAL and not severity & (
+            ReasonSeverity.RATING_BLOCK | ReasonSeverity.OMISSION
+        ):
+            raise ValueError("partial result requires an omission reason")
+        if (
+            self.publication_verdict is PublicationVerdict.DRAFT
+            and not self.reason_codes
+        ):
+            raise ValueError("draft result requires a stable reason")
         if (
             self.effective_rating is RecommendationRating.NO_RATING
             and self.allow_sizing
@@ -1216,11 +1304,16 @@ def _merge_decisions(
             reasons.add(GateReasonCode.RECOMMENDATION_EVIDENCE_MISSING)
             block_rating = True
 
+    reason_effects = combined_reason_severity(reasons)
+    block_rating = block_rating or bool(reason_effects & ReasonSeverity.RATING_BLOCK)
+
     selected_sections = {
         _comparison_key(item.section) for key, item in lookup.items() if key in edited
     }
     selected_failures = blocked_sections & selected_sections
-    global_failure = any(decision.block_publication for decision in decisions)
+    global_failure = any(decision.block_publication for decision in decisions) or bool(
+        reason_effects & ReasonSeverity.PUBLICATION_BLOCK
+    )
     event_failure = any(decision.block_event for decision in decisions)
     critical_failure = False
     if data.publication_kind is PublicationKind.RECOMMENDATION:
@@ -1236,7 +1329,9 @@ def _merge_decisions(
     reviewer_passed = data.reviewer_verdict is ReviewVerdict.PASS
     if global_failure or critical_failure or not safe_keys or not reviewer_passed:
         publication = PublicationVerdict.DRAFT
-    elif selected_failures:
+    elif selected_failures or reason_effects & (
+        ReasonSeverity.RATING_BLOCK | ReasonSeverity.OMISSION
+    ):
         publication = PublicationVerdict.PARTIAL
     else:
         publication = PublicationVerdict.FINAL
@@ -1324,6 +1419,7 @@ __all__ = [
     "MarketPrice",
     "PortfolioFreshnessGate",
     "PriceFreshnessGate",
+    "ReasonSeverity",
     "ReviewerGate",
     "PublicationKind",
     "PublicationVerdict",
@@ -1333,6 +1429,8 @@ __all__ = [
     "QualityGateResult",
     "RecommendationGate",
     "SourceReference",
+    "combined_reason_severity",
     "evaluate_quality_gates",
     "price_is_fresh",
+    "reason_severity",
 ]

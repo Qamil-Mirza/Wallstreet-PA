@@ -629,7 +629,7 @@ def test_future_event_timestamp_is_rejected_and_window_boundary_is_exact():
     assert evaluate_quality_gates(expired).allow_event_report is False
 
 
-def test_event_report_with_stale_portfolio_can_still_be_final():
+def test_event_report_with_stale_portfolio_can_still_publish_partial():
     result = evaluate_quality_gates(
         request(
             publication_kind=PublicationKind.EVENT_REPORT,
@@ -641,7 +641,7 @@ def test_event_report_with_stale_portfolio_can_still_be_final():
     )
     assert result.allow_event_report is True
     assert result.allow_sizing is False
-    assert result.publication_verdict is PublicationVerdict.FINAL
+    assert result.publication_verdict is PublicationVerdict.PARTIAL
 
 
 def test_event_report_with_bad_event_lineage_is_not_allowed():
@@ -1161,7 +1161,7 @@ def test_unsupported_industry_claim_isolated_from_valid_recommendation():
         )
     )
     assert result.allowed_sections == ("recommendation",)
-    assert result.publication_verdict is PublicationVerdict.FINAL
+    assert result.publication_verdict is PublicationVerdict.PARTIAL
     assert result.effective_rating is RecommendationRating.BUY
     assert result.allow_sizing is True
 
@@ -1177,7 +1177,7 @@ def test_industry_contradiction_isolated_from_valid_recommendation():
         )
     )
     assert result.allowed_sections == ("recommendation",)
-    assert result.publication_verdict is PublicationVerdict.FINAL
+    assert result.publication_verdict is PublicationVerdict.PARTIAL
     assert result.effective_rating is RecommendationRating.BUY
 
 
@@ -1291,7 +1291,7 @@ def test_event_report_can_publish_supported_event_section_without_bad_industry()
     )
     assert result.allowed_sections == ("event",)
     assert result.allow_event_report is True
-    assert result.publication_verdict is PublicationVerdict.FINAL
+    assert result.publication_verdict is PublicationVerdict.PARTIAL
 
 
 def test_documented_gate_wrappers_delegate_to_one_engine():
@@ -1417,17 +1417,17 @@ def test_quality_result_canonicalizes_collections_and_roundtrips_json():
     payload = valid.model_dump()
     payload.update(
         reason_codes=(
-            GateReasonCode.PRICE_STALE,
-            GateReasonCode.PORTFOLIO_STALE,
-            GateReasonCode.PRICE_STALE,
+            GateReasonCode.EVENT_OUTSIDE_MATERIALITY_WINDOW,
+            GateReasonCode.EVENT_FRESHNESS_UNKNOWN,
+            GateReasonCode.EVENT_OUTSIDE_MATERIALITY_WINDOW,
         ),
         allowed_claim_ids=("CLAIM-1", "claim-1"),
         allowed_sections=("Recommendation",),
     )
     canonical = QualityGateResult.model_validate(payload)
     assert canonical.reason_codes == (
-        GateReasonCode.PORTFOLIO_STALE,
-        GateReasonCode.PRICE_STALE,
+        GateReasonCode.EVENT_FRESHNESS_UNKNOWN,
+        GateReasonCode.EVENT_OUTSIDE_MATERIALITY_WINDOW,
     )
     assert canonical.allowed_claim_ids == ("claim-1",)
     assert canonical.allowed_sections == ("recommendation",)
@@ -1529,3 +1529,67 @@ def test_critical_draft_never_retains_rating_or_sizing():
     assert result.publication_verdict is PublicationVerdict.DRAFT
     assert result.effective_rating is RecommendationRating.NO_RATING
     assert result.allow_sizing is False
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        GateReasonCode.REVIEWER_NOT_PASSED,
+        GateReasonCode.EDITOR_SELECTION_MISSING,
+        GateReasonCode.EXHIBIT_MISMATCH,
+        GateReasonCode.RECOMMENDATION_EVIDENCE_MISSING,
+        GateReasonCode.PRICE_STALE,
+        GateReasonCode.MISSING_CLAIM_LINEAGE,
+    ],
+)
+def test_quality_result_rejects_forged_final_with_blocking_reason(reason):
+    payload = evaluate_quality_gates(request()).model_dump()
+    payload["reason_codes"] = (reason,)
+    with pytest.raises(ValidationError):
+        QualityGateResult.model_validate(payload)
+
+
+def test_quality_result_verdict_requires_reason_severity_consistency():
+    valid = evaluate_quality_gates(request()).model_dump()
+    partial_without_reason = dict(valid, publication_verdict=PublicationVerdict.PARTIAL)
+    draft_without_reason = dict(
+        valid,
+        publication_verdict=PublicationVerdict.DRAFT,
+        effective_rating=RecommendationRating.NO_RATING,
+        allow_sizing=False,
+    )
+    global_partial = dict(
+        valid,
+        publication_verdict=PublicationVerdict.PARTIAL,
+        reason_codes=(GateReasonCode.REVIEWER_NOT_PASSED,),
+    )
+    for payload in (partial_without_reason, draft_without_reason, global_partial):
+        with pytest.raises(ValidationError):
+            QualityGateResult.model_validate(payload)
+
+
+def test_rating_blocker_can_retain_safe_non_rating_partial_report():
+    payload = evaluate_quality_gates(request()).model_dump()
+    payload.update(
+        publication_verdict=PublicationVerdict.PARTIAL,
+        reason_codes=(GateReasonCode.PORTFOLIO_STALE,),
+        effective_rating=RecommendationRating.NO_RATING,
+        allow_sizing=False,
+    )
+    result = QualityGateResult.model_validate(payload)
+    assert result.publication_verdict is PublicationVerdict.PARTIAL
+    assert result.effective_rating is RecommendationRating.NO_RATING
+
+
+def test_optional_omission_is_partial_but_keeps_safe_rating_subset():
+    unsupported = claim("claim-industry", section="industry", evidence=())
+    result = evaluate_quality_gates(
+        request(
+            claims=(claim(), unsupported),
+            reviewer_approved_claim_ids=("claim-1", "claim-industry"),
+            editor_claim_ids=("claim-1",),
+        )
+    )
+    assert result.publication_verdict is PublicationVerdict.PARTIAL
+    assert result.allowed_claim_ids == ("claim-1",)
+    assert result.effective_rating is RecommendationRating.BUY
