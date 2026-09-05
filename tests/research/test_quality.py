@@ -7,6 +7,7 @@ from decimal import Decimal
 import pytest
 from pydantic import ValidationError
 
+import news_bot.research.quality as quality_module
 from news_bot.research.agents.contracts import SecurityEligibility
 from news_bot.research.models import InferenceMode, RecommendationRating, ReviewVerdict
 from news_bot.research.quality import (
@@ -34,6 +35,7 @@ from news_bot.research.quality import (
     PublicationVerdict,
     QualityGateInput,
     QualityGatePolicy,
+    QualityGateResult,
     QualityGate,
     RecommendationGate,
     SourceReference,
@@ -1372,3 +1374,158 @@ def test_foundational_outputs_require_reviewer_pass(kind):
         request(publication_kind=kind, reviewer_verdict=ReviewVerdict.REVISE)
     )
     assert result.publication_verdict is PublicationVerdict.DRAFT
+
+
+def test_reused_evidence_id_requires_identical_admissibility_identity():
+    untrusted = source(
+        "issuer-doc", evidence_id="Shared-Evidence", stored=False, primary=False
+    )
+    forged = source(
+        "issuer-doc", evidence_id="shared-evidence", stored=True, primary=True
+    )
+    with pytest.raises(
+        ValidationError, match="evidence source mapping is inconsistent"
+    ):
+        request(
+            claims=(
+                claim("claim-a", evidence=(untrusted,)),
+                claim("claim-b", evidence=(forged,)),
+            ),
+            reviewer_approved_claim_ids=("claim-a", "claim-b"),
+            editor_claim_ids=("claim-a", "claim-b"),
+        )
+
+
+def test_canonical_source_requires_consistent_primary_and_storage_semantics():
+    first = source("Shared-Doc", evidence_id="passage-a", stored=False, primary=False)
+    second = source("shared-doc", evidence_id="passage-b", stored=True, primary=True)
+    with pytest.raises(
+        ValidationError, match="evidence source mapping is inconsistent"
+    ):
+        request(
+            claims=(
+                claim("claim-a", evidence=(first,)),
+                claim("claim-b", evidence=(second,)),
+            ),
+            reviewer_approved_claim_ids=("claim-a", "claim-b"),
+            editor_claim_ids=("claim-a", "claim-b"),
+        )
+
+
+def test_quality_result_canonicalizes_collections_and_roundtrips_json():
+    valid = evaluate_quality_gates(request())
+    payload = valid.model_dump()
+    payload.update(
+        reason_codes=(
+            GateReasonCode.PRICE_STALE,
+            GateReasonCode.PORTFOLIO_STALE,
+            GateReasonCode.PRICE_STALE,
+        ),
+        allowed_claim_ids=("CLAIM-1", "claim-1"),
+        allowed_sections=("Recommendation",),
+    )
+    canonical = QualityGateResult.model_validate(payload)
+    assert canonical.reason_codes == (
+        GateReasonCode.PORTFOLIO_STALE,
+        GateReasonCode.PRICE_STALE,
+    )
+    assert canonical.allowed_claim_ids == ("claim-1",)
+    assert canonical.allowed_sections == ("recommendation",)
+    assert QualityGateResult.model_validate_json(valid.model_dump_json()) == valid
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"portfolio_age_hours": Decimal("-1")},
+        {"portfolio_age_hours": Decimal("NaN")},
+        {"effective_rating": RecommendationRating.NO_RATING, "allow_sizing": True},
+        {"publication_verdict": PublicationVerdict.FINAL, "allowed_claim_ids": ()},
+        {"publication_verdict": PublicationVerdict.PARTIAL, "allowed_sections": ()},
+        {
+            "publication_verdict": PublicationVerdict.FINAL,
+            "review_verdict": ReviewVerdict.BLOCK,
+        },
+        {"publication_verdict": PublicationVerdict.DRAFT},
+        {"inference_mode": None, "inference_provider": "openai"},
+        {"inference_mode": InferenceMode.LOCAL_ONLY, "inference_model": None},
+    ],
+)
+def test_quality_result_rejects_impossible_direct_construction(changes):
+    payload = evaluate_quality_gates(request()).model_dump()
+    payload.update(changes)
+    with pytest.raises(ValidationError):
+        QualityGateResult.model_validate(payload)
+
+
+def test_price_freshness_public_helper_normalizes_exchange_like_component_gate():
+    assert (
+        price_is_fresh(date(2026, 8, 21), date(2026, 8, 24), exchange="nasdaq") is True
+    )
+    lower_price = request().price.model_copy(update={"exchange": "nasdaq"})
+    result = evaluate_quality_gates(request(price=lower_price))
+    assert GateReasonCode.PRICE_SESSION_UNKNOWN not in result.reason_codes
+
+
+def test_claim_sections_are_nfc_casefold_normalized_for_rating_and_rendering():
+    result = evaluate_quality_gates(request(claims=(claim(section="Recommendation"),)))
+    assert result.effective_rating is RecommendationRating.BUY
+    assert result.allowed_sections == ("recommendation",)
+
+
+def test_empty_reviewer_or_editor_sets_emit_stable_diagnostics():
+    no_review = evaluate_quality_gates(
+        request(reviewer_approved_claim_ids=(), editor_claim_ids=())
+    )
+    no_edit = evaluate_quality_gates(request(editor_claim_ids=()))
+    assert GateReasonCode.REVIEWER_APPROVAL_MISSING in no_review.reason_codes
+    assert GateReasonCode.EDITOR_SELECTION_MISSING in no_review.reason_codes
+    assert GateReasonCode.EDITOR_SELECTION_MISSING in no_edit.reason_codes
+    for result in (no_review, no_edit):
+        assert result.publication_verdict is PublicationVerdict.DRAFT
+        assert result.allowed_claim_ids == ()
+
+
+def test_immutable_mapping_contracts_roundtrip_their_own_json():
+    policy = QualityGatePolicy(
+        event_window_days_by_source={"NEWS": 9},
+        local_min_confidence=Decimal("0.75"),
+    )
+    row = CalculatedRow(row_id="ROW", values={"Revenue": Decimal("1.25")})
+    restored_policy = QualityGatePolicy.model_validate_json(policy.model_dump_json())
+    restored_row = CalculatedRow.model_validate_json(row.model_dump_json())
+    assert restored_policy == policy
+    assert restored_row == row
+    with pytest.raises(TypeError):
+        QualityGatePolicy(local_min_confidence="0.75")
+    with pytest.raises(ValidationError):
+        CalculatedRow(row_id="row", values={"revenue": "1.25"})
+    with pytest.raises(TypeError):
+        restored_policy.event_window_days_by_source["news"] = 1
+    with pytest.raises(TypeError):
+        restored_row.values["revenue"] = Decimal("2")
+
+
+def test_decision_merge_uses_order_independent_conservative_portfolio_age():
+    context = request()
+    younger = GateDecision(portfolio_age_hours=Decimal("1"))
+    older = GateDecision(portfolio_age_hours=Decimal("2"))
+    forward = quality_module._merge_decisions(context, (younger, older))
+    reverse = quality_module._merge_decisions(context, (older, younger))
+    assert forward == reverse
+    assert forward.portfolio_age_hours == Decimal("2")
+
+
+def test_critical_draft_never_retains_rating_or_sizing():
+    unsupported = claim("claim-industry", section="industry", evidence=())
+    result = evaluate_quality_gates(
+        request(
+            publication_kind=PublicationKind.FOUNDATIONAL_REPORT,
+            claims=(claim(), unsupported),
+            reviewer_approved_claim_ids=("claim-1", "claim-industry"),
+            editor_claim_ids=("claim-1",),
+        )
+    )
+    assert result.publication_verdict is PublicationVerdict.DRAFT
+    assert result.effective_rating is RecommendationRating.NO_RATING
+    assert result.allow_sizing is False

@@ -16,6 +16,7 @@ from pydantic import (
     Field,
     StrictBool,
     StrictInt,
+    ValidationInfo,
     field_serializer,
     field_validator,
     model_validator,
@@ -62,7 +63,9 @@ class GateReasonCode(str, Enum):
     INSUFFICIENT_CORROBORATION = "insufficient_corroboration"
     UNRESOLVED_CONTRADICTION = "unresolved_contradiction"
     REVIEWER_NOT_PASSED = "reviewer_not_passed"
+    REVIEWER_APPROVAL_MISSING = "reviewer_approval_missing"
     EDITOR_UNAPPROVED_CLAIM = "editor_unapproved_claim"
+    EDITOR_SELECTION_MISSING = "editor_selection_missing"
     EXHIBIT_MISMATCH = "exhibit_mismatch"
     INFERENCE_DISCLOSURE_MISSING = "inference_disclosure_missing"
     LOCAL_CONFIDENCE_WEAK = "local_confidence_weak"
@@ -115,10 +118,18 @@ def _sorted_unique(values: tuple[str, ...]) -> tuple[str, ...]:
 
 
 def _canonical_values(values: tuple[str, ...]) -> tuple[str, ...]:
-    by_key = {
-        _comparison_key(_identifier(value)): _identifier(value) for value in values
-    }
-    return tuple(by_key[key] for key in sorted(by_key))
+    by_key: dict[str, set[str]] = {}
+    for value in values:
+        normalized = _identifier(value)
+        by_key.setdefault(_comparison_key(normalized), set()).add(normalized)
+    return tuple(
+        next(iter(by_key[key])) if len(by_key[key]) == 1 else key
+        for key in sorted(by_key)
+    )
+
+
+def _canonical_categories(values: tuple[str, ...]) -> tuple[str, ...]:
+    return tuple(sorted({_source_category(value) for value in values}))
 
 
 class FrozenQualityContract(BaseModel):
@@ -141,15 +152,27 @@ class EvidenceReference(FrozenQualityContract):
     source_type: str
     stored: StrictBool
     primary: StrictBool
+    discovery_snippet: StrictBool = False
+    published_at: datetime | None = None
+    retrieved_at: datetime | None = None
 
     _evidence_id = field_validator("evidence_id")(_identifier)
     _source_id = field_validator("canonical_source_id")(_identifier)
     _source_family = field_validator("source_family")(_source_category)
     _source_type = field_validator("source_type")(_source_category)
 
+    @field_validator("published_at", "retrieved_at")
+    @classmethod
+    def _source_dates(cls, value: datetime | None) -> datetime | None:
+        return None if value is None else _aware(value)
+
     @property
     def admissible(self) -> bool:
-        return self.stored and self.source_type != "search_snippet"
+        return (
+            self.stored
+            and not self.discovery_snippet
+            and self.source_type != "search_snippet"
+        )
 
 
 SourceReference = EvidenceReference
@@ -166,7 +189,7 @@ class ClaimQualityInput(FrozenQualityContract):
     evidence: tuple[EvidenceReference, ...] = ()
 
     _claim_id = field_validator("claim_id")(_identifier)
-    _section = field_validator("section")(_identifier)
+    _section = field_validator("section")(_source_category)
 
     @field_validator("evidence")
     @classmethod
@@ -254,7 +277,7 @@ class CalculatedRow(FrozenQualityContract):
 
     @field_validator("values", mode="before")
     @classmethod
-    def _decimal_values(cls, value: object) -> object:
+    def _decimal_values(cls, value: object, info: ValidationInfo) -> object:
         if not isinstance(value, Mapping) or not value:
             raise ValueError("calculated row values must be a non-empty mapping")
         normalized: dict[str, Decimal] = {}
@@ -263,7 +286,15 @@ class CalculatedRow(FrozenQualityContract):
             if safe_key in normalized:
                 raise ValueError("calculated row keys contain a normalized duplicate")
             if not isinstance(amount, Decimal):
-                raise ValueError("calculated row values must be Decimal")
+                if info.mode == "json" and isinstance(amount, str):
+                    try:
+                        amount = Decimal(amount)
+                    except Exception:
+                        raise ValueError(
+                            "calculated row values must be Decimal"
+                        ) from None
+                else:
+                    raise ValueError("calculated row values must be Decimal")
             if not amount.is_finite():
                 raise ValueError("calculated row values must be finite")
             normalized[safe_key] = amount
@@ -288,7 +319,7 @@ class CalculatedExhibit(FrozenQualityContract):
     section: str = "calculated_exhibits"
 
     _exhibit_id = field_validator("exhibit_id")(_identifier)
-    _section = field_validator("section")(_identifier)
+    _section = field_validator("section")(_source_category)
 
     @field_validator("normalized_rows", "rendered_rows")
     @classmethod
@@ -460,8 +491,13 @@ class QualityGatePolicy(FrozenQualityContract):
 
     @field_validator("local_min_confidence", mode="before")
     @classmethod
-    def _decimal_policy(cls, value: object) -> object:
+    def _decimal_policy(cls, value: object, info: ValidationInfo) -> object:
         if not isinstance(value, Decimal):
+            if info.mode == "json" and isinstance(value, str):
+                try:
+                    return Decimal(value)
+                except Exception:
+                    raise ValueError("quality thresholds must be Decimal") from None
             raise TypeError("quality thresholds must be Decimal")
         return value
 
@@ -564,16 +600,27 @@ class QualityGateInput(FrozenQualityContract):
             <= claim_ids
         ):
             raise ValueError("contradictory claims must be included in claims")
-        evidence_sources: dict[str, tuple[str, str, str]] = {}
-        canonical_sources: dict[str, tuple[str, str]] = {}
+        evidence_sources: dict[str, tuple[object, ...]] = {}
+        canonical_sources: dict[str, tuple[object, ...]] = {}
         for item in self.claims:
             for reference in item.evidence:
+                for field_name, value in (
+                    ("evidence.published_at", reference.published_at),
+                    ("evidence.retrieved_at", reference.retrieved_at),
+                ):
+                    if value is not None and value > self.as_of:
+                        raise ValueError(f"{field_name} cannot be after as_of")
                 evidence_key = _comparison_key(reference.evidence_id)
                 canonical_key = _comparison_key(reference.canonical_source_id)
                 source_identity = (
                     canonical_key,
                     reference.source_family,
                     reference.source_type,
+                    reference.stored,
+                    reference.primary,
+                    reference.discovery_snippet,
+                    reference.published_at,
+                    reference.retrieved_at,
                 )
                 if (
                     evidence_key in evidence_sources
@@ -581,7 +628,15 @@ class QualityGateInput(FrozenQualityContract):
                 ):
                     raise ValueError("evidence source mapping is inconsistent")
                 evidence_sources[evidence_key] = source_identity
-                canonical_identity = (reference.source_family, reference.source_type)
+                canonical_identity = (
+                    reference.source_family,
+                    reference.source_type,
+                    reference.stored,
+                    reference.primary,
+                    reference.discovery_snippet,
+                    reference.published_at,
+                    reference.retrieved_at,
+                )
                 if (
                     canonical_key in canonical_sources
                     and canonical_sources[canonical_key] != canonical_identity
@@ -602,10 +657,64 @@ class QualityGateResult(FrozenQualityContract):
     publication_verdict: PublicationVerdict
     review_verdict: ReviewVerdict
     effective_rating: RecommendationRating
-    portfolio_age_hours: Decimal | None
+    portfolio_age_hours: Decimal | None = Field(
+        default=None, ge=Decimal("0"), allow_inf_nan=False
+    )
     inference_mode: InferenceMode | None
     inference_provider: str | None
     inference_model: str | None
+
+    @field_validator("reason_codes")
+    @classmethod
+    def _canonical_reasons(
+        cls, values: tuple[GateReasonCode, ...]
+    ) -> tuple[GateReasonCode, ...]:
+        return tuple(sorted(set(values), key=lambda value: value.value))
+
+    _canonical_sections = field_validator("allowed_sections")(_canonical_categories)
+    _canonical_claims = field_validator("allowed_claim_ids")(_canonical_values)
+
+    @field_validator("inference_provider", "inference_model")
+    @classmethod
+    def _optional_inference_text(cls, value: str | None) -> str | None:
+        return None if value is None else _text(value)
+
+    @model_validator(mode="after")
+    def _safety_invariants(self) -> "QualityGateResult":
+        publishable = self.publication_verdict in {
+            PublicationVerdict.FINAL,
+            PublicationVerdict.PARTIAL,
+        }
+        if bool(self.allowed_claim_ids) != bool(self.allowed_sections):
+            raise ValueError("allowed claims and sections must be coherent")
+        if publishable and (
+            self.review_verdict is not ReviewVerdict.PASS
+            or not self.allowed_claim_ids
+            or not self.allowed_sections
+        ):
+            raise ValueError("publishable result requires reviewed allowed content")
+        metadata_present = (
+            self.inference_provider is not None or self.inference_model is not None
+        )
+        if (self.inference_mode is None) != (not metadata_present):
+            raise ValueError("inference metadata is inconsistent")
+        if self.inference_mode is not None and (
+            self.inference_provider is None or self.inference_model is None
+        ):
+            raise ValueError("inference metadata is inconsistent")
+        if publishable and self.inference_mode is None:
+            raise ValueError("publishable result requires inference disclosure")
+        if (
+            self.effective_rating is RecommendationRating.NO_RATING
+            and self.allow_sizing
+        ):
+            raise ValueError("no-rating result cannot allow sizing")
+        if self.publication_verdict is PublicationVerdict.DRAFT and (
+            self.effective_rating is not RecommendationRating.NO_RATING
+            or self.allow_sizing
+        ):
+            raise ValueError("draft result cannot retain a rating or sizing")
+        return self
 
     @property
     def rating(self) -> RecommendationRating:
@@ -623,14 +732,16 @@ class GateDecision(FrozenQualityContract):
     block_sizing: StrictBool = False
     block_publication: StrictBool = False
     block_event: StrictBool = False
-    portfolio_age_hours: Decimal | None = None
+    portfolio_age_hours: Decimal | None = Field(
+        default=None, ge=Decimal("0"), allow_inf_nan=False
+    )
 
     @field_validator("reason_codes")
     @classmethod
     def _reasons(cls, values: tuple[GateReasonCode, ...]) -> tuple[GateReasonCode, ...]:
         return tuple(sorted(set(values), key=lambda value: value.value))
 
-    _sections = field_validator("affected_sections")(_canonical_values)
+    _sections = field_validator("affected_sections")(_canonical_categories)
     _claims = field_validator("rejected_claim_ids")(_canonical_values)
 
 
@@ -869,6 +980,8 @@ class ReviewerGate:
         reasons: set[GateReasonCode] = set()
         if data.reviewer_verdict is not ReviewVerdict.PASS:
             reasons.add(GateReasonCode.REVIEWER_NOT_PASSED)
+        if not approved:
+            reasons.add(GateReasonCode.REVIEWER_APPROVAL_MISSING)
         if not approved <= actual:
             reasons.add(GateReasonCode.APPROVED_CLAIM_UNKNOWN)
         failed = bool(reasons)
@@ -894,6 +1007,8 @@ class EditorGate:
         }
         edited = {_comparison_key(value) for value in data.editor_claim_ids}
         reasons: set[GateReasonCode] = set()
+        if not edited:
+            reasons.add(GateReasonCode.EDITOR_SELECTION_MISSING)
         if not edited <= actual:
             reasons.add(GateReasonCode.EDITOR_CLAIM_UNKNOWN)
         if not edited <= approved:
@@ -1032,13 +1147,9 @@ def price_is_fresh(
     ):
         raise TypeError("price_date and as_of_date must be dates")
     exchange_id = _identifier(exchange)
-    supplied = (
-        DEFAULT_EXCHANGE_CALENDARS.get(exchange_id) if calendar is None else calendar
-    )
     try:
-        schedule = (
-            None if supplied is None else ExchangeCalendar.model_validate(supplied)
-        )
+        schedules = _calendar_map(None if calendar is None else {exchange_id: calendar})
+        schedule = schedules.get(_comparison_key(exchange_id))
     except (TypeError, ValueError):
         return False
     if (
@@ -1130,6 +1241,9 @@ def _merge_decisions(
     else:
         publication = PublicationVerdict.FINAL
 
+    if publication is PublicationVerdict.DRAFT:
+        block_rating = True
+
     allowed_claim_ids = tuple(
         sorted((lookup[key].claim_id for key in safe_keys), key=_comparison_key)
     )
@@ -1156,14 +1270,12 @@ def _merge_decisions(
     else:
         allow_event_report = not event_failure
 
-    portfolio_age = next(
-        (
-            decision.portfolio_age_hours
-            for decision in decisions
-            if decision.portfolio_age_hours is not None
-        ),
-        None,
+    reported_ages = tuple(
+        decision.portfolio_age_hours
+        for decision in decisions
+        if decision.portfolio_age_hours is not None
     )
+    portfolio_age = max(reported_ages) if reported_ages else None
     inference = data.inference_disclosure
     return QualityGateResult(
         reason_codes=tuple(sorted(reasons, key=lambda reason: reason.value)),
