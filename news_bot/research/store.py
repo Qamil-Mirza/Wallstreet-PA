@@ -29,6 +29,51 @@ _MIGRATION_NAME = re.compile(r"^(?P<version>[0-9]+)_.+\.sql$")
 _AGENT_EXECUTION_LEASE = timedelta(minutes=15)
 _WORKFLOW_IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
+_PUBLICATION_OMISSION_CODES = frozenset({
+    "approved_claim_unknown",
+    "budget_deferred",
+    "calendar_coverage_unknown",
+    "deferred_by_stage",
+    "dry_run",
+    "editor_claim_unknown",
+    "editor_selection_missing",
+    "editor_unapproved_claim",
+    "event_freshness_unknown",
+    "event_outside_materiality_window",
+    "exhibit_mismatch",
+    "filing_status_unknown",
+    "inference_disclosure_missing",
+    "insufficient_corroboration",
+    "local_confidence_weak",
+    "missing_claim_lineage",
+    "no_material_event",
+    "omission_sanitized",
+    "portfolio_missing",
+    "portfolio_stale",
+    "price_currency_mismatch",
+    "price_missing",
+    "price_not_latest_session",
+    "price_not_trading_session",
+    "price_session_unknown",
+    "price_stale",
+    "publication_dry_run",
+    "publication_outcome_unknown",
+    "publication_quality_blocked",
+    "recommendation_evidence_missing",
+    "required_filing_unavailable",
+    "research_claims_missing",
+    "review_block",
+    "review_not_passed",
+    "review_requires_revision",
+    "review_revise",
+    "reviewer_approval_missing",
+    "reviewer_not_passed",
+    "search_snippet_inadmissible",
+    "security_ineligible",
+    "stage_execution_failed",
+    "task_lease_expired",
+    "unresolved_contradiction",
+})
 
 
 def _system_utc_now() -> datetime:
@@ -78,6 +123,77 @@ def _is_canonical_publication_outcome(
             "defer_reason": None,
             "quality_gate": None,
             "published_claim_ids": [],
+            "publication_receipt_hash": effect_receipt_hash,
+        }
+        canonical = json.dumps(
+            expected, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        )
+        return int(outcome_json == canonical)
+    except (RecursionError, TypeError, ValueError):
+        return 0
+
+
+def _is_canonical_publication_effect_outcome(
+    outcome_json: object,
+    result_ref: object,
+    effect_report_id: object,
+    effect_receipt_hash: object,
+) -> int:
+    """Validate an exact safe publish envelope with bounded audit metadata."""
+    try:
+        if not all(
+            isinstance(value, str)
+            for value in (
+                outcome_json, result_ref, effect_report_id, effect_receipt_hash
+            )
+        ):
+            return 0
+        if (
+            result_ref != effect_report_id
+            or _WORKFLOW_IDENTIFIER.fullmatch(result_ref) is None
+            or _SHA256.fullmatch(effect_receipt_hash) is None
+        ):
+            return 0
+        parsed = json.loads(outcome_json)
+        if not isinstance(parsed, dict):
+            return 0
+        new_agent_runs = parsed.get("new_agent_runs")
+        omissions = parsed.get("omissions")
+        published_claim_ids = parsed.get("published_claim_ids")
+        if type(new_agent_runs) is not int or new_agent_runs < 0:
+            return 0
+        if (
+            not isinstance(omissions, list)
+            or any(
+                not isinstance(code, str)
+                or code not in _PUBLICATION_OMISSION_CODES
+                for code in omissions
+            )
+            or omissions != sorted(set(omissions))
+        ):
+            return 0
+        if (
+            not isinstance(published_claim_ids, list)
+            or any(
+                not isinstance(claim_id, str)
+                or _WORKFLOW_IDENTIFIER.fullmatch(claim_id) is None
+                for claim_id in published_claim_ids
+            )
+            or published_claim_ids != sorted(set(published_claim_ids))
+        ):
+            return 0
+        expected = {
+            "result_ref": result_ref,
+            "result_hash": None,
+            "report_id": effect_report_id,
+            "new_agent_runs": new_agent_runs,
+            "material_event": None,
+            "omissions": omissions,
+            "reviewer_verdict": None,
+            "originating_role": None,
+            "defer_reason": None,
+            "quality_gate": None,
+            "published_claim_ids": published_claim_ids,
             "publication_receipt_hash": effect_receipt_hash,
         }
         canonical = json.dumps(
@@ -356,6 +472,12 @@ class ResearchStore:
             "is_canonical_publication_outcome",
             4,
             _is_canonical_publication_outcome,
+            deterministic=True,
+        )
+        connection.create_function(
+            "is_canonical_publication_effect_outcome",
+            4,
+            _is_canonical_publication_effect_outcome,
             deterministic=True,
         )
 

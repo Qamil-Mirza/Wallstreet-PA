@@ -363,6 +363,8 @@ class PublicationEffectView(FrozenWorkflowContract):
     state: PublicationEffectState
     report_id: str | None = None
     receipt_hash: str | None = None
+    result_hash: str | None = None
+    outcome: StageOutcome | None = None
 
     _key = field_validator("effect_key")(_hash)
     _workflow = field_validator("workflow_id")(_identifier)
@@ -374,12 +376,23 @@ class PublicationEffectView(FrozenWorkflowContract):
     def _receipt(cls, value: str | None) -> str | None:
         return None if value is None else _hash(value)
 
+    @field_validator("result_hash")
+    @classmethod
+    def _result_digest(cls, value: str | None) -> str | None:
+        return None if value is None else _hash(value)
+
     @model_validator(mode="after")
     def _receipt_state(self) -> "PublicationEffectView":
         known = self.state in {
             PublicationEffectState.CONFIRMED, PublicationEffectState.RECONCILED
         }
-        if known != (self.report_id is not None and self.receipt_hash is not None):
+        has_outcome = all(
+            value is not None
+            for value in (
+                self.report_id, self.receipt_hash, self.result_hash, self.outcome
+            )
+        )
+        if known != has_outcome:
             raise ValueError("publication receipt state is inconsistent")
         return self
 
@@ -801,12 +814,31 @@ class ResearchOrchestrator:
         with self.store.connect() as connection:
             row = connection.execute(
                 "SELECT effect_key, workflow_id, task_id, state, report_id, "
-                "receipt_hash FROM publication_effects WHERE effect_key = ?",
+                "receipt_hash, result_hash, outcome_json FROM publication_effects "
+                "WHERE effect_key = ?",
                 (_hash(effect_key),),
             ).fetchone()
         return None if row is None else PublicationEffectView(
             effect_key=row[0], workflow_id=row[1], task_id=row[2],
             state=PublicationEffectState(row[3]), report_id=row[4], receipt_hash=row[5],
+            result_hash=row[6],
+            outcome=(
+                None if row[7] is None else StageOutcome.model_validate_json(row[7])
+            ),
+        )
+
+    @staticmethod
+    def _safe_publication_outcome(outcome: StageOutcome) -> StageOutcome:
+        """Retain only safe publish audit fields in the durable effect."""
+        if outcome.report_id is None or outcome.publication_receipt_hash is None:
+            raise WorkflowConflict("publication receipt is missing")
+        return StageOutcome(
+            result_ref=outcome.report_id,
+            report_id=outcome.report_id,
+            new_agent_runs=outcome.new_agent_runs,
+            omissions=outcome.omissions,
+            published_claim_ids=outcome.published_claim_ids,
+            publication_receipt_hash=outcome.publication_receipt_hash,
         )
 
     @staticmethod
@@ -815,22 +847,18 @@ class ResearchOrchestrator:
         *,
         workflow_id: str,
         task_id: str,
-        report_id: str,
-        receipt_hash: str,
+        outcome: StageOutcome,
         completed_at: datetime,
     ) -> None:
-        outcome = StageOutcome(
-            result_ref=report_id,
-            report_id=report_id,
-            publication_receipt_hash=receipt_hash,
-        )
+        if outcome.report_id is None or outcome.publication_receipt_hash is None:
+            raise WorkflowConflict("publication receipt is missing")
         outcome_json = _json(outcome.model_dump(mode="json"))
         connection.execute(
             "UPDATE workflow_tasks SET state = 'completed', defer_reason = NULL, "
             "result_ref = ?, result_hash = ?, outcome_json = ?, lease_token = NULL, "
             "lease_expires_at = NULL, completed_at = ? WHERE workflow_id = ? "
             "AND task_id = ? AND stage = 'publish' AND state <> 'completed'",
-            (report_id, _digest(outcome.model_dump(mode="json")), outcome_json,
+            (outcome.report_id, _digest(outcome.model_dump(mode="json")), outcome_json,
              _utc_text(completed_at), workflow_id, task_id),
         )
 
@@ -852,11 +880,15 @@ class ResearchOrchestrator:
                 raise WorkflowConflict("publish task does not exist")
             state, attempts, maximum, task_expiry = task
             effect = connection.execute(
-                "SELECT state, claim_token, claim_expires_at, report_id, receipt_hash "
+                "SELECT state, claim_token, claim_expires_at, report_id, receipt_hash, "
+                "result_hash, outcome_json "
                 "FROM publication_effects WHERE effect_key = ?", (effect_key,),
             ).fetchone()
             if effect is not None:
-                effect_state, _, effect_expiry, report_id, receipt_hash = effect
+                (
+                    effect_state, _, effect_expiry, report_id, receipt_hash,
+                    result_hash, outcome_json,
+                ) = effect
                 if effect_state == "claimed":
                     if _parse_utc(effect_expiry) > now:
                         raise WorkflowBusy("publication effect is already claimed")
@@ -887,15 +919,16 @@ class ResearchOrchestrator:
                         state=PublicationEffectState.OUTCOME_UNKNOWN,
                     )
                 if effect_state in {"confirmed", "reconciled"}:
+                    outcome = StageOutcome.model_validate_json(outcome_json)
                     self._complete_publication_task(
                         connection, workflow_id=workflow_id, task_id=task_id,
-                        report_id=report_id, receipt_hash=receipt_hash,
-                        completed_at=now,
+                        outcome=outcome, completed_at=now,
                     )
                     return None, PublicationEffectView(
                         effect_key=effect_key, workflow_id=workflow_id,
                         task_id=task_id, state=PublicationEffectState(effect_state),
                         report_id=report_id, receipt_hash=receipt_hash,
+                        result_hash=result_hash, outcome=outcome,
                     )
             if state == "completed":
                 raise WorkflowConflict("completed publish task lacks a receipt")
@@ -961,17 +994,20 @@ class ResearchOrchestrator:
         if outcome.report_id is None or outcome.publication_receipt_hash is None:
             raise WorkflowConflict("publication receipt is missing")
         now = self._now()
+        outcome_json = _json(outcome.model_dump(mode="json"))
+        result_hash = _digest(outcome.model_dump(mode="json"))
         with self.store.transaction() as connection:
             cursor = connection.execute(
                 "UPDATE publication_effects SET state = 'confirmed', claim_token = NULL, "
-                "claim_expires_at = NULL, report_id = ?, receipt_hash = ?, updated_at = ? "
+                "claim_expires_at = NULL, report_id = ?, receipt_hash = ?, "
+                "outcome_json = ?, result_hash = ?, updated_at = ? "
                 "WHERE effect_key = ? AND state = 'claimed' AND claim_token = ? "
                 "AND claim_expires_at > ? AND EXISTS (SELECT 1 FROM workflow_tasks "
                 "WHERE task_id = ? AND state = 'running' AND lease_token = ? "
                 "AND lease_expires_at > ?)",
-                (outcome.report_id, outcome.publication_receipt_hash, _utc_text(now),
-                 effect.effect_key, claim.lease_token, _utc_text(now), claim.task_id,
-                 claim.lease_token, _utc_text(now)),
+                (outcome.report_id, outcome.publication_receipt_hash, outcome_json,
+                 result_hash, _utc_text(now), effect.effect_key, claim.lease_token,
+                 _utc_text(now), claim.task_id, claim.lease_token, _utc_text(now)),
             )
             if cursor.rowcount != 1:
                 raise WorkflowConflict("publication receipt lease is stale")
@@ -980,6 +1016,8 @@ class ResearchOrchestrator:
             task_id=effect.task_id, state=PublicationEffectState.CONFIRMED,
             report_id=outcome.report_id,
             receipt_hash=outcome.publication_receipt_hash,
+            result_hash=result_hash,
+            outcome=outcome,
         )
 
     def _mark_publication_unknown(
@@ -1011,27 +1049,41 @@ class ResearchOrchestrator:
         now = self._now()
         with self.store.transaction() as connection:
             row = connection.execute(
-                "SELECT workflow_id, task_id, state, report_id, receipt_hash "
+                "SELECT workflow_id, task_id, state, report_id, receipt_hash, "
+                "result_hash, outcome_json "
                 "FROM publication_effects WHERE effect_key = ?", (key,),
             ).fetchone()
             if row is None:
                 raise WorkflowConflict("publication effect does not exist")
-            workflow_id, task_id, state, stored_report, stored_receipt = row
+            (
+                workflow_id, task_id, state, stored_report, stored_receipt,
+                stored_result_hash, stored_outcome_json,
+            ) = row
             if state in {"confirmed", "reconciled"}:
                 if (stored_report, stored_receipt) != (report, receipt):
                     raise WorkflowConflict("publication receipt conflicts")
+                outcome = StageOutcome.model_validate_json(stored_outcome_json)
+                result_hash = stored_result_hash
             elif state != "outcome_unknown":
                 raise WorkflowConflict("publication effect is not reconcilable")
             else:
+                outcome = StageOutcome(
+                    result_ref=report,
+                    report_id=report,
+                    publication_receipt_hash=receipt,
+                )
+                outcome_json = _json(outcome.model_dump(mode="json"))
+                result_hash = _digest(outcome.model_dump(mode="json"))
                 connection.execute(
                     "UPDATE publication_effects SET state = 'reconciled', report_id = ?, "
-                    "receipt_hash = ?, updated_at = ? WHERE effect_key = ? "
+                    "receipt_hash = ?, outcome_json = ?, result_hash = ?, "
+                    "updated_at = ? WHERE effect_key = ? "
                     "AND state = 'outcome_unknown'",
-                    (report, receipt, _utc_text(now), key),
+                    (report, receipt, outcome_json, result_hash, _utc_text(now), key),
                 )
                 self._complete_publication_task(
                     connection, workflow_id=workflow_id, task_id=task_id,
-                    report_id=report, receipt_hash=receipt, completed_at=now,
+                    outcome=outcome, completed_at=now,
                 )
                 connection.execute(
                     "UPDATE workflow_runs SET state = 'running', completed_at = NULL, "
@@ -1042,7 +1094,8 @@ class ResearchOrchestrator:
             effect_key=key, workflow_id=workflow_id, task_id=task_id,
             state=(PublicationEffectState.RECONCILED
                    if state == "outcome_unknown" else PublicationEffectState(state)),
-            report_id=report, receipt_hash=receipt,
+            report_id=report, receipt_hash=receipt, result_hash=result_hash,
+            outcome=outcome,
         )
 
     def _task_rows(self, workflow_id: str) -> list[tuple[object, ...]]:
@@ -1260,7 +1313,15 @@ class ResearchOrchestrator:
                     PublicationEffectState.CONFIRMED,
                     PublicationEffectState.RECONCILED,
                 }:
-                    reports.add(publication_effect.report_id)
+                    recovered_outcome = publication_effect.outcome
+                    if recovered_outcome is None:  # pragma: no cover - model guard
+                        raise WorkflowConflict("publication outcome is missing")
+                    accumulated_runs += recovered_outcome.new_agent_runs
+                    omissions.update(recovered_outcome.omissions)
+                    partial_release = (
+                        partial_release or bool(recovered_outcome.omissions)
+                    )
+                    reports.add(recovered_outcome.report_id)
                     if publish_lease is not None:
                         self.release_lease(publish_lease)
                     continue
@@ -1289,13 +1350,13 @@ class ResearchOrchestrator:
                     PublicationEffectState.CONFIRMED,
                     PublicationEffectState.RECONCILED,
                 }:
-                    outcome = StageOutcome(
-                        result_ref=publication_effect.report_id,
-                        report_id=publication_effect.report_id,
-                        publication_receipt_hash=publication_effect.receipt_hash,
-                    )
+                    outcome = publication_effect.outcome
+                    if outcome is None:  # pragma: no cover - model guard
+                        raise WorkflowConflict("publication outcome is missing")
                 else:
                     outcome = StageOutcome.model_validate(self.runner.run(context))
+                if stage == "publish":
+                    outcome = self._safe_publication_outcome(outcome)
                 if stage == "publish" and (
                     not self._publication_allowed(outcome)
                     or not set(outcome.published_claim_ids)
@@ -1315,7 +1376,7 @@ class ResearchOrchestrator:
                     and publication_effect.state is PublicationEffectState.CLAIMED
                 ):
                     try:
-                        self._confirm_publication_effect(
+                        publication_effect = self._confirm_publication_effect(
                             publication_effect, claim, outcome
                         )
                     except WorkflowConflict:

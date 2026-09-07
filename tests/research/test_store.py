@@ -153,6 +153,49 @@ def test_publication_outcome_scalar_accepts_only_exact_canonical_envelope(tmp_pa
     assert rejected == [0] * len(invalid)
 
 
+def test_publication_effect_scalar_accepts_canonical_safe_audit_fields(tmp_path):
+    store = ResearchStore(tmp_path / "research.db")
+    report_id = "report-safe"
+    receipt_hash = "e" * 64
+    outcome = {
+        "result_ref": report_id,
+        "result_hash": None,
+        "report_id": report_id,
+        "new_agent_runs": 2,
+        "material_event": None,
+        "omissions": ["missing_claim_lineage"],
+        "reviewer_verdict": None,
+        "originating_role": None,
+        "defer_reason": None,
+        "quality_gate": None,
+        "published_claim_ids": ["claim-1"],
+        "publication_receipt_hash": receipt_hash,
+    }
+    canonical = json.dumps(
+        outcome, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    )
+    unsafe_omission = canonical.replace(
+        "missing_claim_lineage", "sk_private"
+    )
+    unsorted_claims = canonical.replace(
+        '["claim-1"]', '["claim-2","claim-1"]'
+    )
+
+    with store.connect() as connection:
+        assert connection.execute(
+            "SELECT is_canonical_publication_effect_outcome(?, ?, ?, ?)",
+            (canonical, report_id, report_id, receipt_hash),
+        ).fetchone() == (1,)
+        assert connection.execute(
+            "SELECT is_canonical_publication_effect_outcome(?, ?, ?, ?)",
+            (unsafe_omission, report_id, report_id, receipt_hash),
+        ).fetchone() == (0,)
+        assert connection.execute(
+            "SELECT is_canonical_publication_effect_outcome(?, ?, ?, ?)",
+            (unsorted_claims, report_id, report_id, receipt_hash),
+        ).fetchone() == (0,)
+
+
 def test_relationship_cannot_be_sealed_without_matching_lineage(migrated_store):
     created_at = "2026-08-24T00:00:00.000000Z"
     with migrated_store.transaction() as connection:
@@ -199,7 +242,7 @@ def test_migration_is_idempotent_and_recorded_once(tmp_path):
         rows = connection.execute(
             "SELECT version, name, applied_at FROM schema_migrations"
         ).fetchall()
-    assert len(rows) == 12
+    assert len(rows) == 13
     assert rows[0][0:2] == (1, "001_initial.sql")
     assert rows[1][0:2] == (2, "002_nullable_portfolio_freshness.sql")
     assert rows[2][0:2] == (3, "003_claim_dependencies.sql")
@@ -212,6 +255,7 @@ def test_migration_is_idempotent_and_recorded_once(tmp_path):
     assert rows[9][0:2] == (10, "010_publication_receipt_recovery.sql")
     assert rows[10][0:2] == (11, "011_bind_publication_receipts.sql")
     assert rows[11][0:2] == (12, "012_canonical_publication_outcomes.sql")
+    assert rows[12][0:2] == (13, "013_publication_effect_outcomes.sql")
     assert all(row[2].endswith("Z") for row in rows)
 
 
@@ -318,7 +362,7 @@ def test_existing_v1_database_upgrades_nullable_freshness_without_data_loss(
 
     assert versions == [
         (1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,), (10,),
-        (11,), (12,),
+        (11,), (12,), (13,),
     ]
     assert stored_snapshot == snapshot_row
     assert stored_security == security_row
@@ -391,7 +435,7 @@ def test_existing_v2_claims_upgrade_with_lineage_anchor_without_data_loss(
         foreign_key_errors = connection.execute("PRAGMA foreign_key_check").fetchall()
     assert versions == [
         (1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,), (10,),
-        (11,), (12,),
+        (11,), (12,), (13,),
     ]
     assert retained_evidence == [("passage-1", stance)]
     if stance == "supports":
@@ -492,7 +536,7 @@ def test_populated_v3_relationship_upgrade_preserves_and_quarantines_legacy_data
 
     assert versions == [
         (1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,), (10,),
-        (11,), (12,),
+        (11,), (12,), (13,),
     ]
     assert relationship == (
         source_entity_id,
@@ -586,7 +630,7 @@ def test_populated_v4_database_upgrades_agent_audit_without_data_loss(
         ).fetchall()
     assert versions == [
         (1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,), (10,),
-        (11,), (12,),
+        (11,), (12,), (13,),
     ]
     assert legacy == [("legacy-run", "legacy-task", "completed")]
     assert {"agent_executions", "provider_attempts"} <= upgraded.table_names()
@@ -677,7 +721,7 @@ def test_populated_v5_database_upgrades_replay_lease_without_data_loss(
         ).fetchall()
     assert versions == [
         (1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,), (10,),
-        (11,), (12,),
+        (11,), (12,), (13,),
     ]
     assert execution == ("succeeded", "e" * 64, None, None, None)
     assert provider_attempt == ("ollama", "legacy", 3, 2, 1, 1)
@@ -815,7 +859,7 @@ def test_populated_v6_database_upgrades_workflow_instances_without_data_loss(
 
     assert versions == [
         (1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,), (10,),
-        (11,), (12,),
+        (11,), (12,), (13,),
     ]
     assert instances == [
         ("v6-workflow-one", "completed", 1),
@@ -1220,6 +1264,7 @@ def test_built_wheel_contains_and_applies_all_migrations(tmp_path):
         "news_bot/research/migrations/010_publication_receipt_recovery.sql",
         "news_bot/research/migrations/011_bind_publication_receipts.sql",
         "news_bot/research/migrations/012_canonical_publication_outcomes.sql",
+        "news_bot/research/migrations/013_publication_effect_outcomes.sql",
     }
     prompt_names = {
         "news_bot/research/prompts/director.md",
@@ -1249,7 +1294,8 @@ def test_built_wheel_contains_and_applies_all_migrations(tmp_path):
         "'009_workflow_recovery_publication.sql', "
         "'010_publication_receipt_recovery.sql', "
         "'011_bind_publication_receipts.sql', "
-        "'012_canonical_publication_outcomes.sql'}; "
+        "'012_canonical_publication_outcomes.sql', "
+        "'013_publication_effect_outcomes.sql'}; "
         "prompt_dir = resources.files('news_bot.research').joinpath('prompts'); "
         "assert {p.name for p in prompt_dir.iterdir()} >= "
         "{'director.md', 'emerging_scout.md', 'event_scout.md', "
@@ -1263,7 +1309,7 @@ def test_built_wheel_contains_and_applies_all_migrations(tmp_path):
         "assert connection.execute('SELECT version FROM schema_migrations "
         "ORDER BY version').fetchall() == "
         "[(1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,), (10,), "
-        "(11,), (12,)]; "
+        "(11,), (12,), (13,)]; "
         "connection.close()"
     )
     subprocess.run(
@@ -1277,7 +1323,7 @@ def test_built_wheel_contains_and_applies_all_migrations(tmp_path):
 
 def test_failed_multi_statement_migration_is_atomic(tmp_path, monkeypatch):
     store = make_migrated_store(tmp_path)
-    bad_migration = tmp_path / "013_broken.sql"
+    bad_migration = tmp_path / "014_broken.sql"
     bad_migration.write_text(
         "CREATE TABLE should_roll_back (id INTEGER);\n"
         "INSERT INTO missing_table (id) VALUES (1);\n",
@@ -1298,7 +1344,7 @@ def test_failed_multi_statement_migration_is_atomic(tmp_path, monkeypatch):
         ).fetchall()
     assert versions == [
         (1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,), (10,),
-        (11,), (12,),
+        (11,), (12,), (13,),
     ]
 
 
