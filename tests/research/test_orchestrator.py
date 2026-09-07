@@ -541,7 +541,7 @@ def test_populated_v7_database_upgrades_without_data_loss(
         ).fetchone()
         fk_errors = connection.execute("PRAGMA foreign_key_check").fetchall()
 
-    assert versions == [(1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,)]
+    assert versions == [(1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,), (10,)]
     assert legacy_row == ("evidence", "pending")
     assert fk_errors == []
 
@@ -832,7 +832,7 @@ def test_populated_v8_workflow_upgrades_to_v9_without_data_loss(
         ).fetchall()
 
     assert row == ("daily", "completed")
-    assert versions[-1] == (9,)
+    assert versions[-1] == (10,)
 
 
 def test_migration_009_failure_rolls_back_publication_schema(
@@ -882,3 +882,171 @@ def test_failed_task_reason_is_immutable_until_repository_retry(
             "UPDATE workflow_tasks SET defer_reason = 'changed' WHERE task_id = ?",
             (failed.task_id,),
         )
+
+
+def test_expired_publish_intent_reconcile_bypasses_attempt_limit_without_recall(
+    tmp_path: Path,
+) -> None:
+    now = [utc()]
+    store = ResearchStore(tmp_path / "research.db", clock=lambda: now[0])
+    store.migrate()
+
+    class CrashingPublisher(RecordingRunner):
+        def run(self, context: StageContext) -> StageOutcome:
+            try:
+                return super().run(context)
+            except KeyboardInterrupt:
+                if context.stage == "publish":
+                    now[0] += timedelta(minutes=15)
+                raise
+
+    runner = CrashingPublisher({"publish": [KeyboardInterrupt()]})
+    first = ResearchOrchestrator(store, runner, owner_id="owner-a")
+    with pytest.raises(KeyboardInterrupt):
+        first.run_weekly(as_of=utc(), source_hashes=("a" * 64,))
+    effect_key = next(
+        call.publication_effect_key for call in runner.calls if call.stage == "publish"
+    )
+    assert effect_key is not None
+
+    deferred = ResearchOrchestrator(store, runner, owner_id="owner-b").run_weekly(
+        as_of=utc(), source_hashes=("a" * 64,)
+    )
+    publish_task = next(
+        task for task in first.list_tasks(deferred.workflow_id)
+        if task.stage == "publish"
+    )
+    assert deferred.status is WorkflowRunState.DEFERRED
+    assert publish_task.attempt_count == 1
+    assert [call.stage for call in runner.calls].count("publish") == 1
+
+    first.reconcile_publication(
+        effect_key, report_id="report-reconciled", receipt_hash="f" * 64
+    )
+    completed = ResearchOrchestrator(store, runner, owner_id="owner-c").run_weekly(
+        as_of=utc(), source_hashes=("a" * 64,)
+    )
+
+    assert completed.status is WorkflowRunState.COMPLETED
+    assert completed.report_ids == ("report-reconciled",)
+    assert [call.stage for call in runner.calls].count("publish") == 1
+    assert next(
+        task for task in first.list_tasks(completed.workflow_id)
+        if task.stage == "publish"
+    ).attempt_count == 1
+
+
+def test_populated_v9_unknown_receipt_state_upgrades_to_v10(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = tmp_path / "v9.db"
+    root = Path(__file__).resolve().parents[2] / "news_bot/research/migrations"
+    names = tuple(f"{number:03d}_" for number in range(1, 10))
+    files = tuple(
+        path for prefix in names for path in root.iterdir()
+        if path.name.startswith(prefix)
+    )
+    legacy = ResearchStore(database)
+    monkeypatch.setattr(legacy, "_migration_files", lambda: files)
+    legacy.migrate()
+    timestamp = "2026-08-24T00:00:00.000000Z"
+    with legacy.transaction() as connection:
+        connection.execute(
+            "INSERT INTO workflow_runs (workflow_id, idempotency_key, workflow_kind, "
+            "period_key, as_of, source_hashes_json, definition_hash, state, dry_run, "
+            "authorize_analysis, created_at, updated_at, completed_at) VALUES "
+            "('wf_v9', ?, 'weekly', '2026-W35', ?, '[]', ?, 'deferred', 0, 0, ?, ?, ?)",
+            ("a" * 64, timestamp, "b" * 64, timestamp, timestamp, timestamp),
+        )
+        connection.execute(
+            "INSERT INTO workflow_tasks (task_id, workflow_id, idempotency_key, stage, "
+            "ordinal, state, attempt_count, max_attempts, assigned_role, "
+            "originating_role, defer_reason, created_at, completed_at) VALUES "
+            "('wft_v9', 'wf_v9', ?, 'publish', 0, 'deferred', 1, 2, "
+            "'research_editor', 'research_editor', 'publication_outcome_unknown', ?, ?)",
+            ("c" * 64, timestamp, timestamp),
+        )
+        connection.execute(
+            "INSERT INTO publication_effects (publication_effect_id, effect_key, "
+            "workflow_id, task_id, state, created_at, updated_at) VALUES "
+            "('pub_v9', ?, 'wf_v9', 'wft_v9', 'outcome_unknown', ?, ?)",
+            ("d" * 64, timestamp, timestamp),
+        )
+
+    upgraded = ResearchStore(database)
+    upgraded.migrate()
+    with upgraded.connect() as connection:
+        assert connection.execute(
+            "SELECT state, attempt_count FROM workflow_tasks WHERE task_id = 'wft_v9'"
+        ).fetchone() == ("deferred", 1)
+        assert connection.execute(
+            "SELECT state FROM publication_effects WHERE publication_effect_id = 'pub_v9'"
+        ).fetchone() == ("outcome_unknown",)
+        assert connection.execute(
+            "SELECT MAX(version) FROM schema_migrations"
+        ).fetchone() == (10,)
+
+
+def test_migration_010_failure_is_atomic(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = tmp_path / "v10-rollback.db"
+    root = Path(__file__).resolve().parents[2] / "news_bot/research/migrations"
+    files = tuple(
+        path for number in range(1, 10) for path in root.iterdir()
+        if path.name.startswith(f"{number:03d}_")
+    )
+    legacy = ResearchStore(database)
+    monkeypatch.setattr(legacy, "_migration_files", lambda: files)
+    legacy.migrate()
+    broken = tmp_path / "010_broken.sql"
+    broken.write_text(
+        "DROP TRIGGER workflow_tasks_transition_guard;\n"
+        "INSERT INTO missing_table VALUES (1);\n", encoding="utf-8",
+    )
+    attempted = ResearchStore(database)
+    monkeypatch.setattr(attempted, "_migration_files", lambda: (*files, broken))
+
+    with pytest.raises(sqlite3.OperationalError):
+        attempted.migrate()
+    with attempted.connect() as connection:
+        assert connection.execute(
+            "SELECT MAX(version) FROM schema_migrations"
+        ).fetchone() == (9,)
+        assert connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'trigger' "
+            "AND name = 'workflow_tasks_transition_guard'"
+        ).fetchone() == ("workflow_tasks_transition_guard",)
+
+
+def test_publish_lock_conflict_does_not_consume_external_attempt(
+    store: ResearchStore,
+) -> None:
+    runner = RecordingRunner()
+    orchestrator = ResearchOrchestrator(store, runner, owner_id="owner-a")
+    original = orchestrator.acquire_lease
+    held = None
+
+    def conflict_on_publish(name: str, **kwargs):
+        nonlocal held
+        if name.startswith("publish:"):
+            blocker = ResearchOrchestrator(store, runner, owner_id="owner-b")
+            held = original(name, **kwargs)
+            return blocker.acquire_lease(name, **kwargs)
+        return original(name, **kwargs)
+
+    orchestrator.acquire_lease = conflict_on_publish  # type: ignore[method-assign]
+    with pytest.raises(WorkflowBusy):
+        orchestrator.run_weekly(as_of=utc(), source_hashes=("a" * 64,))
+    publish = next(call for call in runner.calls if call.stage == "review")
+    workflow_id = publish.workflow_id
+    publish_task = next(
+        task for task in orchestrator.list_tasks(workflow_id) if task.stage == "publish"
+    )
+    with store.connect() as connection:
+        effects = connection.execute("SELECT COUNT(*) FROM publication_effects").fetchone()
+
+    assert publish_task.attempt_count == 0
+    assert effects == (0,)
+    assert held is not None
+    ResearchOrchestrator(store, runner, owner_id="owner-a").release_lease(held)

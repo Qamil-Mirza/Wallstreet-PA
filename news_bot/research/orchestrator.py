@@ -809,57 +809,150 @@ class ResearchOrchestrator:
             state=PublicationEffectState(row[3]), report_id=row[4], receipt_hash=row[5],
         )
 
-    def _claim_publication_effect(
-        self, workflow_id: str, claim: TaskClaim
-    ) -> PublicationEffectView:
-        effect_key = self._publication_key(workflow_id, claim.task_id)
+    @staticmethod
+    def _complete_publication_task(
+        connection: sqlite3.Connection,
+        *,
+        workflow_id: str,
+        task_id: str,
+        report_id: str,
+        receipt_hash: str,
+        completed_at: datetime,
+    ) -> None:
+        outcome = StageOutcome(
+            result_ref=report_id,
+            report_id=report_id,
+            publication_receipt_hash=receipt_hash,
+        )
+        outcome_json = _json(outcome.model_dump(mode="json"))
+        connection.execute(
+            "UPDATE workflow_tasks SET state = 'completed', defer_reason = NULL, "
+            "result_ref = ?, result_hash = ?, outcome_json = ?, lease_token = NULL, "
+            "lease_expires_at = NULL, completed_at = ? WHERE workflow_id = ? "
+            "AND task_id = ? AND stage = 'publish' AND state <> 'completed'",
+            (report_id, _digest(outcome.model_dump(mode="json")), outcome_json,
+             _utc_text(completed_at), workflow_id, task_id),
+        )
+
+    def _prepare_publication_task(
+        self, workflow_id: str, task_id: str
+    ) -> tuple[TaskClaim | None, PublicationEffectView]:
+        """Inspect receipt state before atomically consuming an external attempt."""
+        effect_key = self._publication_key(workflow_id, task_id)
         now = self._now()
+        expires = now + self.lease_duration
+        token = secrets.token_hex(32)
         with self.store.transaction() as connection:
-            row = connection.execute(
+            task = connection.execute(
+                "SELECT state, attempt_count, max_attempts, lease_expires_at "
+                "FROM workflow_tasks WHERE workflow_id = ? AND task_id = ? "
+                "AND stage = 'publish'", (workflow_id, task_id),
+            ).fetchone()
+            if task is None:
+                raise WorkflowConflict("publish task does not exist")
+            state, attempts, maximum, task_expiry = task
+            effect = connection.execute(
                 "SELECT state, claim_token, claim_expires_at, report_id, receipt_hash "
                 "FROM publication_effects WHERE effect_key = ?", (effect_key,),
             ).fetchone()
-            if row is None:
-                connection.execute(
-                    "INSERT INTO publication_effects (publication_effect_id, effect_key, "
-                    "workflow_id, task_id, state, claim_token, claim_expires_at, "
-                    "created_at, updated_at) VALUES (?, ?, ?, ?, 'claimed', ?, ?, ?, ?)",
-                    (f"pub_{effect_key[:40]}", effect_key, workflow_id, claim.task_id,
-                     claim.lease_token, _utc_text(claim.lease_expires_at),
-                     _utc_text(now), _utc_text(now)),
-                )
-                state, report_id, receipt_hash = "claimed", None, None
-            else:
-                state, old_token, old_expiry, report_id, receipt_hash = row
-                if state == "claimed" and _parse_utc(old_expiry) <= now:
+            if effect is not None:
+                effect_state, _, effect_expiry, report_id, receipt_hash = effect
+                if effect_state == "claimed":
+                    if _parse_utc(effect_expiry) > now:
+                        raise WorkflowBusy("publication effect is already claimed")
                     connection.execute(
                         "UPDATE publication_effects SET state = 'outcome_unknown', "
                         "claim_token = NULL, claim_expires_at = NULL, updated_at = ? "
-                        "WHERE effect_key = ? AND state = 'claimed' AND claim_expires_at <= ?",
+                        "WHERE effect_key = ? AND state = 'claimed' "
+                        "AND claim_expires_at <= ?",
                         (_utc_text(now), effect_key, _utc_text(now)),
                     )
-                    connection.execute(
-                        "UPDATE workflow_tasks SET state = 'deferred', "
-                        "defer_reason = 'publication_outcome_unknown', lease_token = NULL, "
-                        "lease_expires_at = NULL, completed_at = ? WHERE task_id = ? "
-                        "AND state = 'running' AND lease_token = ?",
-                        (_utc_text(now), claim.task_id, claim.lease_token),
-                    )
-                    state = "outcome_unknown"
-                elif state == "claimed" and old_token != claim.lease_token:
-                    raise WorkflowBusy("publication effect is already claimed")
-                elif state == "outcome_unknown":
+                    effect_state = "outcome_unknown"
+                if effect_state == "outcome_unknown":
+                    if state == "running" and (
+                        task_expiry is None or _parse_utc(task_expiry) > now
+                    ):
+                        raise WorkflowBusy("publication task is already claimed")
                     connection.execute(
                         "UPDATE workflow_tasks SET state = 'deferred', "
                         "defer_reason = 'publication_outcome_unknown', "
                         "lease_token = NULL, lease_expires_at = NULL, completed_at = ? "
-                        "WHERE task_id = ? AND state = 'running' AND lease_token = ?",
-                        (_utc_text(now), claim.task_id, claim.lease_token),
+                        "WHERE workflow_id = ? AND task_id = ? "
+                        "AND state IN ('pending', 'running', 'failed')",
+                        (_utc_text(now), workflow_id, task_id),
                     )
-        return PublicationEffectView(
-            effect_key=effect_key, workflow_id=workflow_id, task_id=claim.task_id,
-            state=PublicationEffectState(state), report_id=report_id,
-            receipt_hash=receipt_hash,
+                    return None, PublicationEffectView(
+                        effect_key=effect_key, workflow_id=workflow_id,
+                        task_id=task_id,
+                        state=PublicationEffectState.OUTCOME_UNKNOWN,
+                    )
+                if effect_state in {"confirmed", "reconciled"}:
+                    self._complete_publication_task(
+                        connection, workflow_id=workflow_id, task_id=task_id,
+                        report_id=report_id, receipt_hash=receipt_hash,
+                        completed_at=now,
+                    )
+                    return None, PublicationEffectView(
+                        effect_key=effect_key, workflow_id=workflow_id,
+                        task_id=task_id, state=PublicationEffectState(effect_state),
+                        report_id=report_id, receipt_hash=receipt_hash,
+                    )
+            if state == "completed":
+                raise WorkflowConflict("completed publish task lacks a receipt")
+            if state == "running":
+                if task_expiry is not None and _parse_utc(task_expiry) > now:
+                    raise WorkflowBusy("publication task is already claimed")
+                connection.execute(
+                    "UPDATE workflow_tasks SET state = 'failed', "
+                    "defer_reason = 'task_lease_expired', lease_token = NULL, "
+                    "lease_expires_at = NULL, completed_at = ? WHERE workflow_id = ? "
+                    "AND task_id = ? AND state = 'running' AND lease_expires_at <= ?",
+                    (_utc_text(now), workflow_id, task_id, _utc_text(now)),
+                )
+                state = "failed"
+            if state == "deferred":
+                raise WorkflowConflict("publication task is deferred")
+            if attempts >= maximum:
+                raise WorkflowConflict("publication task attempts are exhausted")
+            if state == "failed":
+                connection.execute(
+                    "UPDATE workflow_tasks SET state = 'pending', defer_reason = NULL, "
+                    "completed_at = NULL WHERE workflow_id = ? AND task_id = ? "
+                    "AND state = 'failed'", (workflow_id, task_id),
+                )
+            blocked = connection.execute(
+                "SELECT 1 FROM workflow_task_dependencies AS dependency "
+                "JOIN workflow_tasks AS required "
+                "ON required.task_id = dependency.dependency_task_id "
+                "WHERE dependency.workflow_id = ? AND dependency.task_id = ? "
+                "AND required.state <> 'completed' LIMIT 1",
+                (workflow_id, task_id),
+            ).fetchone()
+            if blocked is not None:
+                raise WorkflowConflict("publication dependencies are incomplete")
+            connection.execute(
+                "UPDATE workflow_tasks SET state = 'running', "
+                "attempt_count = attempt_count + 1, lease_token = ?, "
+                "lease_expires_at = ?, started_at = COALESCE(started_at, ?) "
+                "WHERE workflow_id = ? AND task_id = ? AND state = 'pending' "
+                "AND attempt_count = ?",
+                (token, _utc_text(expires), _utc_text(now), workflow_id,
+                 task_id, attempts),
+            )
+            connection.execute(
+                "INSERT INTO publication_effects (publication_effect_id, effect_key, "
+                "workflow_id, task_id, state, claim_token, claim_expires_at, "
+                "created_at, updated_at) VALUES (?, ?, ?, ?, 'claimed', ?, ?, ?, ?)",
+                (f"pub_{effect_key[:40]}", effect_key, workflow_id, task_id,
+                 token, _utc_text(expires), _utc_text(now), _utc_text(now)),
+            )
+        claim = TaskClaim(
+            task_id=task_id, lease_token=token, attempt_count=attempts + 1,
+            lease_expires_at=expires,
+        )
+        return claim, PublicationEffectView(
+            effect_key=effect_key, workflow_id=workflow_id, task_id=task_id,
+            state=PublicationEffectState.CLAIMED,
         )
 
     def _confirm_publication_effect(
@@ -936,11 +1029,9 @@ class ResearchOrchestrator:
                     "AND state = 'outcome_unknown'",
                     (report, receipt, _utc_text(now), key),
                 )
-                connection.execute(
-                    "UPDATE workflow_tasks SET state = 'pending', defer_reason = NULL, "
-                    "completed_at = NULL WHERE task_id = ? AND state = 'deferred' "
-                    "AND defer_reason = 'publication_outcome_unknown'",
-                    (task_id,),
+                self._complete_publication_task(
+                    connection, workflow_id=workflow_id, task_id=task_id,
+                    report_id=report, receipt_hash=receipt, completed_at=now,
                 )
                 connection.execute(
                     "UPDATE workflow_runs SET state = 'running', completed_at = NULL, "
@@ -1137,21 +1228,44 @@ class ResearchOrchestrator:
                 omissions.add("publication_dry_run")
                 terminal = WorkflowRunState.PARTIAL
                 continue
+            publication_effect: PublicationEffectView | None = None
+            publish_lease: WorkflowLease | None = None
+            if stage == "publish":
+                publish_lease = self.acquire_lease(
+                    f"publish:{workflow_id}", workflow_id=workflow_id
+                )
             try:
-                claim = self.claim_task(workflow_id, task_id)
+                if stage == "publish":
+                    claim, publication_effect = self._prepare_publication_task(
+                        workflow_id, task_id
+                    )
+                else:
+                    claim = self.claim_task(workflow_id, task_id)
             except WorkflowBusy:
+                if publish_lease is not None:
+                    self.release_lease(publish_lease)
                 raise
             except WorkflowConflict:
+                if publish_lease is not None:
+                    self.release_lease(publish_lease)
                 terminal = WorkflowRunState.FAILED
                 break
-            publication_effect: PublicationEffectView | None = None
-            if stage == "publish":
-                publication_effect = self._claim_publication_effect(
-                    workflow_id, claim
-                )
+            if publication_effect is not None:
                 if publication_effect.state is PublicationEffectState.OUTCOME_UNKNOWN:
+                    if publish_lease is not None:
+                        self.release_lease(publish_lease)
                     terminal = WorkflowRunState.DEFERRED
                     break
+                if publication_effect.state in {
+                    PublicationEffectState.CONFIRMED,
+                    PublicationEffectState.RECONCILED,
+                }:
+                    reports.add(publication_effect.report_id)
+                    if publish_lease is not None:
+                        self.release_lease(publish_lease)
+                    continue
+            if claim is None:  # pragma: no cover - guarded by effect states above
+                raise WorkflowConflict("publication preflight did not claim work")
             context = StageContext(
                 workflow_id=workflow_id, workflow_kind=kind, task_id=task_id,
                 stage=stage, as_of=as_of, period_key=period_key,
@@ -1170,12 +1284,7 @@ class ResearchOrchestrator:
                 ),
                 task_lease_token=claim.lease_token,
             )
-            publish_lease: WorkflowLease | None = None
             try:
-                if stage == "publish":
-                    publish_lease = self.acquire_lease(
-                        f"publish:{workflow_id}", workflow_id=workflow_id
-                    )
                 if publication_effect is not None and publication_effect.state in {
                     PublicationEffectState.CONFIRMED,
                     PublicationEffectState.RECONCILED,
