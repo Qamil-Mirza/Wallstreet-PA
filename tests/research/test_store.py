@@ -1,6 +1,7 @@
 """Integration tests for the durable SQLite research store."""
 
 import hashlib
+import json
 import sqlite3
 import shutil
 import subprocess
@@ -102,6 +103,56 @@ def test_store_migrates_empty_database(tmp_path):
     assert REQUIRED_TABLES <= names
 
 
+def test_publication_outcome_scalar_accepts_only_exact_canonical_envelope(tmp_path):
+    store = ResearchStore(tmp_path / "research.db")
+    report_id = "report-safe"
+    receipt_hash = "e" * 64
+    expected = {
+        "result_ref": report_id,
+        "result_hash": None,
+        "report_id": report_id,
+        "new_agent_runs": 0,
+        "material_event": None,
+        "omissions": [],
+        "reviewer_verdict": None,
+        "originating_role": None,
+        "defer_reason": None,
+        "quality_gate": None,
+        "published_claim_ids": [],
+        "publication_receipt_hash": receipt_hash,
+    }
+    canonical = json.dumps(
+        expected, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    )
+    invalid = (
+        "{",
+        "null",
+        "[]",
+        canonical.replace('"new_agent_runs":0', '"new_agent_runs":"0"'),
+        canonical.replace('"report_id":"report-safe"', '"report_id":7'),
+        canonical.replace('"publication_receipt_hash":"' + receipt_hash + '"',
+                          '"publication_receipt_hash":null'),
+        canonical[:-1] + ',"raw_secret":"sk-private"}',
+        json.dumps(expected, ensure_ascii=False),
+    )
+
+    with store.connect() as connection:
+        accepted = connection.execute(
+            "SELECT is_canonical_publication_outcome(?, ?, ?, ?)",
+            (canonical, report_id, report_id, receipt_hash),
+        ).fetchone()
+        rejected = [
+            connection.execute(
+                "SELECT is_canonical_publication_outcome(?, ?, ?, ?)",
+                (candidate, report_id, report_id, receipt_hash),
+            ).fetchone()[0]
+            for candidate in invalid
+        ]
+
+    assert accepted == (1,)
+    assert rejected == [0] * len(invalid)
+
+
 def test_relationship_cannot_be_sealed_without_matching_lineage(migrated_store):
     created_at = "2026-08-24T00:00:00.000000Z"
     with migrated_store.transaction() as connection:
@@ -148,7 +199,7 @@ def test_migration_is_idempotent_and_recorded_once(tmp_path):
         rows = connection.execute(
             "SELECT version, name, applied_at FROM schema_migrations"
         ).fetchall()
-    assert len(rows) == 11
+    assert len(rows) == 12
     assert rows[0][0:2] == (1, "001_initial.sql")
     assert rows[1][0:2] == (2, "002_nullable_portfolio_freshness.sql")
     assert rows[2][0:2] == (3, "003_claim_dependencies.sql")
@@ -160,6 +211,7 @@ def test_migration_is_idempotent_and_recorded_once(tmp_path):
     assert rows[8][0:2] == (9, "009_workflow_recovery_publication.sql")
     assert rows[9][0:2] == (10, "010_publication_receipt_recovery.sql")
     assert rows[10][0:2] == (11, "011_bind_publication_receipts.sql")
+    assert rows[11][0:2] == (12, "012_canonical_publication_outcomes.sql")
     assert all(row[2].endswith("Z") for row in rows)
 
 
@@ -264,7 +316,10 @@ def test_existing_v1_database_upgrades_nullable_freshness_without_data_loss(
             "WHERE type = 'index' AND name LIKE 'idx_positions_%' ORDER BY name"
         ).fetchall()
 
-    assert versions == [(1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,), (10,), (11,)]
+    assert versions == [
+        (1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,), (10,),
+        (11,), (12,),
+    ]
     assert stored_snapshot == snapshot_row
     assert stored_security == security_row
     assert stored_position == position_row
@@ -334,7 +389,10 @@ def test_existing_v2_claims_upgrade_with_lineage_anchor_without_data_loss(
             (claim.claim_id,),
         ).fetchall()
         foreign_key_errors = connection.execute("PRAGMA foreign_key_check").fetchall()
-    assert versions == [(1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,), (10,), (11,)]
+    assert versions == [
+        (1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,), (10,),
+        (11,), (12,),
+    ]
     assert retained_evidence == [("passage-1", stance)]
     if stance == "supports":
         assert upgraded.get_claim(claim.claim_id) == claim
@@ -432,7 +490,10 @@ def test_populated_v3_relationship_upgrade_preserves_and_quarantines_legacy_data
         }
         foreign_key_errors = connection.execute("PRAGMA foreign_key_check").fetchall()
 
-    assert versions == [(1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,), (10,), (11,)]
+    assert versions == [
+        (1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,), (10,),
+        (11,), (12,),
+    ]
     assert relationship == (
         source_entity_id,
         target_entity_id,
@@ -523,7 +584,10 @@ def test_populated_v4_database_upgrades_agent_audit_without_data_loss(
         foreign_key_errors = connection.execute(
             "PRAGMA foreign_key_check"
         ).fetchall()
-    assert versions == [(1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,), (10,), (11,)]
+    assert versions == [
+        (1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,), (10,),
+        (11,), (12,),
+    ]
     assert legacy == [("legacy-run", "legacy-task", "completed")]
     assert {"agent_executions", "provider_attempts"} <= upgraded.table_names()
     assert foreign_key_errors == []
@@ -611,7 +675,10 @@ def test_populated_v5_database_upgrades_replay_lease_without_data_loss(
         foreign_key_errors = connection.execute(
             "PRAGMA foreign_key_check"
         ).fetchall()
-    assert versions == [(1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,), (10,), (11,)]
+    assert versions == [
+        (1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,), (10,),
+        (11,), (12,),
+    ]
     assert execution == ("succeeded", "e" * 64, None, None, None)
     assert provider_attempt == ("ollama", "legacy", 3, 2, 1, 1)
     assert foreign_key_errors == []
@@ -746,7 +813,10 @@ def test_populated_v6_database_upgrades_workflow_instances_without_data_loss(
             "PRAGMA foreign_key_check"
         ).fetchall()
 
-    assert versions == [(1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,), (10,), (11,)]
+    assert versions == [
+        (1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,), (10,),
+        (11,), (12,),
+    ]
     assert instances == [
         ("v6-workflow-one", "completed", 1),
         ("v6-workflow-two", "failed", 0),
@@ -1149,6 +1219,7 @@ def test_built_wheel_contains_and_applies_all_migrations(tmp_path):
         "news_bot/research/migrations/009_workflow_recovery_publication.sql",
         "news_bot/research/migrations/010_publication_receipt_recovery.sql",
         "news_bot/research/migrations/011_bind_publication_receipts.sql",
+        "news_bot/research/migrations/012_canonical_publication_outcomes.sql",
     }
     prompt_names = {
         "news_bot/research/prompts/director.md",
@@ -1177,7 +1248,8 @@ def test_built_wheel_contains_and_applies_all_migrations(tmp_path):
         "'008_durable_workflow_orchestration.sql', "
         "'009_workflow_recovery_publication.sql', "
         "'010_publication_receipt_recovery.sql', "
-        "'011_bind_publication_receipts.sql'}; "
+        "'011_bind_publication_receipts.sql', "
+        "'012_canonical_publication_outcomes.sql'}; "
         "prompt_dir = resources.files('news_bot.research').joinpath('prompts'); "
         "assert {p.name for p in prompt_dir.iterdir()} >= "
         "{'director.md', 'emerging_scout.md', 'event_scout.md', "
@@ -1190,7 +1262,8 @@ def test_built_wheel_contains_and_applies_all_migrations(tmp_path):
         "connection = sqlite3.connect(db); "
         "assert connection.execute('SELECT version FROM schema_migrations "
         "ORDER BY version').fetchall() == "
-        "[(1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,), (10,), (11,)]; "
+        "[(1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,), (10,), "
+        "(11,), (12,)]; "
         "connection.close()"
     )
     subprocess.run(
@@ -1204,7 +1277,7 @@ def test_built_wheel_contains_and_applies_all_migrations(tmp_path):
 
 def test_failed_multi_statement_migration_is_atomic(tmp_path, monkeypatch):
     store = make_migrated_store(tmp_path)
-    bad_migration = tmp_path / "012_broken.sql"
+    bad_migration = tmp_path / "013_broken.sql"
     bad_migration.write_text(
         "CREATE TABLE should_roll_back (id INTEGER);\n"
         "INSERT INTO missing_table (id) VALUES (1);\n",
@@ -1223,7 +1296,10 @@ def test_failed_multi_statement_migration_is_atomic(tmp_path, monkeypatch):
         versions = connection.execute(
             "SELECT version FROM schema_migrations ORDER BY version"
         ).fetchall()
-    assert versions == [(1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,), (10,), (11,)]
+    assert versions == [
+        (1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,), (10,),
+        (11,), (12,),
+    ]
 
 
 def test_migrations_are_sorted_by_numeric_version(tmp_path, monkeypatch):

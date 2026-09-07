@@ -542,7 +542,10 @@ def test_populated_v7_database_upgrades_without_data_loss(
         ).fetchone()
         fk_errors = connection.execute("PRAGMA foreign_key_check").fetchall()
 
-    assert versions == [(1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,), (10,), (11,)]
+    assert versions == [
+        (1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,), (10,),
+        (11,), (12,),
+    ]
     assert legacy_row == ("evidence", "pending")
     assert fk_errors == []
 
@@ -833,7 +836,7 @@ def test_populated_v8_workflow_upgrades_to_v9_without_data_loss(
         ).fetchall()
 
     assert row == ("daily", "completed")
-    assert versions[-1] == (11,)
+    assert versions[-1] == (12,)
 
 
 def test_migration_009_failure_rolls_back_publication_schema(
@@ -985,7 +988,7 @@ def test_populated_v9_unknown_receipt_state_upgrades_to_v10(
         ).fetchone() == ("outcome_unknown",)
         assert connection.execute(
             "SELECT MAX(version) FROM schema_migrations"
-        ).fetchone() == (11,)
+        ).fetchone() == (12,)
 
 
 def test_migration_010_failure_is_atomic(
@@ -1107,6 +1110,85 @@ def test_direct_sql_cannot_complete_confirmed_publish_with_forged_receipt(
         )
 
 
+@pytest.mark.parametrize(
+    ("mutation", "value"),
+    (
+        pytest.param("set", ("result_ref", "different-result"), id="result-ref"),
+        pytest.param("set", ("raw_secret", "sk-private"), id="private-key"),
+        pytest.param("drop", "result_hash", id="missing-key"),
+        pytest.param("set", ("result_hash", "a" * 64), id="inner-result-hash"),
+        pytest.param("set", ("new_agent_runs", False), id="bool-agent-count"),
+        pytest.param("set", ("material_event", False), id="material-event"),
+        pytest.param("set", ("omissions", {}), id="wrong-omissions-type"),
+        pytest.param("set", ("reviewer_verdict", "pass"), id="reviewer-verdict"),
+        pytest.param("set", ("originating_role", "director"), id="origin-role"),
+        pytest.param("set", ("defer_reason", "dry_run"), id="defer-reason"),
+        pytest.param("set", ("quality_gate", {}), id="quality-gate"),
+        pytest.param(
+            "set", ("published_claim_ids", ["claim-safe"]), id="published-claims"
+        ),
+        pytest.param("pretty", None, id="noncanonical-bytes"),
+    ),
+)
+def test_direct_sql_rejects_noncanonical_publication_outcome(
+    store: ResearchStore, mutation: str, value: object
+) -> None:
+    runner = RecordingRunner()
+    orchestrator = ResearchOrchestrator(store, runner, owner_id="owner-a")
+    original_finalize = orchestrator.finalize_task
+
+    def crash_after_confirmation(claim, **kwargs):
+        outcome = kwargs.get("outcome")
+        if outcome is not None and outcome.report_id is not None:
+            raise KeyboardInterrupt
+        return original_finalize(claim, **kwargs)
+
+    orchestrator.finalize_task = crash_after_confirmation  # type: ignore[method-assign]
+    with pytest.raises(KeyboardInterrupt):
+        orchestrator.run_weekly(as_of=utc(), source_hashes=("a" * 64,))
+    publish_context = next(call for call in runner.calls if call.stage == "publish")
+    report_id = f"report-{publish_context.workflow_id[-12:]}"
+    outcome = StageOutcome(
+        result_ref=report_id,
+        report_id=report_id,
+        publication_receipt_hash="e" * 64,
+    ).model_dump(mode="json")
+    if mutation == "set":
+        field, replacement = value
+        outcome[field] = replacement
+    elif mutation == "drop":
+        outcome.pop(value)
+    outcome_json = (
+        json.dumps(outcome, ensure_ascii=False)
+        if mutation == "pretty"
+        else json.dumps(
+            outcome, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        )
+    )
+
+    with store.connect() as connection:
+        with pytest.raises(sqlite3.IntegrityError) as error:
+            connection.execute(
+                "UPDATE workflow_tasks SET state = 'completed', result_ref = ?, "
+                "result_hash = ?, outcome_json = ?, lease_token = NULL, "
+                "lease_expires_at = NULL, completed_at = ? WHERE task_id = ?",
+                (
+                    report_id,
+                    hashlib.sha256(outcome_json.encode()).hexdigest(),
+                    outcome_json,
+                    "2026-08-24T12:01:00.000000Z",
+                    publish_context.task_id,
+                ),
+            )
+        retained = connection.execute(
+            "SELECT state, outcome_json FROM workflow_tasks WHERE task_id = ?",
+            (publish_context.task_id,),
+        ).fetchone()
+
+    assert "sk-private" not in str(error.value)
+    assert retained == ("running", None)
+
+
 def test_populated_v10_publication_receipt_upgrades_without_data_loss(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1132,7 +1214,7 @@ def test_populated_v10_publication_receipt_upgrades_without_data_loss(
         ).fetchone() == ("confirmed", result.report_ids[0], "e" * 64)
         assert connection.execute(
             "SELECT MAX(version) FROM schema_migrations"
-        ).fetchone() == (11,)
+        ).fetchone() == (12,)
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
 
 
@@ -1193,3 +1275,103 @@ def test_migration_011_fails_closed_without_sha256_function(
         assert connection.execute(
             "SELECT MAX(version) FROM schema_migrations"
         ).fetchone() == (10,)
+
+
+def test_populated_v11_publication_outcome_upgrades_without_data_loss(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = tmp_path / "v11.db"
+    root = Path(__file__).resolve().parents[2] / "news_bot/research/migrations"
+    files = tuple(
+        path for number in range(1, 12) for path in root.iterdir()
+        if path.name.startswith(f"{number:03d}_")
+    )
+    legacy = ResearchStore(database)
+    monkeypatch.setattr(legacy, "_migration_files", lambda: files)
+    legacy.migrate()
+    result = ResearchOrchestrator(
+        legacy, RecordingRunner(), owner_id="owner-a"
+    ).run_weekly(as_of=utc(), source_hashes=("a" * 64,))
+
+    upgraded = ResearchStore(database)
+    upgraded.migrate()
+    with upgraded.connect() as connection:
+        assert connection.execute(
+            "SELECT state, report_id, receipt_hash FROM publication_effects "
+            "WHERE workflow_id = ?", (result.workflow_id,),
+        ).fetchone() == ("confirmed", result.report_ids[0], "e" * 64)
+        assert connection.execute(
+            "SELECT MAX(version) FROM schema_migrations"
+        ).fetchone() == (12,)
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+        trigger_sql = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name IN "
+            "('workflow_tasks_transition_guard', "
+            "'workflow_tasks_terminal_output_guard', "
+            "'workflow_tasks_terminal_reason_immutable') ORDER BY name"
+        ).fetchall()
+    assert len(trigger_sql) == 3
+    assert all("is_canonical_publication_outcome" in row[0] for row in trigger_sql)
+
+
+def test_migration_012_rolls_back_trigger_replacement_atomically(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = tmp_path / "v12-rollback.db"
+    root = Path(__file__).resolve().parents[2] / "news_bot/research/migrations"
+    files = tuple(
+        path for number in range(1, 12) for path in root.iterdir()
+        if path.name.startswith(f"{number:03d}_")
+    )
+    legacy = ResearchStore(database)
+    monkeypatch.setattr(legacy, "_migration_files", lambda: files)
+    legacy.migrate()
+    broken = tmp_path / "012_broken.sql"
+    broken.write_text(
+        (root / "012_canonical_publication_outcomes.sql").read_text(encoding="utf-8")
+        + "\nINSERT INTO missing_table VALUES (1);\n",
+        encoding="utf-8",
+    )
+    attempted = ResearchStore(database)
+    monkeypatch.setattr(attempted, "_migration_files", lambda: (*files, broken))
+
+    with pytest.raises(sqlite3.OperationalError):
+        attempted.migrate()
+    with attempted.connect() as connection:
+        assert connection.execute(
+            "SELECT MAX(version) FROM schema_migrations"
+        ).fetchone() == (11,)
+        assert "is_canonical_publication_outcome" not in connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'trigger' "
+            "AND name = 'workflow_tasks_transition_guard'"
+        ).fetchone()[0]
+
+
+def test_migration_012_fails_closed_without_canonical_validator(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = tmp_path / "v12-no-validator.db"
+    root = Path(__file__).resolve().parents[2] / "news_bot/research/migrations"
+    files = tuple(
+        path for number in range(1, 12) for path in root.iterdir()
+        if path.name.startswith(f"{number:03d}_")
+    )
+    legacy = ResearchStore(database)
+    monkeypatch.setattr(legacy, "_migration_files", lambda: files)
+    legacy.migrate()
+    attempted = ResearchStore(database)
+
+    def register_hash_only(connection):
+        connection.create_function(
+            "sha256_hex", 1,
+            lambda value: hashlib.sha256(value.encode("utf-8")).hexdigest(),
+            deterministic=True,
+        )
+
+    monkeypatch.setattr(attempted, "_register_sql_functions", register_hash_only)
+    with pytest.raises(sqlite3.OperationalError, match="canonical_publication"):
+        attempted.migrate()
+    with sqlite3.connect(database) as connection:
+        assert connection.execute(
+            "SELECT MAX(version) FROM schema_migrations"
+        ).fetchone() == (11,)

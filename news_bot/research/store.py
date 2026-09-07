@@ -27,6 +27,8 @@ from .models import (
 
 _MIGRATION_NAME = re.compile(r"^(?P<version>[0-9]+)_.+\.sql$")
 _AGENT_EXECUTION_LEASE = timedelta(minutes=15)
+_WORKFLOW_IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}")
+_SHA256 = re.compile(r"[0-9a-f]{64}")
 
 
 def _system_utc_now() -> datetime:
@@ -38,6 +40,52 @@ def _sha256_hex(value: str) -> str:
     if not isinstance(value, str):
         raise ValueError("sha256_hex requires text")
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _is_canonical_publication_outcome(
+    outcome_json: object,
+    result_ref: object,
+    effect_report_id: object,
+    effect_receipt_hash: object,
+) -> int:
+    """Validate the exact safe StageOutcome envelope without importing it."""
+    try:
+        if not all(
+            isinstance(value, str)
+            for value in (
+                outcome_json, result_ref, effect_report_id, effect_receipt_hash
+            )
+        ):
+            return 0
+        if (
+            result_ref != effect_report_id
+            or _WORKFLOW_IDENTIFIER.fullmatch(result_ref) is None
+            or _SHA256.fullmatch(effect_receipt_hash) is None
+        ):
+            return 0
+        parsed = json.loads(outcome_json)
+        if not isinstance(parsed, dict):
+            return 0
+        expected = {
+            "result_ref": result_ref,
+            "result_hash": None,
+            "report_id": effect_report_id,
+            "new_agent_runs": 0,
+            "material_event": None,
+            "omissions": [],
+            "reviewer_verdict": None,
+            "originating_role": None,
+            "defer_reason": None,
+            "quality_gate": None,
+            "published_claim_ids": [],
+            "publication_receipt_hash": effect_receipt_hash,
+        }
+        canonical = json.dumps(
+            expected, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        )
+        return int(outcome_json == canonical)
+    except (RecursionError, TypeError, ValueError):
+        return 0
 
 
 class _ExactDecimalSum:
@@ -304,6 +352,12 @@ class ResearchStore:
     def _register_sql_functions(connection: sqlite3.Connection) -> None:
         connection.create_aggregate("decimal_sum_exact", 1, _ExactDecimalSum)
         connection.create_function("sha256_hex", 1, _sha256_hex, deterministic=True)
+        connection.create_function(
+            "is_canonical_publication_outcome",
+            4,
+            _is_canonical_publication_outcome,
+            deterministic=True,
+        )
 
     @contextmanager
     def transaction(self) -> Generator[sqlite3.Connection, None, None]:
