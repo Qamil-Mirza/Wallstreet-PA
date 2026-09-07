@@ -33,6 +33,13 @@ def _system_utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _sha256_hex(value: str) -> str:
+    """Hash exact SQLite TEXT for receipt/result integrity triggers."""
+    if not isinstance(value, str):
+        raise ValueError("sha256_hex requires text")
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
 class _ExactDecimalSum:
     """SQLite aggregate that preserves arbitrary Decimal text precision."""
 
@@ -296,6 +303,7 @@ class ResearchStore:
     @staticmethod
     def _register_sql_functions(connection: sqlite3.Connection) -> None:
         connection.create_aggregate("decimal_sum_exact", 1, _ExactDecimalSum)
+        connection.create_function("sha256_hex", 1, _sha256_hex, deterministic=True)
 
     @contextmanager
     def transaction(self) -> Generator[sqlite3.Connection, None, None]:
