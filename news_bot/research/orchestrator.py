@@ -609,8 +609,10 @@ class ResearchOrchestrator:
         identity = {
             "kind": kind.value,
             "period": period_key,
-            "as_of": _utc_text(as_of),
-            "portfolio_date": None if portfolio_date is None else _utc_text(portfolio_date),
+            "as_of": as_of.date().isoformat(),
+            "portfolio_date": (
+                None if portfolio_date is None else portfolio_date.date().isoformat()
+            ),
             "source_hashes": source_hashes,
             "definition_hash": definition_hash,
             "dry_run": dry_run,
@@ -804,7 +806,11 @@ class ResearchOrchestrator:
         if row is None or row[0] is None:
             return ()
         outcome = StageOutcome.model_validate_json(row[0])
-        return () if outcome.quality_gate is None else outcome.quality_gate.allowed_claim_ids
+        return (
+            outcome.quality_gate.allowed_claim_ids
+            if self._review_authorizes_publication(outcome)
+            else ()
+        )
 
     @staticmethod
     def _publication_key(workflow_id: str, task_id: str) -> str:
@@ -853,14 +859,57 @@ class ResearchOrchestrator:
         if outcome.report_id is None or outcome.publication_receipt_hash is None:
             raise WorkflowConflict("publication receipt is missing")
         outcome_json = _json(outcome.model_dump(mode="json"))
+        result_hash = _digest(outcome.model_dump(mode="json"))
         connection.execute(
             "UPDATE workflow_tasks SET state = 'completed', defer_reason = NULL, "
             "result_ref = ?, result_hash = ?, outcome_json = ?, lease_token = NULL, "
             "lease_expires_at = NULL, completed_at = ? WHERE workflow_id = ? "
             "AND task_id = ? AND stage = 'publish' AND state <> 'completed'",
-            (outcome.report_id, _digest(outcome.model_dump(mode="json")), outcome_json,
+            (outcome.report_id, result_hash, outcome_json,
              _utc_text(completed_at), workflow_id, task_id),
         )
+        stored = connection.execute(
+            "SELECT state, result_ref, result_hash, outcome_json "
+            "FROM workflow_tasks WHERE workflow_id = ? AND task_id = ? "
+            "AND stage = 'publish'",
+            (workflow_id, task_id),
+        ).fetchone()
+        if stored != ("completed", outcome.report_id, result_hash, outcome_json):
+            raise WorkflowConflict("publication task recovery did not commit")
+
+    def _recover_confirmed_publication(self, workflow_id: str) -> bool:
+        """Atomically hydrate a task from an authoritative publication effect."""
+        now = self._now()
+        with self.store.transaction() as connection:
+            row = connection.execute(
+                "SELECT task.task_id, effect.outcome_json "
+                "FROM workflow_runs AS run "
+                "JOIN workflow_tasks AS task ON task.workflow_id = run.workflow_id "
+                "JOIN publication_effects AS effect "
+                "ON effect.workflow_id = task.workflow_id "
+                "AND effect.task_id = task.task_id "
+                "WHERE run.workflow_id = ? "
+                "AND run.state IN ('running', 'deferred') "
+                "AND task.stage = 'publish' "
+                "AND effect.state IN ('confirmed', 'reconciled')",
+                (workflow_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            outcome = StageOutcome.model_validate_json(row[1])
+            self._complete_publication_task(
+                connection,
+                workflow_id=workflow_id,
+                task_id=row[0],
+                outcome=outcome,
+                completed_at=now,
+            )
+            connection.execute(
+                "UPDATE workflow_runs SET state = 'running', completed_at = NULL, "
+                "updated_at = ? WHERE workflow_id = ? AND state = 'deferred'",
+                (_utc_text(now), workflow_id),
+            )
+        return True
 
     def _prepare_publication_task(
         self, workflow_id: str, task_id: str
@@ -1081,15 +1130,15 @@ class ResearchOrchestrator:
                     "AND state = 'outcome_unknown'",
                     (report, receipt, outcome_json, result_hash, _utc_text(now), key),
                 )
-                self._complete_publication_task(
-                    connection, workflow_id=workflow_id, task_id=task_id,
-                    outcome=outcome, completed_at=now,
-                )
-                connection.execute(
-                    "UPDATE workflow_runs SET state = 'running', completed_at = NULL, "
-                    "updated_at = ? WHERE workflow_id = ? AND state = 'deferred'",
-                    (_utc_text(now), workflow_id),
-                )
+            self._complete_publication_task(
+                connection, workflow_id=workflow_id, task_id=task_id,
+                outcome=outcome, completed_at=now,
+            )
+            connection.execute(
+                "UPDATE workflow_runs SET state = 'running', completed_at = NULL, "
+                "updated_at = ? WHERE workflow_id = ? AND state = 'deferred'",
+                (_utc_text(now), workflow_id),
+            )
         return PublicationEffectView(
             effect_key=key, workflow_id=workflow_id, task_id=task_id,
             state=(PublicationEffectState.RECONCILED
@@ -1211,12 +1260,12 @@ class ResearchOrchestrator:
             )
 
     @staticmethod
-    def _publication_allowed(outcome: StageOutcome) -> bool:
+    def _review_authorizes_publication(outcome: StageOutcome) -> bool:
         gate = outcome.quality_gate
         if outcome.reviewer_verdict in {ReviewVerdict.REVISE, ReviewVerdict.BLOCK}:
             return False
         if gate is None:
-            return True
+            return False
         if gate.publication_verdict is PublicationVerdict.DRAFT:
             return False
         if gate.review_verdict is not ReviewVerdict.PASS:
@@ -1281,6 +1330,28 @@ class ResearchOrchestrator:
                 omissions.add("publication_dry_run")
                 terminal = WorkflowRunState.PARTIAL
                 continue
+            if stage == "publish":
+                with self.store.connect() as connection:
+                    review_row = connection.execute(
+                        "SELECT outcome_json FROM workflow_tasks "
+                        "WHERE workflow_id = ? AND stage = 'review' "
+                        "AND state = 'completed'",
+                        (workflow_id,),
+                    ).fetchone()
+                review_outcome = (
+                    None
+                    if review_row is None or review_row[0] is None
+                    else StageOutcome.model_validate_json(review_row[0])
+                )
+                if (
+                    review_outcome is None
+                    or not self._review_authorizes_publication(review_outcome)
+                ):
+                    self._defer_optional(
+                        workflow_id, ("publish",), "review_not_passed"
+                    )
+                    terminal = WorkflowRunState.BLOCKED
+                    break
             publication_effect: PublicationEffectView | None = None
             publish_lease: WorkflowLease | None = None
             if stage == "publish":
@@ -1358,8 +1429,7 @@ class ResearchOrchestrator:
                 if stage == "publish":
                     outcome = self._safe_publication_outcome(outcome)
                 if stage == "publish" and (
-                    not self._publication_allowed(outcome)
-                    or not set(outcome.published_claim_ids)
+                    not set(outcome.published_claim_ids)
                     <= set(context.allowed_claim_ids)
                 ):
                     if publication_effect is not None:
@@ -1383,7 +1453,7 @@ class ResearchOrchestrator:
                         self._mark_publication_unknown(publication_effect, claim)
                         terminal = WorkflowRunState.DEFERRED
                         break
-                if stage == "review" and not self._publication_allowed(outcome):
+                if stage == "review" and not self._review_authorizes_publication(outcome):
                     self.finalize_task(claim, outcome=outcome)
                     self._return_for_revision(workflow_id, task_id, outcome)
                     omissions.update(outcome.omissions)
@@ -1397,7 +1467,8 @@ class ResearchOrchestrator:
                 self.finalize_task(claim, outcome=outcome)
             except Exception:
                 if publication_effect is not None:
-                    self._mark_publication_unknown(publication_effect, claim)
+                    if publication_effect.state is PublicationEffectState.CLAIMED:
+                        self._mark_publication_unknown(publication_effect, claim)
                     terminal = WorkflowRunState.DEFERRED
                     break
                 try:
@@ -1485,11 +1556,16 @@ class ResearchOrchestrator:
             max_documents=max_documents, recommendation_triggers=triggers,
         )
         stored = self._stored_result(workflow_id, replay=not created)
-        if stored.status is not WorkflowRunState.RUNNING:
+        if stored.status not in {
+            WorkflowRunState.RUNNING,
+            WorkflowRunState.DEFERRED,
+        }:
             return stored
         lease = self.acquire_lease(f"workflow:{key}", workflow_id=workflow_id)
         executed = False
         try:
+            if not created:
+                self._recover_confirmed_publication(workflow_id)
             current = self._stored_result(workflow_id, replay=not created)
             if current.status is WorkflowRunState.RUNNING:
                 self._execute(

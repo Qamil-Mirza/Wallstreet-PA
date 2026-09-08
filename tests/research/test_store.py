@@ -196,6 +196,24 @@ def test_publication_effect_scalar_accepts_canonical_safe_audit_fields(tmp_path)
         ).fetchone() == (0,)
 
 
+def test_publication_effect_key_scalar_matches_canonical_orchestrator_identity(tmp_path):
+    store = ResearchStore(tmp_path / "research.db")
+    workflow_id = "wf_safe"
+    task_id = "wft_safe"
+    expected = hashlib.sha256(json.dumps(
+        {"workflow_id": workflow_id, "task_id": task_id, "effect": "publish"},
+        sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    ).encode()).hexdigest()
+
+    with store.connect() as connection:
+        assert connection.execute(
+            "SELECT publication_effect_key(?, ?)", (workflow_id, task_id)
+        ).fetchone() == (expected,)
+        assert connection.execute(
+            "SELECT publication_effect_key(?, ?)", ("unsafe id", task_id)
+        ).fetchone() == (None,)
+
+
 def test_relationship_cannot_be_sealed_without_matching_lineage(migrated_store):
     created_at = "2026-08-24T00:00:00.000000Z"
     with migrated_store.transaction() as connection:
@@ -242,7 +260,7 @@ def test_migration_is_idempotent_and_recorded_once(tmp_path):
         rows = connection.execute(
             "SELECT version, name, applied_at FROM schema_migrations"
         ).fetchall()
-    assert len(rows) == 13
+    assert len(rows) == 14
     assert rows[0][0:2] == (1, "001_initial.sql")
     assert rows[1][0:2] == (2, "002_nullable_portfolio_freshness.sql")
     assert rows[2][0:2] == (3, "003_claim_dependencies.sql")
@@ -256,6 +274,7 @@ def test_migration_is_idempotent_and_recorded_once(tmp_path):
     assert rows[10][0:2] == (11, "011_bind_publication_receipts.sql")
     assert rows[11][0:2] == (12, "012_canonical_publication_outcomes.sql")
     assert rows[12][0:2] == (13, "013_publication_effect_outcomes.sql")
+    assert rows[13][0:2] == (14, "014_publication_effect_insert_guards.sql")
     assert all(row[2].endswith("Z") for row in rows)
 
 
@@ -362,7 +381,7 @@ def test_existing_v1_database_upgrades_nullable_freshness_without_data_loss(
 
     assert versions == [
         (1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,), (10,),
-        (11,), (12,), (13,),
+        (11,), (12,), (13,), (14,),
     ]
     assert stored_snapshot == snapshot_row
     assert stored_security == security_row
@@ -435,7 +454,7 @@ def test_existing_v2_claims_upgrade_with_lineage_anchor_without_data_loss(
         foreign_key_errors = connection.execute("PRAGMA foreign_key_check").fetchall()
     assert versions == [
         (1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,), (10,),
-        (11,), (12,), (13,),
+        (11,), (12,), (13,), (14,),
     ]
     assert retained_evidence == [("passage-1", stance)]
     if stance == "supports":
@@ -536,7 +555,7 @@ def test_populated_v3_relationship_upgrade_preserves_and_quarantines_legacy_data
 
     assert versions == [
         (1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,), (10,),
-        (11,), (12,), (13,),
+        (11,), (12,), (13,), (14,),
     ]
     assert relationship == (
         source_entity_id,
@@ -630,7 +649,7 @@ def test_populated_v4_database_upgrades_agent_audit_without_data_loss(
         ).fetchall()
     assert versions == [
         (1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,), (10,),
-        (11,), (12,), (13,),
+        (11,), (12,), (13,), (14,),
     ]
     assert legacy == [("legacy-run", "legacy-task", "completed")]
     assert {"agent_executions", "provider_attempts"} <= upgraded.table_names()
@@ -721,7 +740,7 @@ def test_populated_v5_database_upgrades_replay_lease_without_data_loss(
         ).fetchall()
     assert versions == [
         (1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,), (10,),
-        (11,), (12,), (13,),
+        (11,), (12,), (13,), (14,),
     ]
     assert execution == ("succeeded", "e" * 64, None, None, None)
     assert provider_attempt == ("ollama", "legacy", 3, 2, 1, 1)
@@ -859,7 +878,7 @@ def test_populated_v6_database_upgrades_workflow_instances_without_data_loss(
 
     assert versions == [
         (1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,), (10,),
-        (11,), (12,), (13,),
+        (11,), (12,), (13,), (14,),
     ]
     assert instances == [
         ("v6-workflow-one", "completed", 1),
@@ -1265,6 +1284,7 @@ def test_built_wheel_contains_and_applies_all_migrations(tmp_path):
         "news_bot/research/migrations/011_bind_publication_receipts.sql",
         "news_bot/research/migrations/012_canonical_publication_outcomes.sql",
         "news_bot/research/migrations/013_publication_effect_outcomes.sql",
+        "news_bot/research/migrations/014_publication_effect_insert_guards.sql",
     }
     prompt_names = {
         "news_bot/research/prompts/director.md",
@@ -1295,7 +1315,8 @@ def test_built_wheel_contains_and_applies_all_migrations(tmp_path):
         "'010_publication_receipt_recovery.sql', "
         "'011_bind_publication_receipts.sql', "
         "'012_canonical_publication_outcomes.sql', "
-        "'013_publication_effect_outcomes.sql'}; "
+        "'013_publication_effect_outcomes.sql', "
+        "'014_publication_effect_insert_guards.sql'}; "
         "prompt_dir = resources.files('news_bot.research').joinpath('prompts'); "
         "assert {p.name for p in prompt_dir.iterdir()} >= "
         "{'director.md', 'emerging_scout.md', 'event_scout.md', "
@@ -1309,7 +1330,7 @@ def test_built_wheel_contains_and_applies_all_migrations(tmp_path):
         "assert connection.execute('SELECT version FROM schema_migrations "
         "ORDER BY version').fetchall() == "
         "[(1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,), (10,), "
-        "(11,), (12,), (13,)]; "
+        "(11,), (12,), (13,), (14,)]; "
         "connection.close()"
     )
     subprocess.run(
@@ -1323,7 +1344,7 @@ def test_built_wheel_contains_and_applies_all_migrations(tmp_path):
 
 def test_failed_multi_statement_migration_is_atomic(tmp_path, monkeypatch):
     store = make_migrated_store(tmp_path)
-    bad_migration = tmp_path / "014_broken.sql"
+    bad_migration = tmp_path / "015_broken.sql"
     bad_migration.write_text(
         "CREATE TABLE should_roll_back (id INTEGER);\n"
         "INSERT INTO missing_table (id) VALUES (1);\n",
@@ -1344,7 +1365,7 @@ def test_failed_multi_statement_migration_is_atomic(tmp_path, monkeypatch):
         ).fetchall()
     assert versions == [
         (1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,), (10,),
-        (11,), (12,), (13,),
+        (11,), (12,), (13,), (14,),
     ]
 
 

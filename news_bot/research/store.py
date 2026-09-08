@@ -87,6 +87,28 @@ def _sha256_hex(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+def _publication_effect_key(
+    workflow_id: object, task_id: object
+) -> str | None:
+    """Return the canonical publish-effect key for two safe identifiers."""
+    if (
+        not isinstance(workflow_id, str)
+        or not isinstance(task_id, str)
+        or _WORKFLOW_IDENTIFIER.fullmatch(workflow_id) is None
+        or _WORKFLOW_IDENTIFIER.fullmatch(task_id) is None
+    ):
+        return None
+    payload = {
+        "workflow_id": workflow_id,
+        "task_id": task_id,
+        "effect": "publish",
+    }
+    serialized = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    )
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
 def _is_canonical_publication_outcome(
     outcome_json: object,
     result_ref: object,
@@ -468,6 +490,9 @@ class ResearchStore:
     def _register_sql_functions(connection: sqlite3.Connection) -> None:
         connection.create_aggregate("decimal_sum_exact", 1, _ExactDecimalSum)
         connection.create_function("sha256_hex", 1, _sha256_hex, deterministic=True)
+        connection.create_function(
+            "publication_effect_key", 2, _publication_effect_key, deterministic=True
+        )
         connection.create_function(
             "is_canonical_publication_outcome",
             4,

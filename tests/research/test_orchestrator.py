@@ -66,6 +66,11 @@ class RecordingRunner:
                     report_id=f"report-{context.workflow_id[-12:]}",
                     publication_receipt_hash="e" * 64,
                 )
+            elif context.stage == "review":
+                value = StageOutcome(
+                    result_ref=f"result-{context.task_id[-12:]}",
+                    quality_gate=valid_quality(),
+                )
             else:
                 value = StageOutcome(result_ref=f"result-{context.task_id[-12:]}")
         if isinstance(value, BaseException):
@@ -143,6 +148,32 @@ def test_different_source_hash_creates_a_distinct_run(
     second = orchestrator.run_weekly(as_of=utc(), source_hashes=("b" * 64,))
 
     assert second.workflow_id != first.workflow_id
+
+
+def test_same_utc_date_with_different_times_reuses_workflow_identity(
+    store: ResearchStore,
+) -> None:
+    runner = RecordingRunner()
+    orchestrator = ResearchOrchestrator(store, runner, owner_id="scheduler-a")
+
+    first = orchestrator.run_weekly(
+        as_of=utc(hour=12), portfolio_date=utc(hour=10),
+        source_hashes=("a" * 64,)
+    )
+    second = orchestrator.run_weekly(
+        as_of=utc(hour=13), portfolio_date=utc(hour=11),
+        source_hashes=("a" * 64,)
+    )
+    next_date = orchestrator.run_weekly(
+        as_of=utc(day=25, hour=12), portfolio_date=utc(day=25, hour=10),
+        source_hashes=("a" * 64,)
+    )
+
+    assert second.workflow_id == first.workflow_id
+    assert second.report_ids == first.report_ids
+    assert second.new_agent_runs == 0
+    assert next_date.workflow_id != first.workflow_id
+    assert [call.stage for call in runner.calls].count("publish") == 2
 
 
 def test_weekly_revise_returns_task_to_fundamental_analyst(store: ResearchStore) -> None:
@@ -367,6 +398,28 @@ def test_quality_boundary_blocks_draft_and_unapproved_claims(
     assert "publish" not in [call.stage for call in runner.calls]
 
 
+def test_review_without_explicit_quality_authorization_never_calls_publisher(
+    store: ResearchStore,
+) -> None:
+    runner = RecordingRunner({
+        "review": StageOutcome(result_ref="review-without-gate"),
+    })
+
+    result = ResearchOrchestrator(
+        store, runner, owner_id="scheduler-a"
+    ).run_weekly(as_of=utc(), source_hashes=("a" * 64,))
+
+    assert result.status is WorkflowRunState.BLOCKED
+    assert "publish" not in [call.stage for call in runner.calls]
+    publish_task = next(
+        task for task in ResearchOrchestrator(
+            store, runner, owner_id="reader"
+        ).list_tasks(result.workflow_id)
+        if task.stage == "publish"
+    )
+    assert publish_task.state is not WorkflowTaskState.COMPLETED
+
+
 def test_partial_quality_publishes_only_allowed_claims(store: ResearchStore) -> None:
     runner = RecordingRunner({
         "review": StageOutcome(
@@ -483,6 +536,46 @@ def test_crash_after_publication_confirmation_recovers_full_safe_outcome_once(
     assert StageOutcome.model_validate_json(task_json).published_claim_ids == ("claim-1",)
 
 
+def test_ordinary_failure_after_confirmation_recovers_without_republication(
+    store: ResearchStore,
+) -> None:
+    runner = RecordingRunner({
+        "review": StageOutcome(quality_gate=valid_quality()),
+        "publish": StageOutcome(
+            result_ref="report-safe",
+            report_id="report-safe",
+            new_agent_runs=2,
+            omissions=("missing_claim_lineage",),
+            published_claim_ids=("claim-1",),
+            publication_receipt_hash="e" * 64,
+        ),
+    })
+    first = ResearchOrchestrator(store, runner, owner_id="scheduler-a")
+    original_finalize = first.finalize_task
+    failed_once = False
+
+    def fail_after_confirmation(claim, **kwargs):
+        nonlocal failed_once
+        outcome = kwargs.get("outcome")
+        if not failed_once and outcome is not None and outcome.report_id is not None:
+            failed_once = True
+            raise RuntimeError("transient task completion failure")
+        return original_finalize(claim, **kwargs)
+
+    first.finalize_task = fail_after_confirmation  # type: ignore[method-assign]
+    interrupted = first.run_weekly(as_of=utc(), source_hashes=("a" * 64,))
+    recovered = ResearchOrchestrator(
+        store, runner, owner_id="scheduler-b"
+    ).run_weekly(as_of=utc(hour=13), source_hashes=("a" * 64,))
+
+    assert interrupted.status is WorkflowRunState.DEFERRED
+    assert recovered.status is WorkflowRunState.PARTIAL
+    assert recovered.report_ids == ("report-safe",)
+    assert recovered.new_agent_runs == 2
+    assert recovered.omissions == ("missing_claim_lineage",)
+    assert [call.stage for call in runner.calls].count("publish") == 1
+
+
 @pytest.mark.parametrize(
     "published_claim_ids",
     (("claim-outside",), ("claim private",)),
@@ -553,6 +646,98 @@ def test_direct_effect_confirmation_cannot_bypass_review_claim_allowlist(
                 hashlib.sha256(outcome_json.encode()).hexdigest(),
                 "2026-08-24T12:01:00.000000Z",
                 publish_context.publication_effect_key,
+            ),
+        )
+
+
+def test_direct_insert_cannot_create_terminal_publication_effect(
+    store: ResearchStore,
+) -> None:
+    runner = RecordingRunner({
+        "review": StageOutcome(quality_gate=valid_quality()),
+    })
+    orchestrator = ResearchOrchestrator(store, runner, owner_id="scheduler-a")
+
+    def stop_before_effect(*args, **kwargs):
+        raise KeyboardInterrupt
+
+    orchestrator._prepare_publication_task = stop_before_effect  # type: ignore[method-assign]
+    with pytest.raises(KeyboardInterrupt):
+        orchestrator.run_weekly(as_of=utc(), source_hashes=("a" * 64,))
+    with store.connect() as connection:
+        workflow_id = connection.execute(
+            "SELECT workflow_id FROM workflow_runs"
+        ).fetchone()[0]
+    publish_task = next(
+        task for task in orchestrator.list_tasks(workflow_id)
+        if task.stage == "publish"
+    )
+    effect_key = orchestrator._publication_key(workflow_id, publish_task.task_id)
+    outcome = StageOutcome(
+        result_ref="report-safe",
+        report_id="report-safe",
+        published_claim_ids=("claim-outside",),
+        publication_receipt_hash="e" * 64,
+    )
+    outcome_json = json.dumps(
+        outcome.model_dump(mode="json"), sort_keys=True,
+        separators=(",", ":"), ensure_ascii=False,
+    )
+
+    with store.connect() as connection, pytest.raises(sqlite3.IntegrityError):
+        connection.execute(
+            "INSERT INTO publication_effects (publication_effect_id, effect_key, "
+            "workflow_id, task_id, state, report_id, receipt_hash, outcome_json, "
+            "result_hash, created_at, updated_at) VALUES (?, ?, ?, ?, 'confirmed', "
+            "?, ?, ?, ?, ?, ?)",
+            (
+                f"pub_{effect_key[:40]}", effect_key, workflow_id,
+                publish_task.task_id, "report-safe", "e" * 64, outcome_json,
+                hashlib.sha256(outcome_json.encode()).hexdigest(),
+                "2026-08-24T12:00:00.000000Z",
+                "2026-08-24T12:00:00.000000Z",
+            ),
+        )
+
+
+def test_direct_claimed_effect_insert_requires_stable_identity_and_task_lease(
+    store: ResearchStore,
+) -> None:
+    runner = RecordingRunner({
+        "review": StageOutcome(quality_gate=valid_quality()),
+    })
+    orchestrator = ResearchOrchestrator(store, runner, owner_id="scheduler-a")
+
+    def stop_before_effect(*args, **kwargs):
+        raise KeyboardInterrupt
+
+    orchestrator._prepare_publication_task = stop_before_effect  # type: ignore[method-assign]
+    with pytest.raises(KeyboardInterrupt):
+        orchestrator.run_weekly(as_of=utc(), source_hashes=("a" * 64,))
+    with store.connect() as connection:
+        workflow_id = connection.execute(
+            "SELECT workflow_id FROM workflow_runs"
+        ).fetchone()[0]
+    publish_task = next(
+        task for task in orchestrator.list_tasks(workflow_id)
+        if task.stage == "publish"
+    )
+    claim = orchestrator.claim_task(workflow_id, publish_task.task_id)
+    effect_key = orchestrator._publication_key(workflow_id, publish_task.task_id)
+    expiry = claim.lease_expires_at.isoformat(
+        timespec="microseconds"
+    ).replace("+00:00", "Z")
+
+    with store.connect() as connection, pytest.raises(sqlite3.IntegrityError):
+        connection.execute(
+            "INSERT INTO publication_effects (publication_effect_id, effect_key, "
+            "workflow_id, task_id, state, claim_token, claim_expires_at, "
+            "created_at, updated_at) VALUES ('pub_wrong_identity', ?, ?, ?, "
+            "'claimed', ?, ?, ?, ?)",
+            (
+                effect_key, workflow_id, publish_task.task_id, claim.lease_token,
+                expiry, "2026-08-24T12:00:00.000000Z",
+                "2026-08-24T12:00:00.000000Z",
             ),
         )
 
@@ -717,7 +902,7 @@ def test_populated_v7_database_upgrades_without_data_loss(
 
     assert versions == [
         (1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,), (10,),
-        (11,), (12,), (13,),
+        (11,), (12,), (13,), (14,),
     ]
     assert legacy_row == ("evidence", "pending")
     assert fk_errors == []
@@ -1009,7 +1194,7 @@ def test_populated_v8_workflow_upgrades_to_v9_without_data_loss(
         ).fetchall()
 
     assert row == ("daily", "completed")
-    assert versions[-1] == (13,)
+    assert versions[-1] == (14,)
 
 
 def test_migration_009_failure_rolls_back_publication_schema(
@@ -1161,7 +1346,7 @@ def test_populated_v9_unknown_receipt_state_upgrades_to_v10(
         ).fetchone() == ("outcome_unknown",)
         assert connection.execute(
             "SELECT MAX(version) FROM schema_migrations"
-        ).fetchone() == (13,)
+        ).fetchone() == (14,)
 
 
 def test_migration_010_failure_is_atomic(
@@ -1431,7 +1616,7 @@ def test_populated_v10_publication_receipt_upgrades_without_data_loss(
         ).fetchone() == ("confirmed", report_id, "e" * 64)
         assert connection.execute(
             "SELECT MAX(version) FROM schema_migrations"
-        ).fetchone() == (13,)
+        ).fetchone() == (14,)
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
 
 
@@ -1517,7 +1702,7 @@ def test_populated_v11_publication_outcome_upgrades_without_data_loss(
         ).fetchone() == ("confirmed", report_id, "e" * 64)
         assert connection.execute(
             "SELECT MAX(version) FROM schema_migrations"
-        ).fetchone() == (13,)
+        ).fetchone() == (14,)
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
         trigger_sql = connection.execute(
             "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name IN "
@@ -1662,7 +1847,7 @@ def test_populated_v12_effects_backfill_canonical_outcomes(
         ).fetchall()
         assert connection.execute(
             "SELECT MAX(version) FROM schema_migrations"
-        ).fetchone() == (13,)
+        ).fetchone() == (14,)
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
     assert [row[0] for row in rows] == ["confirmed", "reconciled"]
     assert all(row[1] == row[3] and row[2] == row[4] for row in rows)
@@ -1736,3 +1921,116 @@ def test_migration_013_fails_closed_without_effect_outcome_validator(
         assert connection.execute(
             "SELECT MAX(version) FROM schema_migrations"
         ).fetchone() == (12,)
+
+
+def test_populated_v13_upgrades_effect_insert_guards_without_data_loss(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = tmp_path / "v13.db"
+    root = Path(__file__).resolve().parents[2] / "news_bot/research/migrations"
+    files = tuple(
+        path for number in range(1, 14) for path in root.iterdir()
+        if path.name.startswith(f"{number:03d}_")
+    )
+    legacy = ResearchStore(database)
+    monkeypatch.setattr(legacy, "_migration_files", lambda: files)
+    legacy.migrate()
+    result = ResearchOrchestrator(
+        legacy, RecordingRunner(), owner_id="owner-a"
+    ).run_weekly(as_of=utc(), source_hashes=("a" * 64,))
+
+    upgraded = ResearchStore(database)
+    upgraded.migrate()
+    with upgraded.connect() as connection:
+        assert connection.execute(
+            "SELECT state, report_id, outcome_json, result_hash "
+            "FROM publication_effects WHERE workflow_id = ?",
+            (result.workflow_id,),
+        ).fetchone()[0:2] == ("confirmed", result.report_ids[0])
+        assert connection.execute(
+            "SELECT MAX(version) FROM schema_migrations"
+        ).fetchone() == (14,)
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+        insert_guard = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'trigger' "
+            "AND name = 'publication_effects_insert_guard'"
+        ).fetchone()[0]
+        transition_guard = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'trigger' "
+            "AND name = 'publication_effects_transition_guard'"
+        ).fetchone()[0]
+    assert "publication_effect_key" in insert_guard
+    assert "quality_gate.review_verdict" in transition_guard
+
+
+def test_migration_014_rolls_back_insert_and_transition_guards_atomically(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = tmp_path / "v14-rollback.db"
+    root = Path(__file__).resolve().parents[2] / "news_bot/research/migrations"
+    files = tuple(
+        path for number in range(1, 14) for path in root.iterdir()
+        if path.name.startswith(f"{number:03d}_")
+    )
+    legacy = ResearchStore(database)
+    monkeypatch.setattr(legacy, "_migration_files", lambda: files)
+    legacy.migrate()
+    with legacy.connect() as connection:
+        previous_transition_guard = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'trigger' "
+            "AND name = 'publication_effects_transition_guard'"
+        ).fetchone()[0]
+    broken = tmp_path / "014_broken.sql"
+    broken.write_text(
+        (root / "014_publication_effect_insert_guards.sql").read_text(
+            encoding="utf-8"
+        ) + "\nINSERT INTO missing_table VALUES (1);\n",
+        encoding="utf-8",
+    )
+    attempted = ResearchStore(database)
+    monkeypatch.setattr(attempted, "_migration_files", lambda: (*files, broken))
+
+    with pytest.raises(sqlite3.OperationalError):
+        attempted.migrate()
+    with attempted.connect() as connection:
+        assert connection.execute(
+            "SELECT MAX(version) FROM schema_migrations"
+        ).fetchone() == (13,)
+        assert connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'trigger' "
+            "AND name = 'publication_effects_insert_guard'"
+        ).fetchone() is None
+        assert connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'trigger' "
+            "AND name = 'publication_effects_transition_guard'"
+        ).fetchone()[0] == previous_transition_guard
+
+
+def test_migration_014_fails_closed_without_effect_key_scalar(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = tmp_path / "v14-no-key.db"
+    root = Path(__file__).resolve().parents[2] / "news_bot/research/migrations"
+    files = tuple(
+        path for number in range(1, 14) for path in root.iterdir()
+        if path.name.startswith(f"{number:03d}_")
+    )
+    legacy = ResearchStore(database)
+    monkeypatch.setattr(legacy, "_migration_files", lambda: files)
+    legacy.migrate()
+    attempted = ResearchStore(database)
+    register_all = attempted._register_sql_functions
+
+    def register_without_effect_key(connection):
+        register_all(connection)
+        connection.create_function("publication_effect_key", 2, None)
+
+    monkeypatch.setattr(
+        attempted, "_register_sql_functions", register_without_effect_key
+    )
+    with pytest.raises(sqlite3.OperationalError):
+        attempted.migrate()
+    with sqlite3.connect(database) as connection:
+        assert connection.execute(
+            "SELECT MAX(version) FROM schema_migrations"
+        ).fetchone() == (13,)
