@@ -486,12 +486,25 @@ class ResearchStore:
             raise
         return connection
 
-    @staticmethod
-    def _register_sql_functions(connection: sqlite3.Connection) -> None:
+    def _research_utc_now(self) -> str:
+        """Return the authoritative store clock as strict canonical UTC text."""
+        value = self.clock()
+        if (
+            not isinstance(value, datetime)
+            or value.tzinfo is None
+            or value.utcoffset() != timedelta(0)
+        ):
+            raise ValueError("research store clock must return a UTC datetime")
+        return _utc_text(value, "research store clock")
+
+    def _register_sql_functions(self, connection: sqlite3.Connection) -> None:
         connection.create_aggregate("decimal_sum_exact", 1, _ExactDecimalSum)
         connection.create_function("sha256_hex", 1, _sha256_hex, deterministic=True)
         connection.create_function(
             "publication_effect_key", 2, _publication_effect_key, deterministic=True
+        )
+        connection.create_function(
+            "research_utc_now", 0, self._research_utc_now, deterministic=False
         )
         connection.create_function(
             "is_canonical_publication_outcome",

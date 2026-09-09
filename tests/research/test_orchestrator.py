@@ -742,6 +742,149 @@ def test_direct_claimed_effect_insert_requires_stable_identity_and_task_lease(
         )
 
 
+@pytest.mark.parametrize(
+    "link_forged_review",
+    (
+        pytest.param(False, id="unlinked"),
+        pytest.param(True, id="extra-nonadjacent-dependency"),
+    ),
+)
+def test_duplicate_review_cannot_authorize_publication_effect(
+    store: ResearchStore, link_forged_review: bool,
+) -> None:
+    runner = RecordingRunner({
+        "review": StageOutcome(quality_gate=valid_quality()),
+        "publish": [KeyboardInterrupt()],
+    })
+    orchestrator = ResearchOrchestrator(store, runner, owner_id="scheduler-a")
+    with pytest.raises(KeyboardInterrupt):
+        orchestrator.run_weekly(as_of=utc(), source_hashes=("a" * 64,))
+    publish_context = next(call for call in runner.calls if call.stage == "publish")
+    forged_gate = valid_quality().model_copy(
+        update={"allowed_claim_ids": ("claim-outside",)}
+    )
+    forged_review = StageOutcome(
+        result_ref="forged-review", quality_gate=forged_gate
+    )
+    forged_review_json = json.dumps(
+        forged_review.model_dump(mode="json"), sort_keys=True,
+        separators=(",", ":"), ensure_ascii=False,
+    )
+    outcome = StageOutcome(
+        result_ref="report-safe",
+        report_id="report-safe",
+        published_claim_ids=("claim-outside",),
+        publication_receipt_hash="e" * 64,
+    )
+    outcome_json = json.dumps(
+        outcome.model_dump(mode="json"), sort_keys=True,
+        separators=(",", ":"), ensure_ascii=False,
+    )
+    now_text = "2026-08-24T12:01:00.000000Z"
+
+    with store.connect() as connection:
+        publish_ordinal = connection.execute(
+            "SELECT ordinal FROM workflow_tasks WHERE task_id = ?",
+            (publish_context.task_id,),
+        ).fetchone()[0]
+        connection.execute(
+            "INSERT INTO workflow_tasks (task_id, workflow_id, idempotency_key, "
+            "stage, ordinal, state, max_attempts, result_ref, result_hash, "
+            "outcome_json, created_at, completed_at) VALUES (?, ?, ?, 'review', "
+            "?, 'completed', 2, ?, ?, ?, ?, ?)",
+            (
+                "wft_forged_review", publish_context.workflow_id, "f" * 64,
+                publish_ordinal + 1, "forged-review",
+                hashlib.sha256(forged_review_json.encode()).hexdigest(),
+                forged_review_json, now_text, now_text,
+            ),
+        )
+        if link_forged_review:
+            connection.execute(
+                "INSERT INTO workflow_task_dependencies "
+                "(workflow_id, task_id, dependency_task_id) VALUES (?, ?, ?)",
+                (
+                    publish_context.workflow_id,
+                    publish_context.task_id,
+                    "wft_forged_review",
+                ),
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "UPDATE publication_effects SET state = 'confirmed', "
+                "claim_token = NULL, claim_expires_at = NULL, report_id = ?, "
+                "receipt_hash = ?, outcome_json = ?, result_hash = ?, "
+                "updated_at = ? WHERE effect_key = ?",
+                (
+                    "report-safe", "e" * 64, outcome_json,
+                    hashlib.sha256(outcome_json.encode()).hexdigest(), now_text,
+                    publish_context.publication_effect_key,
+                ),
+            )
+
+
+@pytest.mark.parametrize(
+    ("now_offset", "accepted"),
+    (
+        pytest.param(timedelta(microseconds=-1), True, id="one-microsecond-before"),
+        pytest.param(timedelta(0), False, id="exact-expiry"),
+    ),
+)
+def test_claimed_effect_insert_requires_active_task_lease(
+    tmp_path: Path, now_offset: timedelta, accepted: bool,
+) -> None:
+    now = [utc()]
+    store = ResearchStore(tmp_path / "research.db", clock=lambda: now[0])
+    store.migrate()
+    orchestrator = ResearchOrchestrator(
+        store,
+        RecordingRunner({"review": StageOutcome(quality_gate=valid_quality())}),
+        owner_id="scheduler-a",
+    )
+
+    def stop_before_effect(*args, **kwargs):
+        raise KeyboardInterrupt
+
+    orchestrator._prepare_publication_task = stop_before_effect  # type: ignore[method-assign]
+    with pytest.raises(KeyboardInterrupt):
+        orchestrator.run_weekly(as_of=utc(), source_hashes=("a" * 64,))
+    with store.connect() as connection:
+        workflow_id = connection.execute(
+            "SELECT workflow_id FROM workflow_runs"
+        ).fetchone()[0]
+    publish_task = next(
+        task for task in orchestrator.list_tasks(workflow_id)
+        if task.stage == "publish"
+    )
+    claim = orchestrator.claim_task(workflow_id, publish_task.task_id)
+    effect_key = orchestrator._publication_key(workflow_id, publish_task.task_id)
+    expiry = claim.lease_expires_at.isoformat(
+        timespec="microseconds"
+    ).replace("+00:00", "Z")
+    now[0] = claim.lease_expires_at + now_offset
+    created_at = now[0].isoformat(timespec="microseconds").replace("+00:00", "Z")
+    values = (
+        f"pub_{effect_key[:40]}", effect_key, workflow_id, publish_task.task_id,
+        claim.lease_token, expiry, created_at, created_at,
+    )
+    statement = (
+        "INSERT INTO publication_effects (publication_effect_id, effect_key, "
+        "workflow_id, task_id, state, claim_token, claim_expires_at, created_at, "
+        "updated_at) VALUES (?, ?, ?, ?, 'claimed', ?, ?, ?, ?)"
+    )
+
+    with store.connect() as connection:
+        if accepted:
+            connection.execute(statement, values)
+            assert connection.execute(
+                "SELECT state FROM publication_effects WHERE effect_key = ?",
+                (effect_key,),
+            ).fetchone() == ("claimed",)
+        else:
+            with pytest.raises(sqlite3.IntegrityError):
+                connection.execute(statement, values)
+
+
 def test_named_lease_blocks_second_owner_and_reclaims_at_exact_expiry(tmp_path: Path) -> None:
     now = [utc()]
     store = ResearchStore(tmp_path / "research.db", clock=lambda: now[0])
@@ -902,7 +1045,7 @@ def test_populated_v7_database_upgrades_without_data_loss(
 
     assert versions == [
         (1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,), (10,),
-        (11,), (12,), (13,), (14,),
+        (11,), (12,), (13,), (14,), (15,),
     ]
     assert legacy_row == ("evidence", "pending")
     assert fk_errors == []
@@ -1194,7 +1337,7 @@ def test_populated_v8_workflow_upgrades_to_v9_without_data_loss(
         ).fetchall()
 
     assert row == ("daily", "completed")
-    assert versions[-1] == (14,)
+    assert versions[-1] == (15,)
 
 
 def test_migration_009_failure_rolls_back_publication_schema(
@@ -1346,7 +1489,7 @@ def test_populated_v9_unknown_receipt_state_upgrades_to_v10(
         ).fetchone() == ("outcome_unknown",)
         assert connection.execute(
             "SELECT MAX(version) FROM schema_migrations"
-        ).fetchone() == (14,)
+        ).fetchone() == (15,)
 
 
 def test_migration_010_failure_is_atomic(
@@ -1616,7 +1759,7 @@ def test_populated_v10_publication_receipt_upgrades_without_data_loss(
         ).fetchone() == ("confirmed", report_id, "e" * 64)
         assert connection.execute(
             "SELECT MAX(version) FROM schema_migrations"
-        ).fetchone() == (14,)
+        ).fetchone() == (15,)
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
 
 
@@ -1702,7 +1845,7 @@ def test_populated_v11_publication_outcome_upgrades_without_data_loss(
         ).fetchone() == ("confirmed", report_id, "e" * 64)
         assert connection.execute(
             "SELECT MAX(version) FROM schema_migrations"
-        ).fetchone() == (14,)
+        ).fetchone() == (15,)
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
         trigger_sql = connection.execute(
             "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name IN "
@@ -1847,7 +1990,7 @@ def test_populated_v12_effects_backfill_canonical_outcomes(
         ).fetchall()
         assert connection.execute(
             "SELECT MAX(version) FROM schema_migrations"
-        ).fetchone() == (14,)
+        ).fetchone() == (15,)
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
     assert [row[0] for row in rows] == ["confirmed", "reconciled"]
     assert all(row[1] == row[3] and row[2] == row[4] for row in rows)
@@ -1949,7 +2092,7 @@ def test_populated_v13_upgrades_effect_insert_guards_without_data_loss(
         ).fetchone()[0:2] == ("confirmed", result.report_ids[0])
         assert connection.execute(
             "SELECT MAX(version) FROM schema_migrations"
-        ).fetchone() == (14,)
+        ).fetchone() == (15,)
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
         insert_guard = connection.execute(
             "SELECT sql FROM sqlite_master WHERE type = 'trigger' "
@@ -2034,3 +2177,134 @@ def test_migration_014_fails_closed_without_effect_key_scalar(
         assert connection.execute(
             "SELECT MAX(version) FROM schema_migrations"
         ).fetchone() == (13,)
+
+
+def test_populated_v14_upgrades_bound_publication_authority_without_data_loss(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = tmp_path / "v14.db"
+    root = Path(__file__).resolve().parents[2] / "news_bot/research/migrations"
+    files = tuple(
+        path for number in range(1, 15) for path in root.iterdir()
+        if path.name.startswith(f"{number:03d}_")
+    )
+    legacy = ResearchStore(database)
+    monkeypatch.setattr(legacy, "_migration_files", lambda: files)
+    legacy.migrate()
+    result = ResearchOrchestrator(
+        legacy, RecordingRunner(), owner_id="owner-a"
+    ).run_weekly(as_of=utc(), source_hashes=("a" * 64,))
+
+    upgraded = ResearchStore(database)
+    upgraded.migrate()
+    with upgraded.connect() as connection:
+        effect = connection.execute(
+            "SELECT state, report_id, outcome_json, result_hash "
+            "FROM publication_effects WHERE workflow_id = ?",
+            (result.workflow_id,),
+        ).fetchone()
+        assert connection.execute(
+            "SELECT MAX(version) FROM schema_migrations"
+        ).fetchone() == (15,)
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+        insert_guard = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'trigger' "
+            "AND name = 'publication_effects_insert_guard'"
+        ).fetchone()[0]
+        transition_guard = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'trigger' "
+            "AND name = 'publication_effects_transition_guard'"
+        ).fetchone()[0]
+    assert effect[0:2] == ("confirmed", result.report_ids[0])
+    assert effect[2] is not None and effect[3] is not None
+    assert "research_utc_now" in insert_guard
+    assert "workflow_task_dependencies" in transition_guard
+    assert "review.ordinal + 1 = publish.ordinal" in transition_guard
+
+
+def test_migration_015_rolls_back_all_guard_replacements_atomically(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = tmp_path / "v15-rollback.db"
+    root = Path(__file__).resolve().parents[2] / "news_bot/research/migrations"
+    files = tuple(
+        path for number in range(1, 15) for path in root.iterdir()
+        if path.name.startswith(f"{number:03d}_")
+    )
+    legacy = ResearchStore(database)
+    monkeypatch.setattr(legacy, "_migration_files", lambda: files)
+    legacy.migrate()
+    guard_names = (
+        "publication_effects_insert_guard",
+        "publication_effects_transition_guard",
+        "workflow_tasks_transition_guard",
+        "workflow_tasks_terminal_output_guard",
+        "workflow_tasks_terminal_reason_immutable",
+    )
+    placeholders = ",".join("?" for _ in guard_names)
+    with legacy.connect() as connection:
+        previous_guards = dict(connection.execute(
+            "SELECT name, sql FROM sqlite_master WHERE type = 'trigger' "
+            f"AND name IN ({placeholders})",
+            guard_names,
+        ).fetchall())
+    broken = tmp_path / "015_broken.sql"
+    broken.write_text(
+        (root / "015_bind_publication_authority.sql").read_text(
+            encoding="utf-8"
+        ) + "\nINSERT INTO missing_table VALUES (1);\n",
+        encoding="utf-8",
+    )
+    attempted = ResearchStore(database)
+    monkeypatch.setattr(attempted, "_migration_files", lambda: (*files, broken))
+
+    with pytest.raises(sqlite3.OperationalError):
+        attempted.migrate()
+    with attempted.connect() as connection:
+        assert connection.execute(
+            "SELECT MAX(version) FROM schema_migrations"
+        ).fetchone() == (14,)
+        restored_guards = dict(connection.execute(
+            "SELECT name, sql FROM sqlite_master WHERE type = 'trigger' "
+            f"AND name IN ({placeholders})",
+            guard_names,
+        ).fetchall())
+        assert connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'research_utc_now_function_probe'"
+        ).fetchone() is None
+    assert restored_guards == previous_guards
+
+
+def test_migration_015_fails_closed_without_authoritative_clock_scalar(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = tmp_path / "v15-no-clock.db"
+    root = Path(__file__).resolve().parents[2] / "news_bot/research/migrations"
+    files = tuple(
+        path for number in range(1, 15) for path in root.iterdir()
+        if path.name.startswith(f"{number:03d}_")
+    )
+    legacy = ResearchStore(database)
+    monkeypatch.setattr(legacy, "_migration_files", lambda: files)
+    legacy.migrate()
+    attempted = ResearchStore(database)
+    register_all = attempted._register_sql_functions
+
+    def register_without_clock(connection):
+        register_all(connection)
+        connection.create_function("research_utc_now", 0, None)
+
+    monkeypatch.setattr(
+        attempted, "_register_sql_functions", register_without_clock
+    )
+    with pytest.raises(sqlite3.OperationalError):
+        attempted.migrate()
+    with sqlite3.connect(database) as connection:
+        assert connection.execute(
+            "SELECT MAX(version) FROM schema_migrations"
+        ).fetchone() == (14,)
+        assert connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'trigger' "
+            "AND name = 'publication_effects_insert_guard'"
+        ).fetchone()[0].find("research_utc_now") == -1
