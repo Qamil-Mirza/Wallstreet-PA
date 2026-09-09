@@ -796,21 +796,32 @@ class ResearchOrchestrator:
             ).fetchall()
         return tuple(row[0] for row in rows)
 
-    def _allowed_claims_for_publish(self, workflow_id: str) -> tuple[str, ...]:
+    def _authorizing_review_for_publish(
+        self, workflow_id: str, publish_task_id: str
+    ) -> StageOutcome | None:
+        """Resolve the one completed adjacent review dependency for a publish task."""
         with self.store.connect() as connection:
-            row = connection.execute(
-                "SELECT outcome_json FROM workflow_tasks WHERE workflow_id = ? "
-                "AND stage = 'review' AND state = 'completed'",
-                (workflow_id,),
-            ).fetchone()
-        if row is None or row[0] is None:
-            return ()
-        outcome = StageOutcome.model_validate_json(row[0])
-        return (
-            outcome.quality_gate.allowed_claim_ids
-            if self._review_authorizes_publication(outcome)
-            else ()
-        )
+            rows = connection.execute(
+                "SELECT review.outcome_json "
+                "FROM workflow_task_dependencies AS dependency "
+                "JOIN workflow_tasks AS publish "
+                "ON publish.workflow_id = dependency.workflow_id "
+                "AND publish.task_id = dependency.task_id "
+                "JOIN workflow_tasks AS review "
+                "ON review.workflow_id = dependency.workflow_id "
+                "AND review.task_id = dependency.dependency_task_id "
+                "WHERE dependency.workflow_id = ? AND dependency.task_id = ? "
+                "AND publish.stage = 'publish' AND review.stage = 'review' "
+                "AND review.state = 'completed' "
+                "AND review.ordinal + 1 = publish.ordinal",
+                (workflow_id, publish_task_id),
+            ).fetchall()
+        if len(rows) != 1 or rows[0][0] is None:
+            return None
+        try:
+            return StageOutcome.model_validate_json(rows[0][0])
+        except (TypeError, ValueError):
+            return None
 
     @staticmethod
     def _publication_key(workflow_id: str, task_id: str) -> str:
@@ -1315,6 +1326,7 @@ class ResearchOrchestrator:
             if next_row is None:
                 break
             task_id, _, stage, state, attempts, maximum, *_ = next_row
+            allowed_claim_ids: tuple[str, ...] = ()
             if state == "failed" and attempts >= maximum:
                 terminal = WorkflowRunState.FAILED
                 break
@@ -1331,17 +1343,8 @@ class ResearchOrchestrator:
                 terminal = WorkflowRunState.PARTIAL
                 continue
             if stage == "publish":
-                with self.store.connect() as connection:
-                    review_row = connection.execute(
-                        "SELECT outcome_json FROM workflow_tasks "
-                        "WHERE workflow_id = ? AND stage = 'review' "
-                        "AND state = 'completed'",
-                        (workflow_id,),
-                    ).fetchone()
-                review_outcome = (
-                    None
-                    if review_row is None or review_row[0] is None
-                    else StageOutcome.model_validate_json(review_row[0])
+                review_outcome = self._authorizing_review_for_publish(
+                    workflow_id, task_id
                 )
                 if (
                     review_outcome is None
@@ -1352,6 +1355,11 @@ class ResearchOrchestrator:
                     )
                     terminal = WorkflowRunState.BLOCKED
                     break
+                gate = review_outcome.quality_gate
+                if gate is None:  # pragma: no cover - authorization guarantees it
+                    terminal = WorkflowRunState.BLOCKED
+                    break
+                allowed_claim_ids = gate.allowed_claim_ids
             publication_effect: PublicationEffectView | None = None
             publish_lease: WorkflowLease | None = None
             if stage == "publish":
@@ -1403,10 +1411,7 @@ class ResearchOrchestrator:
                 stage=stage, as_of=as_of, period_key=period_key,
                 source_hashes=source_hashes,
                 dependency_result_refs=self._dependency_refs(workflow_id, task_id),
-                allowed_claim_ids=(
-                    self._allowed_claims_for_publish(workflow_id)
-                    if stage == "publish" else ()
-                ),
+                allowed_claim_ids=allowed_claim_ids,
                 industry_key=industry_key, max_documents=max_documents,
                 authorize_analysis=authorize_analysis, dry_run=dry_run,
                 recommendation_triggers=recommendation_triggers,

@@ -420,6 +420,87 @@ def test_review_without_explicit_quality_authorization_never_calls_publisher(
     assert publish_task.state is not WorkflowTaskState.COMPLETED
 
 
+@pytest.mark.parametrize("link_forged_review", [False, True])
+def test_publisher_context_uses_only_the_canonical_review_dependency(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    link_forged_review: bool,
+) -> None:
+    class ReverseUnorderedStore(ResearchStore):
+        def connect(self) -> sqlite3.Connection:
+            connection = super().connect()
+            connection.execute("PRAGMA reverse_unordered_selects = ON")
+            return connection
+
+    database = tmp_path / "corrupted-v15.db"
+    root = Path(__file__).resolve().parents[2] / "news_bot/research/migrations"
+    files = tuple(
+        path for number in range(1, 16) for path in root.iterdir()
+        if path.name.startswith(f"{number:03d}_")
+    )
+    legacy = ReverseUnorderedStore(database)
+    monkeypatch.setattr(legacy, "_migration_files", lambda: files)
+    legacy.migrate()
+
+    forged_gate = valid_quality().model_copy(
+        update={"allowed_claim_ids": ("claim-outside",)}
+    )
+    forged_outcome = StageOutcome(
+        result_ref="forged-review", quality_gate=forged_gate
+    )
+
+    class ForgedReviewRunner(RecordingRunner):
+        def run(self, context: StageContext) -> StageOutcome:
+            if context.stage == "selected_recommendations":
+                with legacy.connect() as connection:
+                    publish_task_id, publish_ordinal = connection.execute(
+                        "SELECT task_id, ordinal FROM workflow_tasks "
+                        "WHERE workflow_id = ? AND stage = 'publish'",
+                        (context.workflow_id,),
+                    ).fetchone()
+                    forged_task_id = "wft_forged_review"
+                    outcome_json = forged_outcome.model_dump_json()
+                    connection.execute(
+                        "INSERT INTO workflow_tasks (task_id, workflow_id, "
+                        "idempotency_key, stage, ordinal, state, max_attempts, "
+                        "result_ref, result_hash, outcome_json, created_at, "
+                        "completed_at) VALUES (?, ?, ?, 'review', ?, 'completed', "
+                        "1, ?, ?, ?, ?, ?)",
+                        (
+                            forged_task_id,
+                            context.workflow_id,
+                            "f" * 64,
+                            publish_ordinal + 0.5,
+                            forged_outcome.result_ref,
+                            hashlib.sha256(outcome_json.encode()).hexdigest(),
+                            outcome_json,
+                            "2026-08-24T12:00:00.000000Z",
+                            "2026-08-24T12:00:00.000000Z",
+                        ),
+                    )
+                    if link_forged_review:
+                        connection.execute(
+                            "INSERT INTO workflow_task_dependencies "
+                            "(workflow_id, task_id, dependency_task_id) "
+                            "VALUES (?, ?, ?)",
+                            (context.workflow_id, publish_task_id, forged_task_id),
+                        )
+            if context.stage == "publish":
+                self.calls.append(context)
+                raise KeyboardInterrupt
+            return super().run(context)
+
+    runner = ForgedReviewRunner()
+    orchestrator = ResearchOrchestrator(legacy, runner, owner_id="scheduler-a")
+
+    with pytest.raises(KeyboardInterrupt):
+        orchestrator.run_weekly(as_of=utc(), source_hashes=("a" * 64,))
+
+    publish_context = next(call for call in runner.calls if call.stage == "publish")
+    assert publish_context.allowed_claim_ids == ("claim-1",)
+    assert "claim-outside" not in publish_context.allowed_claim_ids
+
+
 def test_partial_quality_publishes_only_allowed_claims(store: ResearchStore) -> None:
     runner = RecordingRunner({
         "review": StageOutcome(
@@ -750,8 +831,18 @@ def test_direct_claimed_effect_insert_requires_stable_identity_and_task_lease(
     ),
 )
 def test_duplicate_review_cannot_authorize_publication_effect(
-    store: ResearchStore, link_forged_review: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    link_forged_review: bool,
 ) -> None:
+    root = Path(__file__).resolve().parents[2] / "news_bot/research/migrations"
+    files = tuple(
+        path for number in range(1, 16) for path in root.iterdir()
+        if path.name.startswith(f"{number:03d}_")
+    )
+    store = ResearchStore(tmp_path / "v15-effect-guard.db")
+    monkeypatch.setattr(store, "_migration_files", lambda: files)
+    store.migrate()
     runner = RecordingRunner({
         "review": StageOutcome(quality_gate=valid_quality()),
         "publish": [KeyboardInterrupt()],
@@ -1045,7 +1136,7 @@ def test_populated_v7_database_upgrades_without_data_loss(
 
     assert versions == [
         (1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,), (10,),
-        (11,), (12,), (13,), (14,), (15,),
+        (11,), (12,), (13,), (14,), (15,), (16,),
     ]
     assert legacy_row == ("evidence", "pending")
     assert fk_errors == []
@@ -1337,7 +1428,7 @@ def test_populated_v8_workflow_upgrades_to_v9_without_data_loss(
         ).fetchall()
 
     assert row == ("daily", "completed")
-    assert versions[-1] == (15,)
+    assert versions[-1] == (16,)
 
 
 def test_migration_009_failure_rolls_back_publication_schema(
@@ -1489,7 +1580,7 @@ def test_populated_v9_unknown_receipt_state_upgrades_to_v10(
         ).fetchone() == ("outcome_unknown",)
         assert connection.execute(
             "SELECT MAX(version) FROM schema_migrations"
-        ).fetchone() == (15,)
+        ).fetchone() == (16,)
 
 
 def test_migration_010_failure_is_atomic(
@@ -1759,7 +1850,7 @@ def test_populated_v10_publication_receipt_upgrades_without_data_loss(
         ).fetchone() == ("confirmed", report_id, "e" * 64)
         assert connection.execute(
             "SELECT MAX(version) FROM schema_migrations"
-        ).fetchone() == (15,)
+        ).fetchone() == (16,)
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
 
 
@@ -1845,7 +1936,7 @@ def test_populated_v11_publication_outcome_upgrades_without_data_loss(
         ).fetchone() == ("confirmed", report_id, "e" * 64)
         assert connection.execute(
             "SELECT MAX(version) FROM schema_migrations"
-        ).fetchone() == (15,)
+        ).fetchone() == (16,)
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
         trigger_sql = connection.execute(
             "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name IN "
@@ -1990,7 +2081,7 @@ def test_populated_v12_effects_backfill_canonical_outcomes(
         ).fetchall()
         assert connection.execute(
             "SELECT MAX(version) FROM schema_migrations"
-        ).fetchone() == (15,)
+        ).fetchone() == (16,)
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
     assert [row[0] for row in rows] == ["confirmed", "reconciled"]
     assert all(row[1] == row[3] and row[2] == row[4] for row in rows)
@@ -2092,7 +2183,7 @@ def test_populated_v13_upgrades_effect_insert_guards_without_data_loss(
         ).fetchone()[0:2] == ("confirmed", result.report_ids[0])
         assert connection.execute(
             "SELECT MAX(version) FROM schema_migrations"
-        ).fetchone() == (15,)
+        ).fetchone() == (16,)
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
         insert_guard = connection.execute(
             "SELECT sql FROM sqlite_master WHERE type = 'trigger' "
@@ -2205,7 +2296,7 @@ def test_populated_v14_upgrades_bound_publication_authority_without_data_loss(
         ).fetchone()
         assert connection.execute(
             "SELECT MAX(version) FROM schema_migrations"
-        ).fetchone() == (15,)
+        ).fetchone() == (16,)
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
         insert_guard = connection.execute(
             "SELECT sql FROM sqlite_master WHERE type = 'trigger' "
@@ -2308,3 +2399,120 @@ def test_migration_015_fails_closed_without_authoritative_clock_scalar(
             "SELECT sql FROM sqlite_master WHERE type = 'trigger' "
             "AND name = 'publication_effects_insert_guard'"
         ).fetchone()[0].find("research_utc_now") == -1
+
+
+def test_populated_v15_upgrades_to_unique_workflow_stages_without_data_loss(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = tmp_path / "v15.db"
+    root = Path(__file__).resolve().parents[2] / "news_bot/research/migrations"
+    files = tuple(
+        path for number in range(1, 16) for path in root.iterdir()
+        if path.name.startswith(f"{number:03d}_")
+    )
+    legacy = ResearchStore(database)
+    monkeypatch.setattr(legacy, "_migration_files", lambda: files)
+    legacy.migrate()
+    result = ResearchOrchestrator(
+        legacy, RecordingRunner(), owner_id="owner-a"
+    ).run_weekly(as_of=utc(), source_hashes=("a" * 64,))
+
+    upgraded = ResearchStore(database)
+    upgraded.migrate()
+    with upgraded.connect() as connection:
+        assert connection.execute(
+            "SELECT MAX(version) FROM schema_migrations"
+        ).fetchone() == (16,)
+        assert connection.execute(
+            "SELECT state FROM workflow_runs WHERE workflow_id = ?",
+            (result.workflow_id,),
+        ).fetchone() == ("completed",)
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+        indexes = connection.execute(
+            "PRAGMA index_list(workflow_tasks)"
+        ).fetchall()
+        index_columns = connection.execute(
+            "PRAGMA index_info(idx_workflow_tasks_workflow_stage)"
+        ).fetchall()
+        with pytest.raises(sqlite3.IntegrityError, match="UNIQUE constraint failed"):
+            connection.execute(
+                "INSERT INTO workflow_tasks (task_id, workflow_id, "
+                "idempotency_key, stage, ordinal, state, max_attempts, "
+                "created_at) VALUES (?, ?, ?, 'review', 99, 'pending', 1, ?)",
+                (
+                    "wft_duplicate_review",
+                    result.workflow_id,
+                    "f" * 64,
+                    "2026-08-24T12:00:00.000000Z",
+                ),
+            )
+    assert any(
+        row[1] == "idx_workflow_tasks_workflow_stage" and row[2] == 1
+        for row in indexes
+    )
+    assert [row[2] for row in index_columns] == ["workflow_id", "stage"]
+
+
+def test_migration_016_rejects_duplicate_stages_atomically(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = tmp_path / "v16-duplicate-stage.db"
+    root = Path(__file__).resolve().parents[2] / "news_bot/research/migrations"
+    files = tuple(
+        path for number in range(1, 16) for path in root.iterdir()
+        if path.name.startswith(f"{number:03d}_")
+    )
+    legacy = ResearchStore(database)
+    monkeypatch.setattr(legacy, "_migration_files", lambda: files)
+    legacy.migrate()
+    result = ResearchOrchestrator(
+        legacy, RecordingRunner(), owner_id="owner-a"
+    ).run_weekly(as_of=utc(), source_hashes=("a" * 64,))
+    outcome = StageOutcome(
+        result_ref="duplicate-review", quality_gate=valid_quality()
+    )
+    outcome_json = outcome.model_dump_json()
+    with legacy.connect() as connection:
+        previous_guard = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'trigger' "
+            "AND name = 'publication_effects_transition_guard'"
+        ).fetchone()[0]
+        connection.execute(
+            "INSERT INTO workflow_tasks (task_id, workflow_id, idempotency_key, "
+            "stage, ordinal, state, max_attempts, result_ref, result_hash, "
+            "outcome_json, created_at, completed_at) VALUES (?, ?, ?, 'review', "
+            "?, 'completed', 1, ?, ?, ?, ?, ?)",
+            (
+                "wft_duplicate_review",
+                result.workflow_id,
+                "f" * 64,
+                4.5,
+                outcome.result_ref,
+                hashlib.sha256(outcome_json.encode()).hexdigest(),
+                outcome_json,
+                "2026-08-24T12:00:00.000000Z",
+                "2026-08-24T12:00:00.000000Z",
+            ),
+        )
+
+    attempted = ResearchStore(database)
+    with pytest.raises(sqlite3.IntegrityError, match="UNIQUE constraint failed"):
+        attempted.migrate()
+    with attempted.connect() as connection:
+        assert connection.execute(
+            "SELECT MAX(version) FROM schema_migrations"
+        ).fetchone() == (15,)
+        assert connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'index' "
+            "AND name = 'idx_workflow_tasks_workflow_stage'"
+        ).fetchone() is None
+        assert connection.execute(
+            "SELECT COUNT(*) FROM workflow_tasks "
+            "WHERE workflow_id = ? AND stage = 'review'",
+            (result.workflow_id,),
+        ).fetchone() == (2,)
+        assert connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'trigger' "
+            "AND name = 'publication_effects_transition_guard'"
+        ).fetchone()[0] == previous_guard
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
