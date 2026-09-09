@@ -16,6 +16,7 @@ import unicodedata
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta, timezone
 from enum import Enum
+from threading import Event, Thread
 from typing import Protocol
 
 from pydantic import (
@@ -36,6 +37,9 @@ from .store import ResearchStore, _parse_utc, _utc_text
 _HASH = re.compile(r"[0-9a-f]{64}")
 _SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}")
 _DEFAULT_LEASE = timedelta(minutes=15)
+_PUBLICATION_LEASE_NAME = "publish:research"
+_MAX_HEARTBEAT_INTERVAL_SECONDS = 30.0
+_MIN_HEARTBEAT_INTERVAL_SECONDS = 0.01
 _MAX_BACKFILL_DOCUMENTS = 1000
 _INTERNAL_REASON_CODES = {
     "budget_deferred",
@@ -69,6 +73,10 @@ class WorkflowBusy(WorkflowError):
 
 class WorkflowConflict(WorkflowError):
     """Raised when durable workflow state fails a compare-and-swap boundary."""
+
+
+class _LeaseHeartbeatConflict(WorkflowConflict):
+    """Raised when an active stage can no longer renew all of its leases."""
 
 
 class WorkflowKind(str, Enum):
@@ -588,6 +596,152 @@ class ResearchOrchestrator:
             )
             if cursor.rowcount != 1:
                 raise WorkflowConflict("workflow lease is stale")
+
+    def _renew_active_execution(
+        self,
+        workflow_id: str,
+        workflow_lease: WorkflowLease,
+        claim: TaskClaim,
+        publication_lease: WorkflowLease | None,
+    ) -> None:
+        """Atomically renew every lease protecting one active runner call."""
+        workflow_id = _identifier(workflow_id)
+        workflow_lease = WorkflowLease.model_validate(workflow_lease)
+        claim = TaskClaim.model_validate(claim)
+        if workflow_lease.workflow_id != workflow_id:
+            raise WorkflowConflict("workflow heartbeat lease is mismatched")
+        named_leases = [workflow_lease]
+        if publication_lease is not None:
+            publication_lease = WorkflowLease.model_validate(publication_lease)
+            if publication_lease.workflow_id != workflow_id:
+                raise WorkflowConflict("publication heartbeat lease is mismatched")
+            named_leases.append(publication_lease)
+        now = self._now()
+        expires = now + self.lease_duration
+        now_text = _utc_text(now)
+        expires_text = _utc_text(expires)
+        with self.store.transaction() as connection:
+            for lease in sorted(named_leases, key=lambda item: item.lease_name):
+                cursor = connection.execute(
+                    "UPDATE workflow_leases SET expires_at = ?, renewed_at = ? "
+                    "WHERE lease_name = ? AND workflow_id = ? AND owner_id = ? "
+                    "AND lease_token = ? AND expires_at > ?",
+                    (
+                        expires_text,
+                        now_text,
+                        lease.lease_name,
+                        workflow_id,
+                        self.owner_id,
+                        lease.lease_token,
+                        now_text,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise WorkflowConflict("named execution lease is stale")
+            task = connection.execute(
+                "SELECT lease_expires_at FROM workflow_tasks "
+                "WHERE workflow_id = ? AND task_id = ? AND state = 'running' "
+                "AND lease_token = ? AND lease_expires_at > ?",
+                (workflow_id, claim.task_id, claim.lease_token, now_text),
+            ).fetchone()
+            if task is None:
+                raise WorkflowConflict("workflow task heartbeat lease is stale")
+            effect = connection.execute(
+                "SELECT state, claim_token, claim_expires_at "
+                "FROM publication_effects WHERE workflow_id = ? AND task_id = ?",
+                (workflow_id, claim.task_id),
+            ).fetchone()
+            if effect is not None:
+                if (
+                    effect[0] != "claimed"
+                    or effect[1] != claim.lease_token
+                    or effect[2] != task[0]
+                    or _parse_utc(effect[2]) <= now
+                ):
+                    raise WorkflowConflict("publication effect heartbeat is stale")
+                cursor = connection.execute(
+                    "UPDATE publication_effects SET claim_expires_at = ?, "
+                    "updated_at = ? WHERE workflow_id = ? AND task_id = ? "
+                    "AND state = 'claimed' AND claim_token = ? "
+                    "AND claim_expires_at = ? AND claim_expires_at > ?",
+                    (
+                        expires_text,
+                        now_text,
+                        workflow_id,
+                        claim.task_id,
+                        claim.lease_token,
+                        task[0],
+                        now_text,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise WorkflowConflict("publication effect heartbeat conflicted")
+            cursor = connection.execute(
+                "UPDATE workflow_tasks SET lease_expires_at = ? "
+                "WHERE workflow_id = ? AND task_id = ? AND state = 'running' "
+                "AND lease_token = ? AND lease_expires_at = ? "
+                "AND lease_expires_at > ?",
+                (
+                    expires_text,
+                    workflow_id,
+                    claim.task_id,
+                    claim.lease_token,
+                    task[0],
+                    now_text,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise WorkflowConflict("workflow task heartbeat conflicted")
+
+    def _run_with_heartbeat(
+        self,
+        context: StageContext,
+        *,
+        workflow_lease: WorkflowLease,
+        claim: TaskClaim,
+        publication_lease: WorkflowLease | None,
+    ) -> StageOutcome:
+        """Run external stage work while a bounded background heartbeat owns leases."""
+        interval = max(
+            _MIN_HEARTBEAT_INTERVAL_SECONDS,
+            min(
+                self.lease_duration.total_seconds() / 3,
+                _MAX_HEARTBEAT_INTERVAL_SECONDS,
+            ),
+        )
+        stop = Event()
+        failures: list[BaseException] = []
+
+        def heartbeat() -> None:
+            while not stop.wait(interval):
+                try:
+                    self._renew_active_execution(
+                        context.workflow_id,
+                        workflow_lease,
+                        claim,
+                        publication_lease,
+                    )
+                except BaseException as error:
+                    failures.append(error)
+                    stop.set()
+                    return
+
+        thread = Thread(
+            target=heartbeat,
+            name=f"research-heartbeat-{context.task_id}",
+            daemon=True,
+        )
+        thread.start()
+        try:
+            result = self.runner.run(context)
+        finally:
+            stop.set()
+            thread.join()
+        if failures:
+            raise _LeaseHeartbeatConflict(
+                "stage execution lease heartbeat failed"
+            ) from failures[0]
+        return StageOutcome.model_validate(result)
 
     def _ensure_run(
         self,
@@ -1364,7 +1518,7 @@ class ResearchOrchestrator:
             publish_lease: WorkflowLease | None = None
             if stage == "publish":
                 publish_lease = self.acquire_lease(
-                    f"publish:{workflow_id}", workflow_id=workflow_id
+                    _PUBLICATION_LEASE_NAME, workflow_id=workflow_id
                 )
             try:
                 if stage == "publish":
@@ -1430,7 +1584,12 @@ class ResearchOrchestrator:
                     if outcome is None:  # pragma: no cover - model guard
                         raise WorkflowConflict("publication outcome is missing")
                 else:
-                    outcome = StageOutcome.model_validate(self.runner.run(context))
+                    outcome = self._run_with_heartbeat(
+                        context,
+                        workflow_lease=workflow_lease,
+                        claim=claim,
+                        publication_lease=publish_lease,
+                    )
                 if stage == "publish":
                     outcome = self._safe_publication_outcome(outcome)
                 if stage == "publish" and (
@@ -1470,6 +1629,13 @@ class ResearchOrchestrator:
                     terminal = WorkflowRunState.DEFERRED
                     break
                 self.finalize_task(claim, outcome=outcome)
+            except _LeaseHeartbeatConflict:
+                if (
+                    publication_effect is not None
+                    and publication_effect.state is PublicationEffectState.CLAIMED
+                ):
+                    self._mark_publication_unknown(publication_effect, claim)
+                raise
             except Exception:
                 if publication_effect is not None:
                     if publication_effect.state is PublicationEffectState.CLAIMED:
