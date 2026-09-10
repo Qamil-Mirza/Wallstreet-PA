@@ -1,6 +1,8 @@
 """Tests for email client module."""
 
 from datetime import date, datetime
+from email import message_from_string
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -272,6 +274,53 @@ class TestSendEmail:
 
             with pytest.raises(EmailError):
                 send_email(mock_config, "Subject", "<html></html>")
+
+    def test_send_email_attaches_pdf_and_audio_with_correct_mime_types(
+        self, mock_config, tmp_path: Path
+    ):
+        pdf = tmp_path / "report.pdf"
+        pdf.write_bytes(b"%PDF-test")
+        audio = tmp_path / "brief.mp3"
+        audio.write_bytes(b"ID3-test")
+
+        with patch("news_bot.email_client.smtplib.SMTP") as smtp_class:
+            smtp = MagicMock()
+            smtp_class.return_value.__enter__.return_value = smtp
+            send_email(mock_config, "Research", "<p>Body</p>", attachment_paths=(pdf, audio))
+
+        message = message_from_string(smtp.sendmail.call_args.args[2])
+        assert message.get_content_subtype() == "mixed"
+        assert [part.get_content_type() for part in message.walk()] == [
+            "multipart/mixed", "text/html", "application/pdf", "audio/mpeg"
+        ]
+
+    def test_send_email_combines_legacy_attachment_and_deduplicates(
+        self, mock_config, tmp_path: Path
+    ):
+        wav = tmp_path / "brief.wav"
+        wav.write_bytes(b"RIFF-test")
+        with patch("news_bot.email_client.smtplib.SMTP") as smtp_class:
+            smtp = MagicMock()
+            smtp_class.return_value.__enter__.return_value = smtp
+            send_email(mock_config, "Research", "<p>Body</p>", wav, attachment_paths=(wav,))
+        message = message_from_string(smtp.sendmail.call_args.args[2])
+        assert [part.get_content_type() for part in message.walk()].count("audio/wav") == 1
+
+    def test_send_email_skips_unknown_and_missing_attachments_but_sends(
+        self, mock_config, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ):
+        unknown = tmp_path / "payload.bin"
+        unknown.write_bytes(b"opaque")
+        missing = tmp_path / "missing.pdf"
+        with patch("news_bot.email_client.smtplib.SMTP") as smtp_class:
+            smtp = MagicMock()
+            smtp_class.return_value.__enter__.return_value = smtp
+            with caplog.at_level("WARNING"):
+                send_email(mock_config, "Research", "<p>Body</p>", attachment_paths=(unknown, missing))
+        message = message_from_string(smtp.sendmail.call_args.args[2])
+        assert message.get_content_subtype() == "alternative"
+        assert "unsupported attachment" in caplog.text.lower()
+        assert "missing or unreadable attachment" in caplog.text.lower()
 
 
 class TestBuildSectionedEmailHtml:

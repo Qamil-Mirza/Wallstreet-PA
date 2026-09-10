@@ -1,0 +1,10 @@
+{% extends "base.html" %}
+{% macro sections(title, items) -%}<section><h2>{{ title }}</h2>{% for item in items %}<div class="section"><h3>{{ item.title }}</h3><p>{{ item.body }}</p><p class="evidence">Evidence: {{ item.evidence_ids|join(', ') }}</p></div>{% endfor %}</section>{%- endmacro %}
+{% block content %}
+{{ sections("Rounded exposure summary", report.exposure_summary) }}
+{{ sections("Relevant news", report.relevant_news) }}
+{{ sections("Value-chain developments", report.value_chain_developments) }}
+{{ sections("Research views", report.research_views) }}
+{{ sections("Research view change history", report.change_history) }}
+{{ sections("Concentration and correlation", report.concentration_and_correlation) }}
+{% endblock %}

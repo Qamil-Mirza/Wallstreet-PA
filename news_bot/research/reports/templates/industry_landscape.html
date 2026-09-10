@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% macro sections(title, items) -%}<section><h2>{{ title }}</h2>{% for item in items %}<div class="section"><h3>{{ item.title }}</h3><p>{{ item.body }}</p><p class="evidence">Evidence: {{ item.evidence_ids|join(', ') }}</p></div>{% endfor %}</section>{%- endmacro %}
+{% block content %}
+{{ sections("Value chain", report.value_chain) }}
+{{ sections("Profit pools", report.profit_pools) }}
+{{ sections("Bottlenecks", report.bottlenecks) }}
+{{ sections("Emerging technology and companies", report.emerging_technology_and_companies) }}
+{{ sections("Base, upside, and downside scenarios — 5–10 years", report.long_term_scenarios) }}
+{{ sections("Signposts", report.signposts) }}
+{{ sections("Invalidation conditions", report.invalidation) }}
+{{ sections("Public beneficiaries", report.public_beneficiaries) }}
+{{ sections("Threats", report.threats) }}
+{{ sections("Portfolio relevance", report.portfolio_relevance) }}
+{% endblock %}

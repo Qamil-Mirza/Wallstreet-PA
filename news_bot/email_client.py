@@ -7,12 +7,13 @@ Builds HTML emails and sends them using configured SMTP server.
 import logging
 import smtplib
 from datetime import date
-from email.encoders import encode_base64
+from email.mime.application import MIMEApplication
 from email.mime.audio import MIMEAudio
+from email.mime.base import MIMEBase
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Sequence
 
 from .classifier import ArticleCategory, bucket_articles
 from .config import Config
@@ -395,21 +396,52 @@ def send_email(
     subject: str,
     html_body: str,
     attachment_path: Optional[Path] = None,
+    *,
+    attachment_paths: Sequence[Path] | None = None,
 ) -> None:
     """
-    Send an HTML email via SMTP with optional MP3 attachment.
+    Send an HTML email via SMTP with optional PDF and audio attachments.
     
     Args:
         config: Application configuration with SMTP settings.
         subject: Email subject line.
         html_body: HTML content for the email body.
-        attachment_path: Optional path to an MP3 file to attach.
+        attachment_path: Legacy optional path to one attachment.
+        attachment_paths: Optional ordered collection of attachments.
     
     Raises:
         EmailError: If sending fails.
     """
-    # Use mixed for attachments, alternative for HTML-only
-    msg = MIMEMultipart("mixed" if attachment_path else "alternative")
+    candidates = ([Path(attachment_path)] if attachment_path is not None else [])
+    candidates.extend(Path(path) for path in (attachment_paths or ()))
+    unique_paths: list[Path] = []
+    seen: set[Path] = set()
+    for path in candidates:
+        key = path.resolve(strict=False)
+        if key not in seen:
+            seen.add(key)
+            unique_paths.append(path)
+
+    attachment_parts: list[MIMEBase] = []
+    for path in unique_paths:
+        suffix = path.suffix.lower()
+        if suffix not in {".pdf", ".mp3", ".wav"}:
+            logger.warning("Unsupported attachment type skipped: %s", path.name)
+            continue
+        try:
+            payload = path.read_bytes()
+        except (OSError, PermissionError):
+            logger.warning("Missing or unreadable attachment skipped: %s", path)
+            continue
+        if suffix == ".pdf":
+            part: MIMEBase = MIMEApplication(payload, _subtype="pdf")
+        else:
+            part = MIMEAudio(payload, _subtype="mpeg" if suffix == ".mp3" else "wav")
+        part.add_header("Content-Disposition", "attachment", filename=path.name)
+        attachment_parts.append(part)
+
+    # Preserve the historical HTML-only subtype while using mixed for attachments.
+    msg = MIMEMultipart("mixed" if attachment_parts else "alternative")
     msg["Subject"] = subject
     msg["From"] = config.smtp_user
     msg["To"] = config.recipient_email
@@ -418,29 +450,8 @@ def send_email(
     html_part = MIMEText(html_body, "html")
     msg.attach(html_part)
     
-    # Attach audio file if provided (supports MP3 and WAV)
-    if attachment_path and attachment_path.exists():
-        try:
-            # Determine audio subtype based on file extension
-            suffix = attachment_path.suffix.lower()
-            if suffix == ".mp3":
-                subtype = "mpeg"
-            elif suffix == ".wav":
-                subtype = "wav"
-            else:
-                subtype = "mpeg"  # Default to MP3
-            
-            with open(attachment_path, "rb") as audio_file:
-                audio_part = MIMEAudio(audio_file.read(), _subtype=subtype)
-            audio_part.add_header(
-                "Content-Disposition",
-                "attachment",
-                filename=attachment_path.name,
-            )
-            msg.attach(audio_part)
-            logger.info(f"Attached audio file: {attachment_path.name}")
-        except Exception as e:
-            logger.warning(f"Failed to attach audio file: {e}")
+    for part in attachment_parts:
+        msg.attach(part)
     
     try:
         with smtplib.SMTP(config.smtp_host, config.smtp_port) as server:

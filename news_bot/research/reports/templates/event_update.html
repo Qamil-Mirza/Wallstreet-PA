@@ -1,0 +1,19 @@
+{% extends "base.html" %}
+{% macro sections(title, items) -%}
+<section><h2>{{ title }}</h2>{% for item in items %}<div class="section"><h3>{{ item.title }}</h3><p>{{ item.body }}</p>{% if item.evidence_ids %}<p class="evidence">Evidence: {{ item.evidence_ids|join(', ') }}</p>{% endif %}</div>{% endfor %}</section>
+{%- endmacro %}
+{% block content %}
+<section><h2>Thesis-led interpretation</h2><h3>{{ report.thesis.title }}</h3><p>{{ report.thesis.body }}</p><p class="evidence">Evidence: {{ report.thesis.evidence_ids|join(', ') }}</p></section>
+{{ sections("Event decomposition", report.event_decomposition) }}
+{{ sections("Causal decomposition", report.causal_decomposition) }}
+{{ sections("Cross-company and portfolio read-through", report.read_through) }}
+{% for exhibit in report.exhibits %}<section><h2>{{ exhibit.title }}</h2>{% if exhibit.rows is defined %}<table>{% for row in exhibit.rows %}<tr>
+{% if row.display_weight is defined %}<td>{{ row.symbol }}</td><td>{{ row.label }}</td><td>{{ row.display_weight }}</td><td>{{ row.currency }}</td>
+{% elif row.display_range is defined %}<td>{{ row.label }}</td><td>{{ row.low }}</td><td>{{ row.base }}</td><td>{{ row.high }}</td><td>{{ row.unit }}</td>
+{% elif row.display_probability is defined %}<td>{{ row.scenario }}</td><td>{{ row.display_probability }}</td><td>{{ row.value }}</td><td>{{ row.currency }} {{ row.unit }}</td>
+{% endif %}</tr>{% endfor %}</table>{% endif %}<p class="evidence">Sources: {{ exhibit.source_notes|join('; ') }}</p></section>{% endfor %}
+{{ sections("Thesis changes", report.thesis_changes) }}
+{{ sections("Unchanged assumptions", report.unchanged_assumptions) }}
+{{ sections("Open questions", report.questions) }}
+{{ sections("Signposts", report.signposts) }}
+{% endblock %}

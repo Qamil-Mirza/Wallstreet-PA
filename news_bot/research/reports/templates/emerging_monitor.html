@@ -1,0 +1,9 @@
+{% extends "base.html" %}
+{% macro sections(title, items) -%}<section><h2>{{ title }}</h2>{% for item in items %}<div class="section"><h3>{{ item.title }}</h3><p>{{ item.body }}</p><p class="evidence">Evidence: {{ item.evidence_ids|join(', ') }}</p></div>{% endfor %}</section>{%- endmacro %}
+{% block content %}
+{{ sections("Company and technology map", report.company_and_technology_map) }}
+{{ sections("Evidence-backed adoption signals", report.adoption_signals) }}
+{{ sections("Confidence and limits", report.confidence_and_limits) }}
+{{ sections("Public-market translation", report.public_market_translation) }}
+<section><h2>Private-company rating</h2><p>No rating. Private companies are monitored for evidence and public-market read-through only.</p></section>
+{% endblock %}
