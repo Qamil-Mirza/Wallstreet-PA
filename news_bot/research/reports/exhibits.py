@@ -1,19 +1,22 @@
-"""Deterministic builders for exhibits derived from normalized rows."""
+"""Deterministic builders for exhibits derived from authoritative normalized rows."""
 
 from __future__ import annotations
 
+import re
 from datetime import date
 from decimal import Decimal
-from typing import Literal
+from typing import Literal, Mapping
 
 from pydantic import Field, field_validator, model_validator
 
-from .models import DisplayExhibit, DisplayModel, _identifier, _text
+from ..quality import CalculatedExhibit
+from .models import DisplayExhibit, DisplayModel, EventUpdate, _identifier, _text
 
 
-DEFAULT_TOLERANCE = Decimal("0.000001")
 Currency = Literal["USD", "EUR", "GBP", "JPY", "MYR"]
 ValuationUnit = Literal["currency", "per_share", "multiple", "percent"]
+_ONE = Decimal("1")
+_ROW_ID_CHARACTER = re.compile(r"[^A-Za-z0-9]+")
 
 
 def _plain_text(value: str) -> str:
@@ -29,21 +32,66 @@ def _finite(value: Decimal) -> Decimal:
     return value
 
 
-def _tolerance(value: Decimal) -> Decimal:
-    value = _finite(value)
-    if value < 0:
-        raise ValueError("tolerance must be non-negative")
-    return value
-
-
 def _source_note(note: str, source_date: date) -> str:
     return f"{_plain_text(note)} ({source_date.isoformat()})"
+
+
+def _row_id(value: str) -> str:
+    identifier = _ROW_ID_CHARACTER.sub("-", value).strip("-").casefold()
+    if not identifier:
+        raise ValueError("exhibit row requires an authoritative row ID")
+    return identifier
+
+
+def _require_nonempty(rows: tuple[object, ...]) -> None:
+    if not rows:
+        raise ValueError("exhibit rows must not be empty")
+
+
+def _require_one_currency(rows: tuple[object, ...]) -> None:
+    currencies = {getattr(row, "currency") for row in rows}
+    if len(currencies) != 1:
+        raise ValueError("exhibit rows must use one currency")
+
+
+def _notes(rows: tuple[object, ...]) -> tuple[str, ...]:
+    return tuple(sorted({_source_note(row.source_note, row.source_date) for row in rows}))
+
+
+def _require_notes(source_notes: tuple[str, ...], rows: tuple[object, ...]) -> None:
+    if source_notes != _notes(rows):
+        raise ValueError("exhibit source notes must be derived from its rows")
+
+
+def _require_authority(
+    calculation: CalculatedExhibit,
+    *,
+    exhibit_id: str,
+    expected: Mapping[str, Mapping[str, Decimal]],
+    row_count: int,
+) -> None:
+    if calculation.exhibit_id.casefold() != exhibit_id:
+        raise ValueError("calculated exhibit uses the wrong authoritative exhibit ID")
+    if not calculation.reconciles:
+        raise ValueError("calculated exhibit does not reconcile")
+    authoritative = {
+        row.row_id.casefold(): dict(row.values) for row in calculation.normalized_rows
+    }
+    canonical_expected = {
+        row_id.casefold(): dict(values) for row_id, values in expected.items()
+    }
+    if len(canonical_expected) != row_count:
+        raise ValueError("display exhibit row IDs must be unique")
+    if authoritative != canonical_expected:
+        raise ValueError(
+            "display rows do not exactly match authoritative calculated rows"
+        )
 
 
 class ExposureRow(DisplayModel):
     symbol: str
     label: str
-    weight: Decimal = Field(ge=Decimal("0"), le=Decimal("1"))
+    weight: Decimal = Field(ge=Decimal("0"), le=_ONE)
     currency: Currency
     source_note: str
     source_date: date
@@ -59,8 +107,26 @@ class ExposureRow(DisplayModel):
 
 
 class ExposureExhibit(DisplayExhibit):
-    rows: tuple[ExposureRow, ...]
+    rows: tuple[ExposureRow, ...] = Field(min_length=1)
     total_weight: Decimal
+
+    _total = field_validator("total_weight")(_finite)
+
+    @model_validator(mode="after")
+    def _authoritative_rows(self) -> "ExposureExhibit":
+        _require_one_currency(self.rows)
+        if self.total_weight != _ONE or sum(
+            (row.weight for row in self.rows), Decimal("0")
+        ) != _ONE:
+            raise ValueError("exposure weights do not reconcile to fixed total 1")
+        _require_notes(self.source_notes, self.rows)
+        _require_authority(
+            self.calculation,
+            exhibit_id="exposure",
+            expected={row.symbol: {"weight": row.weight} for row in self.rows},
+            row_count=len(self.rows),
+        )
+        return self
 
 
 class ValuationRow(DisplayModel):
@@ -91,12 +157,33 @@ class ValuationRow(DisplayModel):
 
 
 class ValuationExhibit(DisplayExhibit):
-    rows: tuple[ValuationRow, ...]
+    rows: tuple[ValuationRow, ...] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _authoritative_rows(self) -> "ValuationExhibit":
+        _require_one_currency(self.rows)
+        if len({row.unit for row in self.rows}) != 1:
+            raise ValueError("valuation rows must use one unit")
+        _require_notes(self.source_notes, self.rows)
+        _require_authority(
+            self.calculation,
+            exhibit_id="valuation",
+            expected={
+                _row_id(row.label): {
+                    "low": row.low,
+                    "base": row.base,
+                    "high": row.high,
+                }
+                for row in self.rows
+            },
+            row_count=len(self.rows),
+        )
+        return self
 
 
 class ScenarioRow(DisplayModel):
     scenario: str
-    probability: Decimal = Field(ge=Decimal("0"), le=Decimal("1"))
+    probability: Decimal = Field(ge=Decimal("0"), le=_ONE)
     value: Decimal
     currency: Currency
     unit: ValuationUnit
@@ -114,77 +201,98 @@ class ScenarioRow(DisplayModel):
 
 
 class ScenarioMatrix(DisplayExhibit):
-    rows: tuple[ScenarioRow, ...]
+    rows: tuple[ScenarioRow, ...] = Field(min_length=1)
     probability_total: Decimal
 
+    _total = field_validator("probability_total")(_finite)
 
-def _require_nonempty(rows: tuple[object, ...]) -> None:
-    if not rows:
-        raise ValueError("exhibit rows must not be empty")
-
-
-def _require_one_currency(rows: tuple[object, ...]) -> None:
-    currencies = {getattr(row, "currency") for row in rows}
-    if len(currencies) != 1:
-        raise ValueError("exhibit rows must use one currency")
-
-
-def _notes(rows: tuple[object, ...]) -> tuple[str, ...]:
-    return tuple(sorted({_source_note(row.source_note, row.source_date) for row in rows}))
+    @model_validator(mode="after")
+    def _authoritative_rows(self) -> "ScenarioMatrix":
+        _require_one_currency(self.rows)
+        if len({row.unit for row in self.rows}) != 1:
+            raise ValueError("scenario rows must use one unit")
+        if self.probability_total != _ONE or sum(
+            (row.probability for row in self.rows), Decimal("0")
+        ) != _ONE:
+            raise ValueError("scenario probabilities do not reconcile to fixed total 1")
+        _require_notes(self.source_notes, self.rows)
+        _require_authority(
+            self.calculation,
+            exhibit_id="scenario",
+            expected={
+                _row_id(row.scenario): {
+                    "probability": row.probability,
+                    "value": row.value,
+                }
+                for row in self.rows
+            },
+            row_count=len(self.rows),
+        )
+        return self
 
 
 def build_exposure_exhibit(
     rows: tuple[ExposureRow, ...],
     *,
-    declared_total: Decimal = Decimal("1"),
-    tolerance: Decimal = DEFAULT_TOLERANCE,
+    calculation: CalculatedExhibit,
+    evidence_ids: tuple[str, ...],
 ) -> ExposureExhibit:
     _require_nonempty(rows)
-    declared_total, tolerance = _finite(declared_total), _tolerance(tolerance)
-    _require_one_currency(rows)
-    total = sum((row.weight for row in rows), Decimal("0"))
-    if abs(total - declared_total) > tolerance:
-        raise ValueError("exposure weights do not reconcile to declared total")
     ordered = tuple(sorted(rows, key=lambda row: (row.symbol, row.label)))
     return ExposureExhibit(
-        title="Rounded exposure summary", rows=ordered, total_weight=total,
-        source_notes=_notes(rows),
+        title="Rounded exposure summary",
+        rows=ordered,
+        total_weight=sum((row.weight for row in ordered), Decimal("0")),
+        source_notes=_notes(ordered),
+        evidence_ids=evidence_ids,
+        calculation=calculation,
+        verified_reconciliation=True,
     )
 
 
 def build_valuation_exhibit(
     rows: tuple[ValuationRow, ...],
+    *,
+    calculation: CalculatedExhibit,
+    evidence_ids: tuple[str, ...],
 ) -> ValuationExhibit:
     _require_nonempty(rows)
-    _require_one_currency(rows)
-    units = {row.unit for row in rows}
-    if len(units) != 1:
-        raise ValueError("valuation rows must use one unit")
+    ordered = tuple(sorted(rows, key=lambda row: row.label))
     return ValuationExhibit(
         title="Valuation ranges",
-        rows=tuple(sorted(rows, key=lambda row: row.label)),
-        source_notes=_notes(rows),
+        rows=ordered,
+        source_notes=_notes(ordered),
+        evidence_ids=evidence_ids,
+        calculation=calculation,
+        verified_reconciliation=True,
     )
 
 
 def build_scenario_matrix(
     rows: tuple[ScenarioRow, ...],
     *,
-    declared_probability: Decimal = Decimal("1"),
-    tolerance: Decimal = DEFAULT_TOLERANCE,
+    calculation: CalculatedExhibit,
+    evidence_ids: tuple[str, ...],
 ) -> ScenarioMatrix:
     _require_nonempty(rows)
-    declared_probability, tolerance = _finite(declared_probability), _tolerance(tolerance)
-    _require_one_currency(rows)
-    units = {row.unit for row in rows}
-    if len(units) != 1:
-        raise ValueError("scenario rows must use one unit")
-    total = sum((row.probability for row in rows), Decimal("0"))
-    if abs(total - declared_probability) > tolerance:
-        raise ValueError("scenario probabilities do not reconcile to declared total")
+    ordered = tuple(sorted(rows, key=lambda row: row.scenario))
     return ScenarioMatrix(
         title="Scenario matrix",
-        rows=tuple(sorted(rows, key=lambda row: row.scenario)),
-        probability_total=total,
-        source_notes=_notes(rows),
+        rows=ordered,
+        probability_total=sum((row.probability for row in ordered), Decimal("0")),
+        source_notes=_notes(ordered),
+        evidence_ids=evidence_ids,
+        calculation=calculation,
+        verified_reconciliation=True,
     )
+
+
+# Resolve EventUpdate's concrete exhibit union after the circular-safe model module
+# has finished loading. This retains subtype rows during render-boundary validation.
+EventUpdate.model_rebuild(
+    _types_namespace={
+        "ExposureExhibit": ExposureExhibit,
+        "ValuationExhibit": ValuationExhibit,
+        "ScenarioMatrix": ScenarioMatrix,
+    }
+)

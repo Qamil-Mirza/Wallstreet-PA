@@ -1,10 +1,18 @@
 {% extends "base.html" %}
 {% macro sections(title, items) -%}<section><h2>{{ title }}</h2>{% for item in items %}<div class="section"><h3>{{ item.title }}</h3><p>{{ item.body }}</p><p class="evidence">Evidence: {{ item.evidence_ids|join(', ') }}</p></div>{% endfor %}</section>{%- endmacro %}
 {% block content %}
-{{ sections("Rounded exposure summary", report.exposure_summary) }}
-{{ sections("Relevant news", report.relevant_news) }}
+<section><h2>Rounded exposure summary</h2>
+{% for item in report.exposure_summary %}<div class="section"><h3>{{ item.symbol }} — {{ item.label }}</h3><p>{{ item.display_weight }}</p><p class="evidence">Evidence: {{ item.evidence_ids|join(', ') }}</p></div>{% endfor %}
+</section>
+<section><h2>Relevant news and thesis impact</h2>
+{% for item in report.relevant_news %}<div class="section"><h3>{{ item.headline }}</h3><p><strong>Thesis impact:</strong> {{ item.thesis_impact }}</p><p class="evidence">Evidence: {{ item.evidence_ids|join(', ') }}</p></div>{% endfor %}
+</section>
 {{ sections("Value-chain developments", report.value_chain_developments) }}
-{{ sections("Research views", report.research_views) }}
-{{ sections("Research view change history", report.change_history) }}
-{{ sections("Concentration and correlation", report.concentration_and_correlation) }}
+<section><h2>Research views</h2>
+{% for item in report.research_views %}<div class="section"><h3>{{ item.symbol }} — {{ item.rating.value }}</h3><p>{{ item.thesis }}</p><p class="evidence">Evidence: {{ item.evidence_ids|join(', ') }}</p></div>{% endfor %}
+</section>
+<section><h2>Research view change history</h2>
+{% for item in report.change_history %}<div class="section"><h3>{{ item.symbol }} — {{ item.previous_rating.value }} → {{ item.new_rating.value }}</h3><p>{{ item.changed_on.isoformat() }} — {{ item.rationale }}</p><p class="evidence">Evidence: {{ item.evidence_ids|join(', ') }}</p></div>{% endfor %}
+</section>
+<section><h2>Concentration and correlation</h2><div class="section"><h3>{{ report.concentration_and_correlation.risk_level }} risk</h3><p>{{ report.concentration_and_correlation.summary }}</p><p class="evidence">Evidence: {{ report.concentration_and_correlation.evidence_ids|join(', ') }}</p></div></section>
 {% endblock %}

@@ -10,7 +10,7 @@ from urllib.parse import unquote, urlsplit
 
 from jinja2 import PackageLoader, StrictUndefined, select_autoescape
 from jinja2.sandbox import SandboxedEnvironment
-from weasyprint import HTML, default_url_fetcher
+from pydantic import BaseModel
 
 from .models import (
     EmergingCompanyMonitor,
@@ -50,23 +50,36 @@ class ReportRenderer:
         candidate = Path(unquote(parsed.path)).resolve()
         if not candidate.is_relative_to(self.template_root):
             raise ValueError("local report resource is outside the trusted package root")
+        from weasyprint import default_url_fetcher
+
         return default_url_fetcher(url)
 
     def render_event_update(self, report: EventUpdate) -> RenderedReportArtifact:
-        return self._render("event_update.html", report)
+        return self._render("event_update.html", self._revalidate(EventUpdate, report))
 
     def render_portfolio_brief(self, report: PortfolioBrief) -> RenderedReportArtifact:
-        return self._render("portfolio_brief.html", report)
+        return self._render(
+            "portfolio_brief.html", self._revalidate(PortfolioBrief, report)
+        )
 
     def render_industry_landscape(
         self, report: IndustryLandscape
     ) -> RenderedReportArtifact:
-        return self._render("industry_landscape.html", report)
+        return self._render(
+            "industry_landscape.html", self._revalidate(IndustryLandscape, report)
+        )
 
     def render_emerging_monitor(
         self, report: EmergingCompanyMonitor
     ) -> RenderedReportArtifact:
-        return self._render("emerging_monitor.html", report)
+        return self._render(
+            "emerging_monitor.html", self._revalidate(EmergingCompanyMonitor, report)
+        )
+
+    @staticmethod
+    def _revalidate(model_type: type[BaseModel], report: BaseModel) -> BaseModel:
+        """Re-run every validator because model_copy(update=...) is not validated."""
+        return model_type.model_validate(report)
 
     def _render(self, template_name: str, report: object) -> RenderedReportArtifact:
         metadata = report.metadata
@@ -78,9 +91,13 @@ class ReportRenderer:
 
         pdf_error: str | None = None
         try:
+            if pdf_path.exists():
+                pdf_path.unlink()
             self._atomic_pdf(pdf_path, html)
         except Exception as exc:  # HTML is an independently useful approved artifact.
             pdf_error = f"{type(exc).__name__}: {exc}"
+            if pdf_path.exists():
+                pdf_path.unlink()
             pdf_path = None
 
         return RenderedReportArtifact(
@@ -121,6 +138,8 @@ class ReportRenderer:
                 temporary.unlink()
 
     def _atomic_pdf(self, destination: Path, html: str) -> None:
+        from weasyprint import HTML
+
         temporary: Path | None = None
         try:
             with tempfile.NamedTemporaryFile(

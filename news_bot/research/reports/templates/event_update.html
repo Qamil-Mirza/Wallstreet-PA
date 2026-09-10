@@ -11,7 +11,7 @@
 {% if row.display_weight is defined %}<td>{{ row.symbol }}</td><td>{{ row.label }}</td><td>{{ row.display_weight }}</td><td>{{ row.currency }}</td>
 {% elif row.display_range is defined %}<td>{{ row.label }}</td><td>{{ row.low }}</td><td>{{ row.base }}</td><td>{{ row.high }}</td><td>{{ row.unit }}</td>
 {% elif row.display_probability is defined %}<td>{{ row.scenario }}</td><td>{{ row.display_probability }}</td><td>{{ row.value }}</td><td>{{ row.currency }} {{ row.unit }}</td>
-{% endif %}</tr>{% endfor %}</table>{% endif %}<p class="evidence">Sources: {{ exhibit.source_notes|join('; ') }}</p></section>{% endfor %}
+{% endif %}</tr>{% endfor %}</table>{% endif %}<p class="evidence">Sources: {{ exhibit.source_notes|join('; ') }}</p><p class="evidence">Exhibit evidence: {{ exhibit.evidence_ids|join(', ') }}</p></section>{% endfor %}
 {{ sections("Thesis changes", report.thesis_changes) }}
 {{ sections("Unchanged assumptions", report.unchanged_assumptions) }}
 {{ sections("Open questions", report.questions) }}

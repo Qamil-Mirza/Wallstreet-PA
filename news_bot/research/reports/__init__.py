@@ -1,8 +1,11 @@
 """Institutional research report contracts, exhibit builders, and renderer."""
 
 from .exhibits import (
+    ExposureExhibit,
     ExposureRow,
+    ScenarioMatrix,
     ScenarioRow,
+    ValuationExhibit,
     ValuationRow,
     build_exposure_exhibit,
     build_scenario_matrix,
@@ -10,20 +13,28 @@ from .exhibits import (
 )
 from .models import (
     Citation,
+    ConcentrationCorrelation,
     EmergingCompanyMonitor,
     EventUpdate,
     IndustryLandscape,
+    NonClaimSection,
     PortfolioBrief,
+    PortfolioNewsItem,
     RenderedReportArtifact,
     ReportMetadata,
     ReportSection,
+    ResearchView,
+    ResearchViewChange,
+    RoundedExposure,
 )
 from .renderer import ReportRenderer
 
 __all__ = [
-    "Citation", "EmergingCompanyMonitor", "EventUpdate", "ExposureRow",
-    "IndustryLandscape", "PortfolioBrief", "RenderedReportArtifact",
-    "ReportMetadata", "ReportRenderer", "ReportSection", "ScenarioRow",
-    "ValuationRow", "build_exposure_exhibit", "build_scenario_matrix",
-    "build_valuation_exhibit",
+    "Citation", "ConcentrationCorrelation", "EmergingCompanyMonitor",
+    "EventUpdate", "ExposureExhibit", "ExposureRow", "IndustryLandscape",
+    "NonClaimSection", "PortfolioBrief", "PortfolioNewsItem",
+    "RenderedReportArtifact", "ReportMetadata", "ReportRenderer",
+    "ReportSection", "ResearchView", "ResearchViewChange", "RoundedExposure",
+    "ScenarioMatrix", "ScenarioRow", "ValuationExhibit", "ValuationRow",
+    "build_exposure_exhibit", "build_scenario_matrix", "build_valuation_exhibit",
 ]
