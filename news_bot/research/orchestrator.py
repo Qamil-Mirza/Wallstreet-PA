@@ -17,6 +17,7 @@ from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from threading import Event, Thread
+from time import monotonic
 from typing import Protocol
 
 from pydantic import (
@@ -75,8 +76,69 @@ class WorkflowConflict(WorkflowError):
     """Raised when durable workflow state fails a compare-and-swap boundary."""
 
 
-class _LeaseHeartbeatConflict(WorkflowConflict):
-    """Raised when an active stage can no longer renew all of its leases."""
+class StageLeaseLost(WorkflowConflict):
+    """Raised when a runner can no longer safely continue claimed stage work."""
+
+
+class StageExecutionControl:
+    """Cooperative cancellation and fencing control for one runner invocation.
+
+    Cancellation cannot retract an irreversible provider call already in flight.
+    Runners must therefore checkpoint at call boundaries and submit ``task_id``
+    (plus ``publication_effect_key`` for publishing) as stable external fencing
+    and idempotency keys.
+    """
+
+    __slots__ = ("task_id", "publication_effect_key", "_lost_lease_event")
+
+    def __init__(
+        self, *, task_id: str, publication_effect_key: str | None = None
+    ) -> None:
+        self.task_id = _identifier(task_id)
+        self.publication_effect_key = (
+            None
+            if publication_effect_key is None
+            else _hash(publication_effect_key)
+        )
+        self._lost_lease_event = Event()
+
+    @property
+    def lost_lease_event(self) -> Event:
+        """Event set immediately after the orchestrator loses its lease fence."""
+        return self._lost_lease_event
+
+    def wait(self, timeout: float | None = None) -> bool:
+        """Wait until cancellation, returning false only when timeout elapses."""
+        return self._lost_lease_event.wait(timeout)
+
+    def wait_for(self, event: Event, timeout: float | None = None) -> bool:
+        """Wait for another event while promptly honoring lease cancellation."""
+        if not isinstance(event, Event):
+            raise TypeError("event must be threading.Event")
+        deadline = None if timeout is None else monotonic() + timeout
+        while not event.is_set():
+            self.checkpoint()
+            remaining = (
+                _MIN_HEARTBEAT_INTERVAL_SECONDS
+                if deadline is None
+                else deadline - monotonic()
+            )
+            if remaining <= 0:
+                return False
+            if self._lost_lease_event.wait(
+                min(_MIN_HEARTBEAT_INTERVAL_SECONDS, remaining)
+            ):
+                self.checkpoint()
+        self.checkpoint()
+        return True
+
+    def checkpoint(self) -> None:
+        """Fail safely if the stage lease fence has been lost."""
+        if self._lost_lease_event.is_set():
+            raise StageLeaseLost("stage execution lease was lost")
+
+    def _signal_lease_lost(self) -> None:
+        self._lost_lease_event.set()
 
 
 class WorkflowKind(str, Enum):
@@ -253,7 +315,11 @@ class WorkflowRunResult(FrozenWorkflowContract):
 
 
 class StageContext(FrozenWorkflowContract):
-    """Identifier-only context passed to a stage service outside transactions."""
+    """Identifier-only context passed to a stage service outside transactions.
+
+    ``task_id`` is the stable external idempotency/fencing key for provider
+    effects. Publish adapters must additionally use ``publication_effect_key``.
+    """
 
     workflow_id: str
     workflow_kind: WorkflowKind
@@ -406,8 +472,16 @@ class PublicationEffectView(FrozenWorkflowContract):
 
 
 class StageRunner(Protocol):
-    def run(self, context: StageContext) -> StageOutcome:
-        """Perform one claimed stage and return identifier-only metadata."""
+    def run(
+        self, context: StageContext, control: StageExecutionControl
+    ) -> StageOutcome:
+        """Run a stage with cooperative lease fencing.
+
+        Implementations must call ``control.checkpoint()`` immediately before
+        and after every provider or simulated side effect. Provider calls must
+        use ``context.task_id`` as their stable idempotency/fencing key, plus
+        ``context.publication_effect_key`` for publication side effects.
+        """
 
 
 class _TaskDefinition(FrozenWorkflowContract):
@@ -481,8 +555,12 @@ class ResearchOrchestrator:
         self.store = store
         self.runner = runner
         self.owner_id = _identifier(owner_id)
-        if not isinstance(lease_duration, timedelta) or lease_duration <= timedelta(0):
-            raise ValueError("lease_duration must be positive")
+        if not isinstance(lease_duration, timedelta):
+            raise TypeError("lease_duration must be timedelta")
+        if lease_duration < timedelta(
+            seconds=3 * _MIN_HEARTBEAT_INTERVAL_SECONDS
+        ):
+            raise ValueError("lease_duration must be at least 30 milliseconds")
         self.lease_duration = lease_duration
 
     def _now(self) -> datetime:
@@ -537,10 +615,10 @@ class ResearchOrchestrator:
         ttl = self.lease_duration if duration is None else duration
         if not isinstance(ttl, timedelta) or ttl <= timedelta(0):
             raise ValueError("lease duration must be positive")
-        now = self._now()
-        expires = now + ttl
         token = secrets.token_hex(32)
         with self.store.transaction() as connection:
+            now = self._now()
+            expires = now + ttl
             row = connection.execute(
                 "SELECT owner_id, lease_token, expires_at FROM workflow_leases "
                 "WHERE lease_name = ?", (name,),
@@ -573,9 +651,9 @@ class ResearchOrchestrator:
         ttl = self.lease_duration if duration is None else duration
         if not isinstance(ttl, timedelta) or ttl <= timedelta(0):
             raise ValueError("lease duration must be positive")
-        now = self._now()
-        expires = now + ttl
         with self.store.transaction() as connection:
+            now = self._now()
+            expires = now + ttl
             cursor = connection.execute(
                 "UPDATE workflow_leases SET expires_at = ?, renewed_at = ? "
                 "WHERE lease_name = ? AND owner_id = ? AND lease_token = ? "
@@ -589,10 +667,11 @@ class ResearchOrchestrator:
     def release_lease(self, lease: WorkflowLease) -> None:
         lease = WorkflowLease.model_validate(lease)
         with self.store.transaction() as connection:
+            now = self._now()
             cursor = connection.execute(
                 "DELETE FROM workflow_leases WHERE lease_name = ? AND owner_id = ? "
                 "AND lease_token = ? AND expires_at > ?",
-                (lease.lease_name, self.owner_id, lease.lease_token, _utc_text(self._now())),
+                (lease.lease_name, self.owner_id, lease.lease_token, _utc_text(now)),
             )
             if cursor.rowcount != 1:
                 raise WorkflowConflict("workflow lease is stale")
@@ -616,11 +695,11 @@ class ResearchOrchestrator:
             if publication_lease.workflow_id != workflow_id:
                 raise WorkflowConflict("publication heartbeat lease is mismatched")
             named_leases.append(publication_lease)
-        now = self._now()
-        expires = now + self.lease_duration
-        now_text = _utc_text(now)
-        expires_text = _utc_text(expires)
         with self.store.transaction() as connection:
+            now = self._now()
+            expires = now + self.lease_duration
+            now_text = _utc_text(now)
+            expires_text = _utc_text(expires)
             for lease in sorted(named_leases, key=lambda item: item.lease_name):
                 cursor = connection.execute(
                     "UPDATE workflow_leases SET expires_at = ?, renewed_at = ? "
@@ -700,7 +779,7 @@ class ResearchOrchestrator:
         workflow_lease: WorkflowLease,
         claim: TaskClaim,
         publication_lease: WorkflowLease | None,
-    ) -> StageOutcome:
+    ) -> tuple[StageOutcome, StageExecutionControl]:
         """Run external stage work while a bounded background heartbeat owns leases."""
         interval = max(
             _MIN_HEARTBEAT_INTERVAL_SECONDS,
@@ -711,6 +790,10 @@ class ResearchOrchestrator:
         )
         stop = Event()
         failures: list[BaseException] = []
+        control = StageExecutionControl(
+            task_id=context.task_id,
+            publication_effect_key=context.publication_effect_key,
+        )
 
         def heartbeat() -> None:
             while not stop.wait(interval):
@@ -723,6 +806,7 @@ class ResearchOrchestrator:
                     )
                 except BaseException as error:
                     failures.append(error)
+                    control._signal_lease_lost()
                     stop.set()
                     return
 
@@ -732,16 +816,23 @@ class ResearchOrchestrator:
             daemon=True,
         )
         thread.start()
+        runner_error: BaseException | None = None
+        result: StageOutcome | object | None = None
         try:
-            result = self.runner.run(context)
+            control.checkpoint()
+            result = self.runner.run(context, control)
+            control.checkpoint()
+        except BaseException as error:
+            runner_error = error
         finally:
             stop.set()
             thread.join()
         if failures:
-            raise _LeaseHeartbeatConflict(
-                "stage execution lease heartbeat failed"
-            ) from failures[0]
-        return StageOutcome.model_validate(result)
+            raise StageLeaseLost("stage execution lease heartbeat failed") from failures[0]
+        if runner_error is not None:
+            raise runner_error
+        control.checkpoint()
+        return StageOutcome.model_validate(result), control
 
     def _ensure_run(
         self,
@@ -779,8 +870,8 @@ class ResearchOrchestrator:
         }
         key = _digest(identity)
         workflow_id = f"wf_{key[:40]}"
-        now = self._now()
         with self.store.transaction() as connection:
+            now = self._now()
             row = connection.execute(
                 "SELECT workflow_id FROM workflow_runs WHERE idempotency_key = ?", (key,)
             ).fetchone()
@@ -832,10 +923,10 @@ class ResearchOrchestrator:
         """Claim one dependency-ready task, reclaiming expired work safely."""
         workflow_id = _identifier(workflow_id)
         task_id = _identifier(task_id)
-        now = self._now()
-        expires = now + self.lease_duration
         token = secrets.token_hex(32)
         with self.store.transaction() as connection:
+            now = self._now()
+            expires = now + self.lease_duration
             row = connection.execute(
                 "SELECT state, attempt_count, max_attempts, lease_expires_at "
                 "FROM workflow_tasks WHERE workflow_id = ? AND task_id = ?",
@@ -904,7 +995,6 @@ class ResearchOrchestrator:
         valid_failure = outcome is None and failure_code is not None and not deferred
         if not (valid_success or valid_failure):
             raise ValueError("task finalization must select exactly one outcome")
-        now = self._now()
         state = "completed" if outcome is not None and not deferred else (
             "deferred" if deferred else "failed"
         )
@@ -914,6 +1004,7 @@ class ResearchOrchestrator:
         outcome_json = None if outcome is None else _json(outcome.model_dump(mode="json"))
         defer_reason = None if outcome is None else outcome.defer_reason
         with self.store.transaction() as connection:
+            now = self._now()
             if outcome is None:
                 cursor = connection.execute(
                     "UPDATE workflow_tasks SET state = 'failed', defer_reason = ?, "
@@ -1044,8 +1135,8 @@ class ResearchOrchestrator:
 
     def _recover_confirmed_publication(self, workflow_id: str) -> bool:
         """Atomically hydrate a task from an authoritative publication effect."""
-        now = self._now()
         with self.store.transaction() as connection:
+            now = self._now()
             row = connection.execute(
                 "SELECT task.task_id, effect.outcome_json "
                 "FROM workflow_runs AS run "
@@ -1081,10 +1172,10 @@ class ResearchOrchestrator:
     ) -> tuple[TaskClaim | None, PublicationEffectView]:
         """Inspect receipt state before atomically consuming an external attempt."""
         effect_key = self._publication_key(workflow_id, task_id)
-        now = self._now()
-        expires = now + self.lease_duration
         token = secrets.token_hex(32)
         with self.store.transaction() as connection:
+            now = self._now()
+            expires = now + self.lease_duration
             task = connection.execute(
                 "SELECT state, attempt_count, max_attempts, lease_expires_at "
                 "FROM workflow_tasks WHERE workflow_id = ? AND task_id = ? "
@@ -1207,10 +1298,10 @@ class ResearchOrchestrator:
     ) -> PublicationEffectView:
         if outcome.report_id is None or outcome.publication_receipt_hash is None:
             raise WorkflowConflict("publication receipt is missing")
-        now = self._now()
         outcome_json = _json(outcome.model_dump(mode="json"))
         result_hash = _digest(outcome.model_dump(mode="json"))
         with self.store.transaction() as connection:
+            now = self._now()
             cursor = connection.execute(
                 "UPDATE publication_effects SET state = 'confirmed', claim_token = NULL, "
                 "claim_expires_at = NULL, report_id = ?, receipt_hash = ?, "
@@ -1237,8 +1328,8 @@ class ResearchOrchestrator:
     def _mark_publication_unknown(
         self, effect: PublicationEffectView, claim: TaskClaim
     ) -> None:
-        now = self._now()
         with self.store.transaction() as connection:
+            now = self._now()
             connection.execute(
                 "UPDATE publication_effects SET state = 'outcome_unknown', "
                 "claim_token = NULL, claim_expires_at = NULL, updated_at = ? "
@@ -1260,8 +1351,8 @@ class ResearchOrchestrator:
         key = _hash(effect_key)
         report = _identifier(report_id)
         receipt = _hash(receipt_hash)
-        now = self._now()
         with self.store.transaction() as connection:
+            now = self._now()
             row = connection.execute(
                 "SELECT workflow_id, task_id, state, report_id, receipt_hash, "
                 "result_hash, outcome_json "
@@ -1363,8 +1454,8 @@ class ResearchOrchestrator:
         )
 
     def _defer_optional(self, workflow_id: str, stages: Sequence[str], reason: str) -> None:
-        now = self._now()
         with self.store.transaction() as connection:
+            now = self._now()
             connection.execute(
                 f"UPDATE workflow_tasks SET state = 'deferred', defer_reason = ?, "
                 f"lease_token = NULL, lease_expires_at = NULL, completed_at = ? "
@@ -1401,8 +1492,8 @@ class ResearchOrchestrator:
         )
         key = _digest({"workflow": workflow_id, "review": review_task_id, "role": role.value})
         task_id = f"wft_{key[:40]}"
-        now = self._now()
         with self.store.transaction() as connection:
+            now = self._now()
             ordinal = connection.execute(
                 "SELECT COALESCE(MAX(ordinal), -1) + 1 FROM workflow_tasks WHERE workflow_id = ?",
                 (workflow_id,),
@@ -1576,20 +1667,13 @@ class ResearchOrchestrator:
                 task_lease_token=claim.lease_token,
             )
             try:
-                if publication_effect is not None and publication_effect.state in {
-                    PublicationEffectState.CONFIRMED,
-                    PublicationEffectState.RECONCILED,
-                }:
-                    outcome = publication_effect.outcome
-                    if outcome is None:  # pragma: no cover - model guard
-                        raise WorkflowConflict("publication outcome is missing")
-                else:
-                    outcome = self._run_with_heartbeat(
-                        context,
-                        workflow_lease=workflow_lease,
-                        claim=claim,
-                        publication_lease=publish_lease,
-                    )
+                outcome, execution_control = self._run_with_heartbeat(
+                    context,
+                    workflow_lease=workflow_lease,
+                    claim=claim,
+                    publication_lease=publish_lease,
+                )
+                execution_control.checkpoint()
                 if stage == "publish":
                     outcome = self._safe_publication_outcome(outcome)
                 if stage == "publish" and (
@@ -1609,6 +1693,7 @@ class ResearchOrchestrator:
                     publication_effect is not None
                     and publication_effect.state is PublicationEffectState.CLAIMED
                 ):
+                    execution_control.checkpoint()
                     try:
                         publication_effect = self._confirm_publication_effect(
                             publication_effect, claim, outcome
@@ -1618,18 +1703,21 @@ class ResearchOrchestrator:
                         terminal = WorkflowRunState.DEFERRED
                         break
                 if stage == "review" and not self._review_authorizes_publication(outcome):
+                    execution_control.checkpoint()
                     self.finalize_task(claim, outcome=outcome)
                     self._return_for_revision(workflow_id, task_id, outcome)
                     omissions.update(outcome.omissions)
                     terminal = WorkflowRunState.BLOCKED
                     break
                 if outcome.defer_reason is not None and stage != "review":
+                    execution_control.checkpoint()
                     self.finalize_task(claim, outcome=outcome, deferred=True)
                     omissions.update(outcome.omissions)
                     terminal = WorkflowRunState.DEFERRED
                     break
+                execution_control.checkpoint()
                 self.finalize_task(claim, outcome=outcome)
-            except _LeaseHeartbeatConflict:
+            except StageLeaseLost:
                 if (
                     publication_effect is not None
                     and publication_effect.state is PublicationEffectState.CLAIMED
@@ -1681,8 +1769,8 @@ class ResearchOrchestrator:
             terminal = WorkflowRunState.PARTIAL
         if terminal is WorkflowRunState.COMPLETED and partial_release:
             terminal = WorkflowRunState.PARTIAL
-        now = self._now()
         with self.store.transaction() as connection:
+            now = self._now()
             connection.execute(
                 "UPDATE workflow_runs SET state = ?, completed_stages_json = ?, "
                 "report_ids_json = ?, omissions_json = ?, new_agent_runs = ?, "
@@ -1805,7 +1893,8 @@ class ResearchOrchestrator:
 
 __all__ = [
     "DurableTaskView", "PublicationEffectState", "PublicationEffectView",
-    "RecommendationTrigger", "ResearchOrchestrator", "StageContext", "StageOutcome",
-    "StageRunner", "TaskClaim", "WorkflowBusy", "WorkflowConflict", "WorkflowKind",
-    "WorkflowLease", "WorkflowRunResult", "WorkflowRunState", "WorkflowTaskState",
+    "RecommendationTrigger", "ResearchOrchestrator", "StageContext",
+    "StageExecutionControl", "StageLeaseLost", "StageOutcome", "StageRunner",
+    "TaskClaim", "WorkflowBusy", "WorkflowConflict", "WorkflowKind", "WorkflowLease",
+    "WorkflowRunResult", "WorkflowRunState", "WorkflowTaskState",
 ]

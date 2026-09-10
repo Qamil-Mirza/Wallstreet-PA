@@ -20,9 +20,12 @@ from news_bot.research.orchestrator import (
     DurableTaskView,
     RecommendationTrigger,
     ResearchOrchestrator,
+    StageExecutionControl,
+    StageLeaseLost,
     StageContext,
     StageOutcome,
     WorkflowKind,
+    WorkflowLease,
     WorkflowRunResult,
     WorkflowRunState,
     WorkflowTaskState,
@@ -53,7 +56,10 @@ class RecordingRunner:
         self.calls: list[StageContext] = []
         self._lock = Lock()
 
-    def run(self, context: StageContext) -> StageOutcome:
+    def run(
+        self, context: StageContext, control: StageExecutionControl
+    ) -> StageOutcome:
+        control.checkpoint()
         with self._lock:
             self.calls.append(context)
             configured = self.outcomes.get(context.stage)
@@ -74,6 +80,7 @@ class RecordingRunner:
                 )
             else:
                 value = StageOutcome(result_ref=f"result-{context.task_id[-12:]}")
+        control.checkpoint()
         if isinstance(value, BaseException):
             raise value
         return value
@@ -115,6 +122,26 @@ def test_contracts_are_immutable_and_json_roundtrippable() -> None:
         WorkflowRunResult.model_validate(
             {**result.model_dump(), "workflow_id": "account-U123", "nav": "4999"}
         )
+
+
+def test_lease_duration_enforces_heartbeat_floor(store: ResearchStore) -> None:
+    with pytest.raises(TypeError, match="timedelta"):
+        ResearchOrchestrator(
+            store, RecordingRunner(), owner_id="owner-a", lease_duration=True
+        )
+    with pytest.raises(ValueError, match="at least"):
+        ResearchOrchestrator(
+            store,
+            RecordingRunner(),
+            owner_id="owner-a",
+            lease_duration=timedelta(microseconds=29_999),
+        )
+    ResearchOrchestrator(
+        store,
+        RecordingRunner(),
+        owner_id="owner-a",
+        lease_duration=timedelta(milliseconds=30),
+    )
 
 
 def test_daily_run_does_not_recompute_all_ratings(
@@ -451,7 +478,10 @@ def test_publisher_context_uses_only_the_canonical_review_dependency(
     )
 
     class ForgedReviewRunner(RecordingRunner):
-        def run(self, context: StageContext) -> StageOutcome:
+        def run(
+            self, context: StageContext, control: StageExecutionControl
+        ) -> StageOutcome:
+            control.checkpoint()
             if context.stage == "selected_recommendations":
                 with legacy.connect() as connection:
                     publish_task_id, publish_ordinal = connection.execute(
@@ -486,10 +516,13 @@ def test_publisher_context_uses_only_the_canonical_review_dependency(
                             "VALUES (?, ?, ?)",
                             (context.workflow_id, publish_task_id, forged_task_id),
                         )
+                control.checkpoint()
             if context.stage == "publish":
+                control.checkpoint()
                 self.calls.append(context)
+                control.checkpoint()
                 raise KeyboardInterrupt
-            return super().run(context)
+            return super().run(context, control)
 
     runner = ForgedReviewRunner()
     orchestrator = ResearchOrchestrator(legacy, runner, owner_id="scheduler-a")
@@ -666,15 +699,18 @@ def test_publisher_claims_are_rejected_before_effect_confirmation(
     store: ResearchStore, published_claim_ids: tuple[str, ...]
 ) -> None:
     class UntrustedPublisher(RecordingRunner):
-        def run(self, context: StageContext):
+        def run(self, context: StageContext, control: StageExecutionControl):
             if context.stage == "publish":
-                return {
+                control.checkpoint()
+                outcome = {
                     "result_ref": "report-safe",
                     "report_id": "report-safe",
                     "published_claim_ids": published_claim_ids,
                     "publication_receipt_hash": "e" * 64,
                 }
-            return super().run(context)
+                control.checkpoint()
+                return outcome
+            return super().run(context, control)
 
     runner = UntrustedPublisher({
         "review": StageOutcome(quality_gate=valid_quality()),
@@ -1060,6 +1096,139 @@ def test_named_lease_blocks_second_owner_and_reclaims_at_exact_expiry(tmp_path: 
     second.release_lease(replacement)
 
 
+def test_blocked_heartbeat_samples_clock_after_write_lock(tmp_path: Path) -> None:
+    now = [utc()]
+    store = ResearchStore(tmp_path / "research.db", clock=lambda: now[0])
+    store.migrate()
+    orchestrator = ResearchOrchestrator(
+        store,
+        RecordingRunner(),
+        owner_id="owner-a",
+        lease_duration=timedelta(milliseconds=100),
+    )
+    workflow_id, key, _ = orchestrator._ensure_run(
+        kind=WorkflowKind.WEEKLY,
+        as_of=utc(),
+        portfolio_date=None,
+        source_hashes=("a" * 64,),
+        period_key="2026-W35",
+        dry_run=False,
+        authorize_analysis=False,
+        industry_key=None,
+        max_documents=None,
+        recommendation_triggers=(RecommendationTrigger.SCHEDULED,),
+    )
+    lease = orchestrator.acquire_lease(
+        f"workflow:{key}", workflow_id=workflow_id
+    )
+    task_id = orchestrator.list_tasks(workflow_id)[0].task_id
+    claim = orchestrator.claim_task(workflow_id, task_id)
+    blocker = store.connect()
+    blocker.execute("BEGIN IMMEDIATE")
+    started = Event()
+
+    def renew() -> None:
+        started.set()
+        orchestrator._renew_active_execution(
+            workflow_id, lease, claim, None
+        )
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(renew)
+            assert started.wait(timeout=5)
+            time.sleep(0.05)
+            now[0] = claim.lease_expires_at
+            blocker.commit()
+            with pytest.raises(WorkflowConflict, match="stale"):
+                future.result(timeout=5)
+    finally:
+        if blocker.in_transaction:
+            blocker.rollback()
+        blocker.close()
+
+
+def test_background_heartbeat_rejects_expiry_after_sqlite_contention(
+    tmp_path: Path,
+) -> None:
+    store = ResearchStore(tmp_path / "research.db")
+    store.migrate()
+    entered = Event()
+
+    class BlockingRunner(RecordingRunner):
+        def run(
+            self, context: StageContext, control: StageExecutionControl
+        ) -> StageOutcome:
+            if context.stage == "portfolio":
+                entered.set()
+                assert control.wait(timeout=5)
+                control.checkpoint()
+            return super().run(context, control)
+
+    orchestrator = ResearchOrchestrator(
+        store,
+        BlockingRunner(),
+        owner_id="owner-a",
+        lease_duration=timedelta(milliseconds=150),
+    )
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(
+            orchestrator.run_weekly, as_of=utc(), source_hashes=("a" * 64,)
+        )
+        assert entered.wait(timeout=5)
+        blocker = store.connect()
+        try:
+            blocker.execute("BEGIN IMMEDIATE")
+            time.sleep(0.45)
+            blocker.commit()
+        finally:
+            if blocker.in_transaction:
+                blocker.rollback()
+            blocker.close()
+        with pytest.raises(StageLeaseLost, match="heartbeat"):
+            future.result(timeout=5)
+
+
+def test_blocked_acquisition_reclaims_using_post_lock_time(tmp_path: Path) -> None:
+    now = [utc()]
+    store = ResearchStore(tmp_path / "research.db", clock=lambda: now[0])
+    store.migrate()
+    first = ResearchOrchestrator(
+        store,
+        RecordingRunner(),
+        owner_id="owner-a",
+        lease_duration=timedelta(milliseconds=100),
+    )
+    second = ResearchOrchestrator(
+        store,
+        RecordingRunner(),
+        owner_id="owner-b",
+        lease_duration=timedelta(milliseconds=100),
+    )
+    original = first.acquire_lease("workflow:contended")
+    blocker = store.connect()
+    blocker.execute("BEGIN IMMEDIATE")
+    started = Event()
+
+    def acquire() -> WorkflowLease:
+        started.set()
+        return second.acquire_lease("workflow:contended")
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(acquire)
+            assert started.wait(timeout=5)
+            time.sleep(0.05)
+            now[0] = original.expires_at
+            blocker.commit()
+            replacement = future.result(timeout=5)
+    finally:
+        if blocker.in_transaction:
+            blocker.rollback()
+        blocker.close()
+    assert replacement.lease_token != original.lease_token
+
+
 def test_expired_task_claim_is_resumed_without_repeating_completed_effects(
     tmp_path: Path,
 ) -> None:
@@ -1088,11 +1257,13 @@ def test_same_idempotency_key_concurrently_runs_each_effect_once(tmp_path: Path)
     release = Event()
 
     class BlockingRunner(RecordingRunner):
-        def run(self, context: StageContext) -> StageOutcome:
+        def run(
+            self, context: StageContext, control: StageExecutionControl
+        ) -> StageOutcome:
             if context.stage == "portfolio":
                 entered.set()
-                assert release.wait(timeout=5)
-            return super().run(context)
+                assert control.wait_for(release, timeout=5)
+            return super().run(context, control)
 
     runner = BlockingRunner()
     first = ResearchOrchestrator(store, runner, owner_id="owner-a")
@@ -1121,13 +1292,17 @@ def test_publication_is_serialized_across_distinct_workflows(tmp_path: Path) -> 
     lease_duration = timedelta(milliseconds=150)
 
     class BlockingPublisher(RecordingRunner):
-        def run(self, context: StageContext) -> StageOutcome:
+        def run(
+            self, context: StageContext, control: StageExecutionControl
+        ) -> StageOutcome:
             if context.stage == "publish":
+                control.checkpoint()
                 publish_entries.append(context.source_hashes)
+                control.checkpoint()
                 if context.source_hashes == ("a" * 64,):
                     first_entered.set()
-                    assert release_first.wait(timeout=5)
-            return super().run(context)
+                    assert control.wait_for(release_first, timeout=5)
+            return super().run(context, control)
 
     runner = BlockingPublisher()
     first = ResearchOrchestrator(
@@ -1199,13 +1374,17 @@ def test_heartbeat_renews_workflow_and_task_during_long_runner(tmp_path: Path) -
     portfolio_entries = 0
 
     class BlockingRunner(RecordingRunner):
-        def run(self, context: StageContext) -> StageOutcome:
+        def run(
+            self, context: StageContext, control: StageExecutionControl
+        ) -> StageOutcome:
             nonlocal portfolio_entries
             if context.stage == "portfolio":
+                control.checkpoint()
                 portfolio_entries += 1
+                control.checkpoint()
                 entered.set()
-                assert release.wait(timeout=5)
-            return super().run(context)
+                assert control.wait_for(release, timeout=5)
+            return super().run(context, control)
 
     runner = BlockingRunner()
     first = ResearchOrchestrator(
@@ -1246,14 +1425,22 @@ def test_heartbeat_failure_is_surfaced_without_false_completion(
     store = ResearchStore(tmp_path / "research.db")
     store.migrate()
     entered = Event()
-    release = Event()
+    heartbeat_thread_name: list[str] = []
+    workflow_ids: list[str] = []
 
     class BlockingRunner(RecordingRunner):
-        def run(self, context: StageContext) -> StageOutcome:
+        def run(
+            self, context: StageContext, control: StageExecutionControl
+        ) -> StageOutcome:
             if context.stage == "portfolio":
+                workflow_ids.append(context.workflow_id)
                 entered.set()
-                assert release.wait(timeout=5)
-            return super().run(context)
+                assert control.wait(timeout=5)
+                heartbeat_thread_name.append(
+                    f"research-heartbeat-{context.task_id}"
+                )
+                raise RuntimeError("runner also failed")
+            return super().run(context, control)
 
     runner = BlockingRunner()
     orchestrator = ResearchOrchestrator(
@@ -1274,16 +1461,88 @@ def test_heartbeat_failure_is_surfaced_without_false_completion(
             orchestrator.run_weekly, as_of=utc(), source_hashes=("a" * 64,)
         )
         assert entered.wait(timeout=5)
-        time.sleep(0.2)
-        release.set()
-        with pytest.raises(WorkflowConflict, match="heartbeat"):
+        with pytest.raises(StageLeaseLost, match="heartbeat"):
             future.result(timeout=5)
 
     portfolio = next(
-        task for task in orchestrator.list_tasks(runner.calls[0].workflow_id)
+        task for task in orchestrator.list_tasks(workflow_ids[0])
         if task.stage == "portfolio"
     )
     assert portfolio.state is not WorkflowTaskState.COMPLETED
+    assert heartbeat_thread_name
+    assert all(
+        thread.name not in heartbeat_thread_name
+        for thread in __import__("threading").enumerate()
+    )
+
+
+def test_cooperative_runner_is_fenced_before_another_owner_reclaims(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = [utc()]
+    store = ResearchStore(tmp_path / "research.db", clock=lambda: now[0])
+    store.migrate()
+    entered = Event()
+    cancellation_observed = Event()
+    portfolio_invocations = 0
+    side_effect_keys: list[str] = []
+
+    class CooperativeRunner(RecordingRunner):
+        def run(
+            self, context: StageContext, control: StageExecutionControl
+        ) -> StageOutcome:
+            nonlocal portfolio_invocations
+            control.checkpoint()
+            if context.stage == "portfolio":
+                portfolio_invocations += 1
+                if portfolio_invocations == 1:
+                    entered.set()
+                    assert control.wait(timeout=5)
+                    cancellation_observed.set()
+                    control.checkpoint()
+                control.checkpoint()
+                side_effect_keys.append(control.task_id)
+                control.checkpoint()
+            return super().run(context, control)
+
+    runner = CooperativeRunner()
+    first = ResearchOrchestrator(
+        store,
+        runner,
+        owner_id="owner-a",
+        lease_duration=timedelta(milliseconds=100),
+    )
+    second = ResearchOrchestrator(
+        store,
+        runner,
+        owner_id="owner-b",
+        lease_duration=timedelta(milliseconds=100),
+    )
+
+    def fail_renewal(*args, **kwargs):
+        raise WorkflowConflict("forced heartbeat CAS failure")
+
+    monkeypatch.setattr(first, "_renew_active_execution", fail_renewal)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(
+            first.run_weekly, as_of=utc(), source_hashes=("a" * 64,)
+        )
+        assert entered.wait(timeout=5)
+        assert cancellation_observed.wait(timeout=5)
+        with pytest.raises(WorkflowBusy):
+            second.run_weekly(as_of=utc(), source_hashes=("a" * 64,))
+        with pytest.raises(StageLeaseLost):
+            future.result(timeout=5)
+
+    assert side_effect_keys == []
+    assert portfolio_invocations == 1
+    now[0] += timedelta(milliseconds=100)
+    result = second.run_weekly(as_of=utc(), source_hashes=("a" * 64,))
+
+    assert result.status is WorkflowRunState.COMPLETED
+    assert portfolio_invocations == 2
+    assert len(side_effect_keys) == 1
+    assert side_effect_keys[0] == runner.calls[0].task_id
 
 
 def test_task_results_store_identifiers_and_hashes_not_raw_output(
@@ -1423,11 +1682,15 @@ def test_publish_expiry_records_unknown_outcome_and_never_repeats_effect(
     store.migrate()
 
     class ExpiringPublisher(RecordingRunner):
-        def run(self, context: StageContext) -> StageOutcome:
-            outcome = super().run(context)
+        def run(
+            self, context: StageContext, control: StageExecutionControl
+        ) -> StageOutcome:
+            outcome = super().run(context, control)
             if context.stage == "publish":
                 assert context.publication_effect_key
+                control.checkpoint()
                 now[0] += timedelta(minutes=15)
+                control.checkpoint()
             return outcome
 
     runner = ExpiringPublisher()
@@ -1538,10 +1801,14 @@ def test_unknown_publication_requires_explicit_idempotent_reconciliation(
     store.migrate()
 
     class UnknownPublisher(RecordingRunner):
-        def run(self, context: StageContext) -> StageOutcome:
-            outcome = super().run(context)
+        def run(
+            self, context: StageContext, control: StageExecutionControl
+        ) -> StageOutcome:
+            outcome = super().run(context, control)
             if context.stage == "publish":
+                control.checkpoint()
                 now[0] += timedelta(minutes=15)
+                control.checkpoint()
             return outcome
 
     runner = UnknownPublisher()
@@ -1726,12 +1993,16 @@ def test_expired_publish_intent_reconcile_bypasses_attempt_limit_without_recall(
     store.migrate()
 
     class CrashingPublisher(RecordingRunner):
-        def run(self, context: StageContext) -> StageOutcome:
+        def run(
+            self, context: StageContext, control: StageExecutionControl
+        ) -> StageOutcome:
             try:
-                return super().run(context)
+                return super().run(context, control)
             except KeyboardInterrupt:
                 if context.stage == "publish":
+                    control.checkpoint()
                     now[0] += timedelta(minutes=15)
+                    control.checkpoint()
                 raise
 
     runner = CrashingPublisher({"publish": [KeyboardInterrupt()]})
