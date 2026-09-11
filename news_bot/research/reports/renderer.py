@@ -89,16 +89,17 @@ class ReportRenderer:
         pdf_path = self._contained_path(f"{stem}.pdf")
         self._atomic_write(html_path, html.encode("utf-8"))
 
-        pdf_error: str | None = None
-        try:
-            if pdf_path.exists():
-                pdf_path.unlink()
-            self._atomic_pdf(pdf_path, html)
-        except Exception as exc:  # HTML is an independently useful approved artifact.
-            pdf_error = f"{type(exc).__name__}: {exc}"
-            if pdf_path.exists():
-                pdf_path.unlink()
-            pdf_path = None
+        pdf_error = self._remove_existing_pdf(pdf_path)
+        if pdf_error is None:
+            try:
+                self._atomic_pdf(pdf_path, html)
+            except Exception as exc:  # HTML is independently useful.
+                pdf_error = self._error_text(exc)
+                cleanup_error = self._remove_existing_pdf(pdf_path)
+                if cleanup_error is not None:
+                    pdf_error = f"{pdf_error}; cleanup failed: {cleanup_error}"
+
+        current_pdf_path = None if pdf_error is not None else pdf_path
 
         return RenderedReportArtifact(
             report_id=metadata.report_id,
@@ -106,9 +107,22 @@ class ReportRenderer:
             as_of=metadata.as_of,
             html=html,
             html_path=html_path,
-            pdf_path=pdf_path,
+            pdf_path=current_pdf_path,
             pdf_error=pdf_error,
         )
+
+    @staticmethod
+    def _error_text(exc: Exception) -> str:
+        return f"{type(exc).__name__}: {exc}"
+
+    @classmethod
+    def _remove_existing_pdf(cls, path: Path) -> str | None:
+        try:
+            if path.exists():
+                path.unlink()
+        except Exception as exc:
+            return cls._error_text(exc)
+        return None
 
     @staticmethod
     def _filename(report_type: str, report_id: str, as_of: object) -> str:

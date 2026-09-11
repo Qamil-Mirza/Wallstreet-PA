@@ -34,11 +34,24 @@ _ACCOUNT_ASSIGNMENT = re.compile(
     r"(?i)\b(?:account|acct)[_\s-]?(?:id|number|no\.?)\b"
     r"\s*(?:is|of|[:=])\s*[A-Za-z0-9-]{5,}"
 )
+_ACCOUNT_REFERENCE = re.compile(
+    r"(?i)\b(?:brokerage\s+)?(?:account|acct)\b\s*(?:is|of|[:=#-])?\s*"
+    r"(?=[A-Za-z0-9-]*\d)[A-Za-z0-9-]{5,}\b"
+)
 _EXACT_PORTFOLIO_VALUE = re.compile(
     r"(?ix)\b(?:net\s+asset\s+value|nav|cash(?:\s+balance)?|position(?:\s+value)?|market\s+value)\b"
-    r"\s*(?:is|of|[:=])?\s*(?:USD|EUR|GBP|JPY|MYR|[$€£])?\s*"
-    r"\d(?:[\d,]*\d)?(?:\.\d+)?(?![\d,%x×])"
+    r"\s*(?:is|was|were|of|at|stood\s+at|[:=])?\s*[+−-]?\s*(?:\(\s*)?"
+    r"[+−-]?\s*(?:USD|EUR|GBP|JPY|MYR|[$€£])?\s*[+−-]?\s*"
+    r"\d(?:[\d,]*\d)?(?:\.\d+)?(?![\d,.])\s*\)?(?!\s*[%x×])"
 )
+_MONEY_AMOUNT = re.compile(
+    r"(?ix)(?:\(\s*)?(?:"
+    r"[+−-]?\s*(?:USD|EUR|GBP|JPY|MYR|[$€£])\s*[+−-]?\s*\d(?:[\d,]*\d)?(?:\.\d+)?"
+    r"|[+−-]?\s*\d(?:[\d,]*\d)?(?:\.\d+)?\s*(?:USD|EUR|GBP|JPY|MYR|[$€£])"
+    r")\s*\)?"
+)
+_PERCENT_ESCAPE = re.compile(r"%[0-9A-Fa-f]{2}")
+_MAX_PERCENT_DECODE_ROUNDS = 4
 _SENSITIVE_URL_KEYS = {
     "access_token",
     "api_key",
@@ -55,13 +68,35 @@ _SENSITIVE_URL_KEYS = {
 }
 
 
-def _contains_private_material(value: str) -> bool:
+def _contains_private_material_once(value: str) -> bool:
     return bool(
         _SECRET_ASSIGNMENT.search(value)
         or _RAW_SECRET.search(value)
         or _IBKR_ACCOUNT.search(value)
         or _ACCOUNT_ASSIGNMENT.search(value)
+        or _ACCOUNT_REFERENCE.search(value)
         or _EXACT_PORTFOLIO_VALUE.search(value)
+    )
+
+
+def _privacy_decoded_variants(value: str) -> tuple[str, ...]:
+    variants = [value]
+    current = value
+    for _ in range(_MAX_PERCENT_DECODE_ROUNDS):
+        decoded = unquote(current)
+        if decoded == current:
+            return tuple(variants)
+        variants.append(decoded)
+        current = decoded
+    if _PERCENT_ESCAPE.search(current):
+        raise ValueError("display text is excessively percent encoded")
+    return tuple(variants)
+
+
+def _contains_private_material(value: str) -> bool:
+    return any(
+        _contains_private_material_once(candidate)
+        for candidate in _privacy_decoded_variants(value)
     )
 
 
@@ -76,6 +111,13 @@ def _display_text(value: str) -> str:
         raise ValueError("must be nonblank display text without control characters")
     if _contains_private_material(value):
         raise ValueError("display text contains private or sensitive material")
+    return value
+
+
+def _identity_label(value: str) -> str:
+    value = _display_text(value)
+    if any(_MONEY_AMOUNT.search(item) for item in _privacy_decoded_variants(value)):
+        raise ValueError("identity label contains private money material")
     return value
 
 
@@ -258,7 +300,7 @@ class RoundedExposure(DisplayModel):
     evidence_ids: tuple[str, ...] = Field(min_length=1)
 
     _symbol = field_validator("symbol")(_identifier)
-    _label = field_validator("label")(_display_text)
+    _label = field_validator("label")(_identity_label)
     _evidence = field_validator("evidence_ids")(_evidence_ids)
 
     @field_validator("rounded_weight_percent")
@@ -307,6 +349,8 @@ class ResearchView(DisplayModel):
 
 
 class ResearchViewChange(DisplayModel):
+    """Dated rating history, including explicit no-change entries."""
+
     symbol: str
     previous_rating: RecommendationRating
     new_rating: RecommendationRating
@@ -317,13 +361,6 @@ class ResearchViewChange(DisplayModel):
     _symbol = field_validator("symbol")(_identifier)
     _rationale = field_validator("rationale")(_display_text)
     _evidence = field_validator("evidence_ids")(_evidence_ids)
-
-    @model_validator(mode="after")
-    def _changed(self) -> "ResearchViewChange":
-        if self.previous_rating is self.new_rating:
-            raise ValueError("rating change must change the rating")
-        return self
-
 
 class ConcentrationCorrelation(DisplayModel):
     summary: str
@@ -394,6 +431,27 @@ class PortfolioBrief(_Report):
     @model_validator(mode="after")
     def _type(self) -> "PortfolioBrief":
         self._require_type(self.metadata, "portfolio_brief")
+        current_by_symbol: dict[str, RecommendationRating] = {}
+        for view in self.research_views:
+            symbol = view.symbol.casefold()
+            if symbol in current_by_symbol:
+                raise ValueError("current research view symbols must be unique")
+            current_by_symbol[symbol] = view.rating
+
+        history_by_symbol: dict[str, ResearchViewChange] = {}
+        for entry in self.change_history:
+            symbol = entry.symbol.casefold()
+            if symbol in history_by_symbol:
+                raise ValueError("rating history symbols must be unique")
+            history_by_symbol[symbol] = entry
+
+        if set(history_by_symbol) != set(current_by_symbol):
+            raise ValueError(
+                "rating history must contain exactly one entry per current view symbol"
+            )
+        for symbol, rating in current_by_symbol.items():
+            if history_by_symbol[symbol].new_rating is not rating:
+                raise ValueError("rating history must match the current research view rating")
         return self
 
 

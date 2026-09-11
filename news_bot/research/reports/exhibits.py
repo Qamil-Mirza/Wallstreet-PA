@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import re
 from datetime import date
 from decimal import Decimal
 from typing import Literal, Mapping
@@ -10,13 +9,19 @@ from typing import Literal, Mapping
 from pydantic import Field, field_validator, model_validator
 
 from ..quality import CalculatedExhibit
-from .models import DisplayExhibit, DisplayModel, EventUpdate, _identifier, _text
+from .models import (
+    DisplayExhibit,
+    DisplayModel,
+    EventUpdate,
+    _identifier,
+    _identity_label,
+    _text,
+)
 
 
 Currency = Literal["USD", "EUR", "GBP", "JPY", "MYR"]
 ValuationUnit = Literal["currency", "per_share", "multiple", "percent"]
 _ONE = Decimal("1")
-_ROW_ID_CHARACTER = re.compile(r"[^A-Za-z0-9]+")
 
 
 def _plain_text(value: str) -> str:
@@ -34,13 +39,6 @@ def _finite(value: Decimal) -> Decimal:
 
 def _source_note(note: str, source_date: date) -> str:
     return f"{_plain_text(note)} ({source_date.isoformat()})"
-
-
-def _row_id(value: str) -> str:
-    identifier = _ROW_ID_CHARACTER.sub("-", value).strip("-").casefold()
-    if not identifier:
-        raise ValueError("exhibit row requires an authoritative row ID")
-    return identifier
 
 
 def _require_nonempty(rows: tuple[object, ...]) -> None:
@@ -61,6 +59,24 @@ def _notes(rows: tuple[object, ...]) -> tuple[str, ...]:
 def _require_notes(source_notes: tuple[str, ...], rows: tuple[object, ...]) -> None:
     if source_notes != _notes(rows):
         raise ValueError("exhibit source notes must be derived from its rows")
+
+
+def _require_stored_provenance(
+    authority_rows: tuple[DisplayModel, ...], rendered_rows: tuple[DisplayModel, ...]
+) -> None:
+    def keyed(rows: tuple[DisplayModel, ...]) -> dict[str, dict[str, object]]:
+        result: dict[str, dict[str, object]] = {}
+        for row in rows:
+            row_id = str(getattr(row, "row_id")).casefold()
+            if row_id in result:
+                raise ValueError("stored and rendered exhibit row IDs must be unique")
+            result[row_id] = row.model_dump(mode="python")
+        return result
+
+    if keyed(authority_rows) != keyed(rendered_rows):
+        raise ValueError(
+            "rendered exhibit fields do not exactly match authoritative stored provenance"
+        )
 
 
 def _require_authority(
@@ -88,7 +104,10 @@ def _require_authority(
         )
 
 
-class ExposureRow(DisplayModel):
+class StoredExposureRow(DisplayModel):
+    """Authoritative normalized exposure row loaded before presentation."""
+
+    row_id: str
     symbol: str
     label: str
     weight: Decimal = Field(ge=Decimal("0"), le=_ONE)
@@ -96,8 +115,25 @@ class ExposureRow(DisplayModel):
     source_note: str
     source_date: date
 
+    _row_id = field_validator("row_id")(_identifier)
     _symbol = field_validator("symbol")(_identifier)
-    _label = field_validator("label")(_plain_text)
+    _label = field_validator("label")(_identity_label)
+    _weight = field_validator("weight")(_finite)
+    _source = field_validator("source_note")(_plain_text)
+
+
+class ExposureRow(DisplayModel):
+    row_id: str
+    symbol: str
+    label: str
+    weight: Decimal = Field(ge=Decimal("0"), le=_ONE)
+    currency: Currency
+    source_note: str
+    source_date: date
+
+    _row_id = field_validator("row_id")(_identifier)
+    _symbol = field_validator("symbol")(_identifier)
+    _label = field_validator("label")(_identity_label)
     _weight = field_validator("weight")(_finite)
     _source = field_validator("source_note")(_plain_text)
 
@@ -107,6 +143,7 @@ class ExposureRow(DisplayModel):
 
 
 class ExposureExhibit(DisplayExhibit):
+    authority_rows: tuple[StoredExposureRow, ...] = Field(min_length=1)
     rows: tuple[ExposureRow, ...] = Field(min_length=1)
     total_weight: Decimal
 
@@ -114,22 +151,26 @@ class ExposureExhibit(DisplayExhibit):
 
     @model_validator(mode="after")
     def _authoritative_rows(self) -> "ExposureExhibit":
+        _require_stored_provenance(self.authority_rows, self.rows)
         _require_one_currency(self.rows)
         if self.total_weight != _ONE or sum(
             (row.weight for row in self.rows), Decimal("0")
         ) != _ONE:
             raise ValueError("exposure weights do not reconcile to fixed total 1")
-        _require_notes(self.source_notes, self.rows)
+        _require_notes(self.source_notes, self.authority_rows)
         _require_authority(
             self.calculation,
             exhibit_id="exposure",
-            expected={row.symbol: {"weight": row.weight} for row in self.rows},
-            row_count=len(self.rows),
+            expected={row.row_id: {"weight": row.weight} for row in self.authority_rows},
+            row_count=len(self.authority_rows),
         )
         return self
 
 
-class ValuationRow(DisplayModel):
+class StoredValuationRow(DisplayModel):
+    """Authoritative normalized valuation row loaded before presentation."""
+
+    row_id: str
     label: str
     low: Decimal
     base: Decimal
@@ -139,6 +180,32 @@ class ValuationRow(DisplayModel):
     source_note: str
     source_date: date
 
+    _row_id = field_validator("row_id")(_identifier)
+    _label = field_validator("label")(_plain_text)
+    _low = field_validator("low")(_finite)
+    _base = field_validator("base")(_finite)
+    _high = field_validator("high")(_finite)
+    _source = field_validator("source_note")(_plain_text)
+
+    @model_validator(mode="after")
+    def _ordered(self) -> "StoredValuationRow":
+        if not self.low <= self.base <= self.high:
+            raise ValueError("valuation range must satisfy low <= base <= high")
+        return self
+
+
+class ValuationRow(DisplayModel):
+    row_id: str
+    label: str
+    low: Decimal
+    base: Decimal
+    high: Decimal
+    currency: Currency
+    unit: ValuationUnit
+    source_note: str
+    source_date: date
+
+    _row_id = field_validator("row_id")(_identifier)
     _label = field_validator("label")(_plain_text)
     _low = field_validator("low")(_finite)
     _base = field_validator("base")(_finite)
@@ -157,31 +224,36 @@ class ValuationRow(DisplayModel):
 
 
 class ValuationExhibit(DisplayExhibit):
+    authority_rows: tuple[StoredValuationRow, ...] = Field(min_length=1)
     rows: tuple[ValuationRow, ...] = Field(min_length=1)
 
     @model_validator(mode="after")
     def _authoritative_rows(self) -> "ValuationExhibit":
+        _require_stored_provenance(self.authority_rows, self.rows)
         _require_one_currency(self.rows)
         if len({row.unit for row in self.rows}) != 1:
             raise ValueError("valuation rows must use one unit")
-        _require_notes(self.source_notes, self.rows)
+        _require_notes(self.source_notes, self.authority_rows)
         _require_authority(
             self.calculation,
             exhibit_id="valuation",
             expected={
-                _row_id(row.label): {
+                row.row_id: {
                     "low": row.low,
                     "base": row.base,
                     "high": row.high,
                 }
-                for row in self.rows
+                for row in self.authority_rows
             },
-            row_count=len(self.rows),
+            row_count=len(self.authority_rows),
         )
         return self
 
 
-class ScenarioRow(DisplayModel):
+class StoredScenarioRow(DisplayModel):
+    """Authoritative normalized scenario row loaded before presentation."""
+
+    row_id: str
     scenario: str
     probability: Decimal = Field(ge=Decimal("0"), le=_ONE)
     value: Decimal
@@ -190,6 +262,24 @@ class ScenarioRow(DisplayModel):
     source_note: str
     source_date: date
 
+    _row_id = field_validator("row_id")(_identifier)
+    _scenario = field_validator("scenario")(_plain_text)
+    _probability = field_validator("probability")(_finite)
+    _value = field_validator("value")(_finite)
+    _source = field_validator("source_note")(_plain_text)
+
+
+class ScenarioRow(DisplayModel):
+    row_id: str
+    scenario: str
+    probability: Decimal = Field(ge=Decimal("0"), le=_ONE)
+    value: Decimal
+    currency: Currency
+    unit: ValuationUnit
+    source_note: str
+    source_date: date
+
+    _row_id = field_validator("row_id")(_identifier)
     _scenario = field_validator("scenario")(_plain_text)
     _probability = field_validator("probability")(_finite)
     _value = field_validator("value")(_finite)
@@ -201,6 +291,7 @@ class ScenarioRow(DisplayModel):
 
 
 class ScenarioMatrix(DisplayExhibit):
+    authority_rows: tuple[StoredScenarioRow, ...] = Field(min_length=1)
     rows: tuple[ScenarioRow, ...] = Field(min_length=1)
     probability_total: Decimal
 
@@ -208,6 +299,7 @@ class ScenarioMatrix(DisplayExhibit):
 
     @model_validator(mode="after")
     def _authoritative_rows(self) -> "ScenarioMatrix":
+        _require_stored_provenance(self.authority_rows, self.rows)
         _require_one_currency(self.rows)
         if len({row.unit for row in self.rows}) != 1:
             raise ValueError("scenario rows must use one unit")
@@ -215,35 +307,42 @@ class ScenarioMatrix(DisplayExhibit):
             (row.probability for row in self.rows), Decimal("0")
         ) != _ONE:
             raise ValueError("scenario probabilities do not reconcile to fixed total 1")
-        _require_notes(self.source_notes, self.rows)
+        _require_notes(self.source_notes, self.authority_rows)
         _require_authority(
             self.calculation,
             exhibit_id="scenario",
             expected={
-                _row_id(row.scenario): {
+                row.row_id: {
                     "probability": row.probability,
                     "value": row.value,
                 }
-                for row in self.rows
+                for row in self.authority_rows
             },
-            row_count=len(self.rows),
+            row_count=len(self.authority_rows),
         )
         return self
 
 
 def build_exposure_exhibit(
-    rows: tuple[ExposureRow, ...],
+    authority_rows: tuple[StoredExposureRow, ...],
     *,
     calculation: CalculatedExhibit,
     evidence_ids: tuple[str, ...],
 ) -> ExposureExhibit:
-    _require_nonempty(rows)
-    ordered = tuple(sorted(rows, key=lambda row: (row.symbol, row.label)))
+    _require_nonempty(authority_rows)
+    ordered_authority = tuple(
+        sorted(authority_rows, key=lambda row: (row.symbol, row.label, row.row_id))
+    )
+    rows = tuple(
+        ExposureRow.model_validate(row.model_dump(mode="python"))
+        for row in ordered_authority
+    )
     return ExposureExhibit(
         title="Rounded exposure summary",
-        rows=ordered,
-        total_weight=sum((row.weight for row in ordered), Decimal("0")),
-        source_notes=_notes(ordered),
+        rows=rows,
+        total_weight=sum((row.weight for row in rows), Decimal("0")),
+        authority_rows=ordered_authority,
+        source_notes=_notes(ordered_authority),
         evidence_ids=evidence_ids,
         calculation=calculation,
         verified_reconciliation=True,
@@ -251,17 +350,24 @@ def build_exposure_exhibit(
 
 
 def build_valuation_exhibit(
-    rows: tuple[ValuationRow, ...],
+    authority_rows: tuple[StoredValuationRow, ...],
     *,
     calculation: CalculatedExhibit,
     evidence_ids: tuple[str, ...],
 ) -> ValuationExhibit:
-    _require_nonempty(rows)
-    ordered = tuple(sorted(rows, key=lambda row: row.label))
+    _require_nonempty(authority_rows)
+    ordered_authority = tuple(
+        sorted(authority_rows, key=lambda row: (row.label, row.row_id))
+    )
+    rows = tuple(
+        ValuationRow.model_validate(row.model_dump(mode="python"))
+        for row in ordered_authority
+    )
     return ValuationExhibit(
         title="Valuation ranges",
-        rows=ordered,
-        source_notes=_notes(ordered),
+        rows=rows,
+        authority_rows=ordered_authority,
+        source_notes=_notes(ordered_authority),
         evidence_ids=evidence_ids,
         calculation=calculation,
         verified_reconciliation=True,
@@ -269,18 +375,25 @@ def build_valuation_exhibit(
 
 
 def build_scenario_matrix(
-    rows: tuple[ScenarioRow, ...],
+    authority_rows: tuple[StoredScenarioRow, ...],
     *,
     calculation: CalculatedExhibit,
     evidence_ids: tuple[str, ...],
 ) -> ScenarioMatrix:
-    _require_nonempty(rows)
-    ordered = tuple(sorted(rows, key=lambda row: row.scenario))
+    _require_nonempty(authority_rows)
+    ordered_authority = tuple(
+        sorted(authority_rows, key=lambda row: (row.scenario, row.row_id))
+    )
+    rows = tuple(
+        ScenarioRow.model_validate(row.model_dump(mode="python"))
+        for row in ordered_authority
+    )
     return ScenarioMatrix(
         title="Scenario matrix",
-        rows=ordered,
-        probability_total=sum((row.probability for row in ordered), Decimal("0")),
-        source_notes=_notes(ordered),
+        rows=rows,
+        probability_total=sum((row.probability for row in rows), Decimal("0")),
+        authority_rows=ordered_authority,
+        source_notes=_notes(ordered_authority),
         evidence_ids=evidence_ids,
         calculation=calculation,
         verified_reconciliation=True,

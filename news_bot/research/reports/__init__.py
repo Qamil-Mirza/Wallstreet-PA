@@ -5,6 +5,9 @@ from .exhibits import (
     ExposureRow,
     ScenarioMatrix,
     ScenarioRow,
+    StoredExposureRow,
+    StoredScenarioRow,
+    StoredValuationRow,
     ValuationExhibit,
     ValuationRow,
     build_exposure_exhibit,
@@ -35,6 +38,7 @@ __all__ = [
     "NonClaimSection", "PortfolioBrief", "PortfolioNewsItem",
     "RenderedReportArtifact", "ReportMetadata", "ReportRenderer",
     "ReportSection", "ResearchView", "ResearchViewChange", "RoundedExposure",
-    "ScenarioMatrix", "ScenarioRow", "ValuationExhibit", "ValuationRow",
+    "ScenarioMatrix", "ScenarioRow", "StoredExposureRow", "StoredScenarioRow",
+    "StoredValuationRow", "ValuationExhibit", "ValuationRow",
     "build_exposure_exhibit", "build_scenario_matrix", "build_valuation_exhibit",
 ]

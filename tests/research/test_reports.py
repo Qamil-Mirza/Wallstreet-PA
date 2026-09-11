@@ -10,6 +10,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tomllib
+from urllib.parse import quote
 
 import pytest
 from jinja2 import StrictUndefined
@@ -17,11 +18,15 @@ from pydantic import ValidationError
 
 from news_bot.research.models import InferenceMode, RecommendationRating
 from news_bot.research.quality import CalculatedExhibit, CalculatedRow
+from news_bot.research.reports import exhibits as exhibit_models
 from news_bot.research.reports import models as report_models
 from news_bot.research.reports.exhibits import (
     ExposureExhibit,
     ExposureRow,
     ScenarioRow,
+    StoredExposureRow,
+    StoredScenarioRow,
+    StoredValuationRow,
     ValuationRow,
     build_exposure_exhibit,
     build_scenario_matrix,
@@ -200,11 +205,13 @@ def test_emerging_monitor_prohibits_private_company_rating() -> None:
 
 def test_exposure_builder_formats_weight_and_orders_deterministically() -> None:
     rows = (
-        ExposureRow(
+        StoredExposureRow(
+            row_id="NVDA",
             symbol="NVDA", label="NVIDIA", weight=Decimal("0.25"), currency="USD",
             source_note="Broker statement", source_date=date(2026, 9, 8),
         ),
-        ExposureRow(
+        StoredExposureRow(
+            row_id="CASH",
             symbol="CASH", label="Cash", weight=Decimal("0.75"), currency="USD",
             source_note="Broker statement", source_date=date(2026, 9, 8),
         ),
@@ -212,7 +219,7 @@ def test_exposure_builder_formats_weight_and_orders_deterministically() -> None:
     authority = calculation(
         "exposure",
         tuple(
-            CalculatedRow(row_id=row.symbol, values={"weight": row.weight})
+            CalculatedRow(row_id=row.row_id, values={"weight": row.weight})
             for row in rows
         ),
     )
@@ -228,6 +235,7 @@ def test_exposure_builder_formats_weight_and_orders_deterministically() -> None:
 def test_exhibit_rows_reject_non_decimal_numeric_values(bad: object) -> None:
     with pytest.raises(ValidationError):
         ExposureRow(
+            row_id="NVDA",
             symbol="NVDA", label="NVIDIA", weight=bad, currency="USD",  # type: ignore[arg-type]
             source_note="Statement", source_date=date(2026, 9, 8),
         )
@@ -235,13 +243,13 @@ def test_exhibit_rows_reject_non_decimal_numeric_values(bad: object) -> None:
 
 def test_exposure_builder_requires_fixed_total_and_one_currency() -> None:
     rows = (
-        ExposureRow(symbol="A", label="A", weight=Decimal("0.4"), currency="USD", source_note="S", source_date=date(2026, 9, 8)),
-        ExposureRow(symbol="B", label="B", weight=Decimal("0.5"), currency="USD", source_note="S", source_date=date(2026, 9, 8)),
+        StoredExposureRow(row_id="A", symbol="A", label="A", weight=Decimal("0.4"), currency="USD", source_note="S", source_date=date(2026, 9, 8)),
+        StoredExposureRow(row_id="B", symbol="B", label="B", weight=Decimal("0.5"), currency="USD", source_note="S", source_date=date(2026, 9, 8)),
     )
     authority = calculation(
         "exposure",
         tuple(
-            CalculatedRow(row_id=row.symbol, values={"weight": row.weight})
+            CalculatedRow(row_id=row.row_id, values={"weight": row.weight})
             for row in rows
         ),
     )
@@ -251,16 +259,17 @@ def test_exposure_builder_requires_fixed_total_and_one_currency() -> None:
         )
     with pytest.raises(ValueError, match="currency"):
         mixed_rows = rows + (
-            ExposureRow(symbol="C", label="C", weight=Decimal("0.1"), currency="EUR", source_note="S", source_date=date(2026, 9, 8)),
+            StoredExposureRow(row_id="C", symbol="C", label="C", weight=Decimal("0.1"), currency="EUR", source_note="S", source_date=date(2026, 9, 8)),
         )
         build_exposure_exhibit(mixed_rows, calculation=calculation(
             "exposure",
-            tuple(CalculatedRow(row_id=row.symbol, values={"weight": row.weight}) for row in mixed_rows),
+            tuple(CalculatedRow(row_id=row.row_id, values={"weight": row.weight}) for row in mixed_rows),
         ), evidence_ids=("E-001",))
 
 
 def test_valuation_and_scenario_builders_validate_units_and_values() -> None:
-    valuation_row = ValuationRow(
+    valuation_row = StoredValuationRow(
+        row_id="EV-sales",
         label="EV / sales", low=Decimal("5"), base=Decimal("7"), high=Decimal("9"),
         currency="USD", unit="multiple", source_note="Model; Evidence E-001", source_date=date(2026, 9, 8),
     )
@@ -272,11 +281,13 @@ def test_valuation_and_scenario_builders_validate_units_and_values() -> None:
         evidence_ids=("E-001",),
     )
     assert valuation.rows[0].display_range == "5–9 multiple"
-    scenario_row = ScenarioRow(
+    scenario_row = StoredScenarioRow(
+        row_id="Base",
         scenario="Base", probability=Decimal("0.6"), value=Decimal("100"),
         currency="USD", unit="per_share", source_note="Model; Evidence E-001", source_date=date(2026, 9, 8),
     )
-    downside_row = ScenarioRow(
+    downside_row = StoredScenarioRow(
+        row_id="Downside",
         scenario="Downside", probability=Decimal("0.4"), value=Decimal("70"),
         currency="USD", unit="per_share", source_note="Model; Evidence E-001", source_date=date(2026, 9, 8),
     )
@@ -284,14 +295,14 @@ def test_valuation_and_scenario_builders_validate_units_and_values() -> None:
     matrix = build_scenario_matrix(
         scenario_rows,
         calculation=calculation("scenario", tuple(
-            CalculatedRow(row_id=row.scenario, values={"probability": row.probability, "value": row.value})
+            CalculatedRow(row_id=row.row_id, values={"probability": row.probability, "value": row.value})
             for row in scenario_rows
         )),
         evidence_ids=("E-001",),
     )
     assert next(row for row in matrix.rows if row.scenario == "Base").display_probability == "60.0%"
     with pytest.raises(ValidationError):
-        ValuationRow(label="Bad", low=Decimal("9"), base=Decimal("7"), high=Decimal("5"), currency="USD", unit="multiple", source_note="S", source_date=date(2026, 9, 8))
+        ValuationRow(row_id="Bad", label="Bad", low=Decimal("9"), base=Decimal("7"), high=Decimal("5"), currency="USD", unit="multiple", source_note="S", source_date=date(2026, 9, 8))
 
 
 @pytest.mark.parametrize(
@@ -455,7 +466,10 @@ def test_metadata_rejects_unsafe_model_names(model_name: str) -> None:
 def test_display_privacy_filter_allows_legitimate_valuation_language() -> None:
     section_value = ReportSection(
         title="Valuation",
-        body="NAV multiple: 5x; valuation range is USD 70–100 per share.",
+        body=(
+            "NAV was -20%; NAV multiple: 5x; "
+            "valuation range is USD 70–100 per share."
+        ),
         evidence_ids=("E-001",),
     )
     assert "5x" in section_value.body
@@ -497,11 +511,11 @@ def calculation(
 
 def test_exposure_builder_requires_reconciled_authoritative_rows() -> None:
     rows = (
-        ExposureRow(symbol="NVDA", label="NVIDIA", weight=Decimal("0.25"), currency="USD", source_note="Statement", source_date=date(2026, 9, 8)),
-        ExposureRow(symbol="OTHER", label="Other", weight=Decimal("0.75"), currency="USD", source_note="Statement", source_date=date(2026, 9, 8)),
+        StoredExposureRow(row_id="NVDA", symbol="NVDA", label="NVIDIA", weight=Decimal("0.25"), currency="USD", source_note="Statement", source_date=date(2026, 9, 8)),
+        StoredExposureRow(row_id="OTHER", symbol="OTHER", label="Other", weight=Decimal("0.75"), currency="USD", source_note="Statement", source_date=date(2026, 9, 8)),
     )
     authority_rows = tuple(
-        CalculatedRow(row_id=row.symbol, values={"weight": row.weight}) for row in rows
+        CalculatedRow(row_id=row.row_id, values={"weight": row.weight}) for row in rows
     )
     exhibit = build_exposure_exhibit(
         rows,
@@ -524,7 +538,8 @@ def test_exposure_builder_requires_reconciled_authoritative_rows() -> None:
 
 
 def test_exhibit_rejects_stored_vs_rendered_row_mismatch_and_direct_bypass() -> None:
-    row = ExposureRow(symbol="NVDA", label="NVIDIA", weight=Decimal("1"), currency="USD", source_note="Statement", source_date=date(2026, 9, 8))
+    stored = StoredExposureRow(row_id="NVDA", symbol="NVDA", label="NVIDIA", weight=Decimal("1"), currency="USD", source_note="Statement", source_date=date(2026, 9, 8))
+    row = ExposureRow.model_validate(stored.model_dump())
     mismatched = calculation(
         "exposure",
         (CalculatedRow(row_id="NVDA", values={"weight": Decimal("0.9")}),),
@@ -532,13 +547,14 @@ def test_exhibit_rejects_stored_vs_rendered_row_mismatch_and_direct_bypass() -> 
     with pytest.raises(ValidationError, match="authoritative|reconcile"):
         ExposureExhibit(
             title="Exposure", source_notes=("Statement (2026-09-08)",),
-            evidence_ids=("E-001",), rows=(row,), total_weight=Decimal("1"),
+            evidence_ids=("E-001",), authority_rows=(stored,), rows=(row,), total_weight=Decimal("1"),
             calculation=mismatched, verified_reconciliation=True,
         )
 
 
 def test_event_renderer_preserves_typed_exhibit_rows_and_citation(tmp_path: Path) -> None:
-    row = ExposureRow(
+    row = StoredExposureRow(
+        row_id="NVDA",
         symbol="NVDA", label="NVIDIA", weight=Decimal("1"), currency="USD",
         source_note="Statement", source_date=date(2026, 9, 8),
     )
@@ -558,7 +574,8 @@ def test_event_renderer_preserves_typed_exhibit_rows_and_citation(tmp_path: Path
 
 
 def test_renderer_revalidates_copied_exhibit_at_authority_boundary(tmp_path: Path) -> None:
-    row = ExposureRow(
+    row = StoredExposureRow(
+        row_id="NVDA",
         symbol="NVDA", label="NVIDIA", weight=Decimal("1"), currency="USD",
         source_note="Statement", source_date=date(2026, 9, 8),
     )
@@ -575,7 +592,8 @@ def test_renderer_revalidates_copied_exhibit_at_authority_boundary(tmp_path: Pat
 
 
 def test_valuation_and_scenario_builders_reconcile_authoritative_values() -> None:
-    valuation_row = ValuationRow(
+    valuation_row = StoredValuationRow(
+        row_id="EV-sales",
         label="EV sales", low=Decimal("5"), base=Decimal("7"), high=Decimal("9"),
         currency="USD", unit="multiple", source_note="Model", source_date=date(2026, 9, 8),
     )
@@ -587,11 +605,11 @@ def test_valuation_and_scenario_builders_reconcile_authoritative_values() -> Non
     ).verified_reconciliation
 
     scenario_rows = (
-        ScenarioRow(scenario="Base", probability=Decimal("0.6"), value=Decimal("100"), currency="USD", unit="per_share", source_note="Model", source_date=date(2026, 9, 8)),
-        ScenarioRow(scenario="Downside", probability=Decimal("0.4"), value=Decimal("70"), currency="USD", unit="per_share", source_note="Model", source_date=date(2026, 9, 8)),
+        StoredScenarioRow(row_id="Base", scenario="Base", probability=Decimal("0.6"), value=Decimal("100"), currency="USD", unit="per_share", source_note="Model", source_date=date(2026, 9, 8)),
+        StoredScenarioRow(row_id="Downside", scenario="Downside", probability=Decimal("0.4"), value=Decimal("70"), currency="USD", unit="per_share", source_note="Model", source_date=date(2026, 9, 8)),
     )
     scenario_authority = calculation("scenario", tuple(
-        CalculatedRow(row_id=row.scenario, values={"probability": row.probability, "value": row.value}) for row in scenario_rows
+        CalculatedRow(row_id=row.row_id, values={"probability": row.probability, "value": row.value}) for row in scenario_rows
     ))
     assert build_scenario_matrix(
         scenario_rows, calculation=scenario_authority, evidence_ids=("E-001",)
@@ -599,7 +617,7 @@ def test_valuation_and_scenario_builders_reconcile_authoritative_values() -> Non
 
 
 def test_uncited_exhibit_is_rejected() -> None:
-    row = ExposureRow(symbol="NVDA", label="NVIDIA", weight=Decimal("1"), currency="USD", source_note="Statement", source_date=date(2026, 9, 8))
+    row = StoredExposureRow(row_id="NVDA", symbol="NVDA", label="NVIDIA", weight=Decimal("1"), currency="USD", source_note="Statement", source_date=date(2026, 9, 8))
     authority = calculation("exposure", (
         CalculatedRow(row_id="NVDA", values={"weight": Decimal("1")}),
     ))
@@ -669,3 +687,270 @@ def test_wheel_configuration_includes_every_report_template() -> None:
         "base.html", "event_update.html", "portfolio_brief.html",
         "industry_landscape.html", "emerging_monitor.html",
     }
+
+
+@pytest.mark.parametrize(
+    "private_text",
+    (
+        "U%31%32%33%34%35%36%37",
+        "api%5Fkey%3Dsk-live-secret",
+        "Brokerage account 12345678",
+        "NAV was USD 1,234.56",
+        "NAV: USD -1,234.56",
+        "NAV was -USD 1,234.56",
+        "NAV was USD −1,234.56",
+        "cash balance was $1200.25",
+        "cash balance was +EUR 1,200.25",
+        "position value = (USD 9,876.54)",
+    ),
+)
+def test_display_privacy_rejects_encoded_and_accounting_variants(
+    private_text: str,
+) -> None:
+    with pytest.raises(ValidationError, match="private|sensitive"):
+        ReportSection(title="Analysis", body=private_text, evidence_ids=("E-001",))
+
+
+def test_display_privacy_decoding_is_bounded_and_fail_closed() -> None:
+    deeply_encoded = "api_key=sk-live-secret"
+    for _ in range(20):
+        deeply_encoded = quote(deeply_encoded, safe="")
+    with pytest.raises(ValidationError, match="encoded|private|sensitive"):
+        ReportSection(
+            title="Analysis", body=deeply_encoded, evidence_ids=("E-001",)
+        )
+
+    benign = ReportSection(
+        title="Analysis",
+        body="Revenue rose 20%; malformed %ZZ stays literal.",
+        evidence_ids=("E-001",),
+    )
+    assert "%ZZ" in benign.body
+
+
+@pytest.mark.parametrize(
+    "label", ("NVIDIA — USD 1,234.56", "NVIDIA — USD −1,234.56")
+)
+def test_rounded_exposure_identity_rejects_bare_money(label: str) -> None:
+    with pytest.raises(ValidationError, match="money|private|sensitive"):
+        RoundedExposure(
+            symbol="NVDA",
+            label=label,
+            weight_band="20%+",
+            rounded_weight_percent=Decimal("25"),
+            evidence_ids=("E-001",),
+        )
+
+
+def stored_exposure(**updates: object) -> object:
+    StoredExposureRow = getattr(exhibit_models, "StoredExposureRow")
+    values = {
+        "row_id": "position-nvda",
+        "symbol": "NVDA",
+        "label": "NVIDIA",
+        "weight": Decimal("1"),
+        "currency": "USD",
+        "source_note": "Broker statement",
+        "source_date": date(2026, 9, 8),
+    }
+    values.update(updates)
+    return StoredExposureRow(**values)
+
+
+def stored_valuation(**updates: object) -> object:
+    StoredValuationRow = getattr(exhibit_models, "StoredValuationRow")
+    values = {
+        "row_id": "nvda-ev-sales",
+        "label": "NVDA EV / sales",
+        "low": Decimal("5"),
+        "base": Decimal("7"),
+        "high": Decimal("9"),
+        "currency": "USD",
+        "unit": "multiple",
+        "source_note": "Analyst model",
+        "source_date": date(2026, 9, 8),
+    }
+    values.update(updates)
+    return StoredValuationRow(**values)
+
+
+def test_exhibit_builder_derives_display_and_provenance_from_stored_rows() -> None:
+    authority = stored_exposure()
+    numeric = calculation(
+        "exposure",
+        (CalculatedRow(row_id="position-nvda", values={"weight": Decimal("1")}),),
+    )
+    exhibit = build_exposure_exhibit(
+        (authority,), calculation=numeric, evidence_ids=("E-001",)
+    )
+
+    assert exhibit.rows[0].row_id == "position-nvda"
+    assert exhibit.rows[0].label == "NVIDIA"
+    assert exhibit.rows[0].currency == "USD"
+    assert exhibit.source_notes == ("Broker statement (2026-09-08)",)
+    assert exhibit.authority_rows == (authority,)
+
+
+@pytest.mark.parametrize(
+    ("field", "bad_value"),
+    (
+        ("row_id", "wrong-id"),
+        ("label", "Wrong label"),
+        ("currency", "EUR"),
+        ("source_note", "Wrong source"),
+        ("source_date", date(2026, 9, 7)),
+    ),
+)
+def test_exposure_exhibit_rejects_rendered_provenance_mismatch(
+    field: str, bad_value: object
+) -> None:
+    authority = stored_exposure()
+    numeric = calculation(
+        "exposure",
+        (CalculatedRow(row_id="position-nvda", values={"weight": Decimal("1")}),),
+    )
+    valid = build_exposure_exhibit(
+        (authority,), calculation=numeric, evidence_ids=("E-001",)
+    )
+    values = valid.model_dump()
+    values["rows"][0][field] = bad_value
+
+    with pytest.raises(ValidationError, match="authoritative|stored|provenance"):
+        ExposureExhibit.model_validate(values)
+
+
+def test_valuation_exhibit_rejects_rendered_unit_mismatch() -> None:
+    authority = stored_valuation()
+    numeric = calculation(
+        "valuation",
+        (
+            CalculatedRow(
+                row_id="nvda-ev-sales",
+                values={
+                    "low": Decimal("5"),
+                    "base": Decimal("7"),
+                    "high": Decimal("9"),
+                },
+            ),
+        ),
+    )
+    valid = build_valuation_exhibit(
+        (authority,), calculation=numeric, evidence_ids=("E-001",)
+    )
+    values = valid.model_dump()
+    values["rows"][0]["unit"] = "currency"
+
+    with pytest.raises(ValidationError, match="authoritative|stored|provenance"):
+        exhibit_models.ValuationExhibit.model_validate(values)
+
+
+def test_exhibit_builder_rejects_numeric_authority_row_id_mismatch() -> None:
+    authority = stored_exposure()
+    wrong_numeric = calculation(
+        "exposure",
+        (CalculatedRow(row_id="wrong-id", values={"weight": Decimal("1")}),),
+    )
+    with pytest.raises((ValueError, ValidationError), match="authoritative|stored"):
+        build_exposure_exhibit(
+            (authority,), calculation=wrong_numeric, evidence_ids=("E-001",)
+        )
+
+
+def test_rating_history_allows_unchanged_current_view() -> None:
+    unchanged = ResearchViewChange(
+        symbol="NVDA",
+        previous_rating=RecommendationRating.HOLD,
+        new_rating=RecommendationRating.HOLD,
+        rationale="Thesis and valuation remain balanced",
+        changed_on=date(2026, 9, 9),
+        evidence_ids=("E-001",),
+    )
+    values = portfolio_report().model_dump()
+    values["change_history"] = (unchanged.model_dump(),)
+    assert PortfolioBrief.model_validate(values).change_history == (unchanged,)
+
+
+def test_portfolio_history_maps_exactly_once_to_each_current_view() -> None:
+    values = portfolio_report().model_dump()
+    nvda_view = ResearchView(
+        symbol="NVDA",
+        thesis="Demand remains durable",
+        rating=RecommendationRating.HOLD,
+        evidence_ids=("E-001",),
+    ).model_dump()
+    msft_view = ResearchView(
+        symbol="MSFT",
+        thesis="Cloud demand remains durable",
+        rating=RecommendationRating.BUY,
+        evidence_ids=("E-001",),
+    ).model_dump()
+    nvda_history = {
+        "symbol": "nvda",
+        "previous_rating": RecommendationRating.BUY,
+        "new_rating": RecommendationRating.HOLD,
+        "rationale": "Valuation now balanced",
+        "changed_on": date(2026, 9, 9),
+        "evidence_ids": ("E-001",),
+    }
+    msft_history = {
+        "symbol": "MSFT",
+        "previous_rating": RecommendationRating.BUY,
+        "new_rating": RecommendationRating.BUY,
+        "rationale": "No change to the current view",
+        "changed_on": date(2026, 9, 9),
+        "evidence_ids": ("E-001",),
+    }
+    values["research_views"] = (nvda_view, msft_view)
+    values["change_history"] = (nvda_history, msft_history)
+    assert len(PortfolioBrief.model_validate(values).change_history) == 2
+
+    extra = {
+        **msft_history,
+        "symbol": "AAPL",
+        "rationale": "No current view exists",
+    }
+    mismatch = {**nvda_history, "new_rating": RecommendationRating.BUY}
+    for bad_history in (
+        (nvda_history,),
+        (nvda_history, msft_history, nvda_history),
+        (nvda_history, msft_history, extra),
+        (mismatch, msft_history),
+    ):
+        with pytest.raises(ValidationError, match="history|rating|symbol"):
+            PortfolioBrief.model_validate({**values, "change_history": bad_history})
+
+    with pytest.raises(ValidationError, match="current|view|symbol"):
+        PortfolioBrief.model_validate(
+            {**values, "research_views": (nvda_view, nvda_view)}
+        )
+
+
+def test_pdf_stale_cleanup_failure_never_escapes_or_surfaces_stale_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    renderer = ReportRenderer(tmp_path)
+    report = event_report()
+    stale_pdf = tmp_path / (
+        renderer._filename(
+            report.metadata.report_type,
+            report.metadata.report_id,
+            report.metadata.as_of,
+        )
+        + ".pdf"
+    )
+    stale_pdf.write_bytes(b"%PDF-stale")
+    real_unlink = Path.unlink
+
+    def deny_stale_unlink(path: Path, *args: object, **kwargs: object) -> None:
+        if path == stale_pdf:
+            raise PermissionError("cleanup denied")
+        real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", deny_stale_unlink)
+    artifact = renderer.render_event_update(report)
+
+    assert artifact.html_path.exists()
+    assert artifact.pdf_path is None
+    assert "cleanup denied" in (artifact.pdf_error or "")
+    assert stale_pdf.read_bytes() == b"%PDF-stale"
+    assert not tuple(tmp_path.glob("*.tmp"))
