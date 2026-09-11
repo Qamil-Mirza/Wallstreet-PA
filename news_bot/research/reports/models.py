@@ -79,11 +79,20 @@ def _contains_private_material_once(value: str) -> bool:
     )
 
 
+def _privacy_analysis_copy(value: str) -> str:
+    if any(unicodedata.category(char) == "Cf" for char in value):
+        raise ValueError("display text contains invisible format characters")
+    normalized = unicodedata.normalize("NFKC", value)
+    if any(unicodedata.category(char) == "Cf" for char in normalized):
+        raise ValueError("display text contains invisible format characters")
+    return normalized
+
+
 def _privacy_decoded_variants(value: str) -> tuple[str, ...]:
-    variants = [value]
-    current = value
+    current = _privacy_analysis_copy(value)
+    variants = [current]
     for _ in range(_MAX_PERCENT_DECODE_ROUNDS):
-        decoded = unquote(current)
+        decoded = _privacy_analysis_copy(unquote(current))
         if decoded == current:
             return tuple(variants)
         variants.append(decoded)

@@ -50,6 +50,7 @@ from news_bot.research.reports.renderer import ReportRenderer
 
 
 NOW = datetime(2026, 9, 9, 12, tzinfo=timezone.utc)
+PRIVACY_AMOUNT_SIGNS = ("+", "-", "−", "＋", "－", "﹢", "﹣")
 
 
 def metadata(report_type: str) -> ReportMetadata:
@@ -447,6 +448,30 @@ def test_renderer_revalidates_copied_models_at_privacy_boundary(tmp_path: Path) 
         ReportRenderer(tmp_path).render_event_update(unsafe)
 
 
+@pytest.mark.parametrize("sign", PRIVACY_AMOUNT_SIGNS)
+def test_renderer_rejects_copied_private_compatibility_sign_amounts(
+    tmp_path: Path, sign: str
+) -> None:
+    private_body = f"NAV was USD {sign}1,234.56"
+    unsafe = event_report().model_copy(
+        update={
+            "thesis": section("Thesis").model_copy(update={"body": private_body})
+        }
+    )
+
+    with pytest.raises(ValidationError, match="private|sensitive"):
+        ReportRenderer(tmp_path).render_event_update(unsafe)
+
+
+def test_display_privacy_rejects_invisible_keyword_split() -> None:
+    with pytest.raises(ValidationError, match="format|invisible|private|sensitive"):
+        ReportSection(
+            title="Analysis",
+            body="N\u200bAV was USD 1,234.56",
+            evidence_ids=("E-001",),
+        )
+
+
 def test_metadata_accepts_actual_research_config_model_name() -> None:
     values = metadata("event_update").model_dump()
     values["model"] = "library/llama3.1:8b"
@@ -463,16 +488,21 @@ def test_metadata_rejects_unsafe_model_names(model_name: str) -> None:
         ReportMetadata.model_validate(values)
 
 
-def test_display_privacy_filter_allows_legitimate_valuation_language() -> None:
+@pytest.mark.parametrize("sign", (*PRIVACY_AMOUNT_SIGNS, "±"))
+def test_display_privacy_filter_allows_legitimate_valuation_language(
+    sign: str,
+) -> None:
+    body = (
+        f"NAV was {sign}20%; NAV multiple was {sign}5x; "
+        "valuation range is USD 70–100 per share."
+    )
     section_value = ReportSection(
         title="Valuation",
-        body=(
-            "NAV was -20%; NAV multiple: 5x; "
-            "valuation range is USD 70–100 per share."
-        ),
+        body=body,
         evidence_ids=("E-001",),
     )
     assert "5x" in section_value.body
+    assert section_value.body == body
 
 
 def test_material_sections_require_evidence() -> None:
@@ -711,6 +741,25 @@ def test_display_privacy_rejects_encoded_and_accounting_variants(
         ReportSection(title="Analysis", body=private_text, evidence_ids=("E-001",))
 
 
+@pytest.mark.parametrize("sign", PRIVACY_AMOUNT_SIGNS)
+def test_display_privacy_rejects_all_compatibility_sign_amounts(sign: str) -> None:
+    with pytest.raises(ValidationError, match="private|sensitive"):
+        ReportSection(
+            title="Analysis",
+            body=f"NAV was USD {sign}1,234.56",
+            evidence_ids=("E-001",),
+        )
+
+
+@pytest.mark.parametrize("sign", ("＋", "－", "﹢", "﹣"))
+def test_display_privacy_rejects_encoded_compatibility_sign_amounts(
+    sign: str,
+) -> None:
+    encoded = quote(f"NAV was USD {sign}1,234.56", safe="")
+    with pytest.raises(ValidationError, match="private|sensitive"):
+        ReportSection(title="Analysis", body=encoded, evidence_ids=("E-001",))
+
+
 def test_display_privacy_decoding_is_bounded_and_fail_closed() -> None:
     deeply_encoded = "api_key=sk-live-secret"
     for _ in range(20):
@@ -728,14 +777,12 @@ def test_display_privacy_decoding_is_bounded_and_fail_closed() -> None:
     assert "%ZZ" in benign.body
 
 
-@pytest.mark.parametrize(
-    "label", ("NVIDIA — USD 1,234.56", "NVIDIA — USD −1,234.56")
-)
-def test_rounded_exposure_identity_rejects_bare_money(label: str) -> None:
+@pytest.mark.parametrize("sign", PRIVACY_AMOUNT_SIGNS)
+def test_rounded_exposure_identity_rejects_bare_money(sign: str) -> None:
     with pytest.raises(ValidationError, match="money|private|sensitive"):
         RoundedExposure(
             symbol="NVDA",
-            label=label,
+            label=f"NVIDIA — USD {sign}1,234.56",
             weight_band="20%+",
             rounded_weight_percent=Decimal("25"),
             evidence_ids=("E-001",),
