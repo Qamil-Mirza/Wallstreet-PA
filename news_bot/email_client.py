@@ -5,7 +5,9 @@ Builds HTML emails and sends them using configured SMTP server.
 """
 
 import logging
+import os
 import smtplib
+import stat
 from datetime import date
 from email.mime.application import MIMEApplication
 from email.mime.audio import MIMEAudio
@@ -22,6 +24,13 @@ from .selection import get_article_category_label
 
 
 logger = logging.getLogger(__name__)
+
+
+MAX_ATTACHMENTS = 10
+MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024
+MAX_TOTAL_ATTACHMENT_BYTES = 20 * 1024 * 1024
+_ATTACHMENT_READ_CHUNK_BYTES = 64 * 1024
+_SUPPORTED_ATTACHMENT_SUFFIXES = {".pdf", ".mp3", ".wav"}
 
 
 # Section display configuration with emoji icons
@@ -391,6 +400,107 @@ class EmailError(Exception):
     pass
 
 
+def _attachment_basename(path: Path) -> str:
+    """Return a log-safe basename without disclosing its parent directories."""
+    name = path.name or "attachment"
+    return "".join(character if character.isprintable() else "?" for character in name)
+
+
+def _safe_attachment_payload(
+    path: Path,
+    *,
+    remaining_total_bytes: int,
+) -> tuple[bytes | None, str | None]:
+    """Open one unchanged regular file and read it within fixed byte bounds."""
+    try:
+        before = path.lstat()
+    except OSError:
+        return None, "unreadable"
+    if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+        return None, "unsafe"
+    if before.st_size > MAX_ATTACHMENT_BYTES:
+        return None, "oversized"
+    if before.st_size > remaining_total_bytes:
+        return None, "total"
+
+    flags = os.O_RDONLY
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_NONBLOCK", 0)
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(path, flags)
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
+            or opened.st_size != before.st_size
+            or opened.st_size > MAX_ATTACHMENT_BYTES
+            or opened.st_size > remaining_total_bytes
+        ):
+            return None, "unsafe"
+
+        expected = opened.st_size
+        chunks: list[bytes] = []
+        bytes_read = 0
+        while bytes_read < expected:
+            request_size = min(
+                _ATTACHMENT_READ_CHUNK_BYTES,
+                expected - bytes_read,
+                MAX_ATTACHMENT_BYTES - bytes_read,
+                remaining_total_bytes - bytes_read,
+            )
+            if request_size <= 0:
+                return None, "oversized"
+            chunk = os.read(descriptor, request_size)
+            if not chunk:
+                return None, "unsafe"
+            chunks.append(chunk)
+            bytes_read += len(chunk)
+
+        after = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(after.st_mode)
+            or (after.st_dev, after.st_ino, after.st_size)
+            != (opened.st_dev, opened.st_ino, opened.st_size)
+        ):
+            return None, "unsafe"
+        return b"".join(chunks), None
+    except OSError:
+        return None, "unreadable"
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _valid_attachment_signature(suffix: str, payload: bytes) -> bool:
+    if suffix == ".pdf":
+        return payload.startswith(b"%PDF-")
+    if suffix == ".wav":
+        return (
+            len(payload) >= 12
+            and payload[:4] == b"RIFF"
+            and payload[8:12] == b"WAVE"
+        )
+    if suffix == ".mp3":
+        if payload.startswith(b"ID3"):
+            return True
+        if len(payload) < 4:
+            return False
+        header = int.from_bytes(payload[:4], "big")
+        version = (header >> 19) & 0b11
+        layer = (header >> 17) & 0b11
+        bitrate = (header >> 12) & 0b1111
+        sample_rate = (header >> 10) & 0b11
+        return (
+            (header >> 21) & 0x7FF == 0x7FF
+            and version != 0b01
+            and layer != 0b00
+            and bitrate not in {0, 0b1111}
+            and sample_rate != 0b11
+        )
+    return False
+
+
 def send_email(
     config: Config,
     subject: str,
@@ -417,21 +527,39 @@ def send_email(
     unique_paths: list[Path] = []
     seen: set[Path] = set()
     for path in candidates:
-        key = path.resolve(strict=False)
+        key = Path(os.path.abspath(path))
         if key not in seen:
             seen.add(key)
             unique_paths.append(path)
 
     attachment_parts: list[MIMEBase] = []
+    total_attachment_bytes = 0
+    supported_candidates = 0
     for path in unique_paths:
         suffix = path.suffix.lower()
-        if suffix not in {".pdf", ".mp3", ".wav"}:
-            logger.warning("Unsupported attachment type skipped: %s", path.name)
+        basename = _attachment_basename(path)
+        if suffix not in _SUPPORTED_ATTACHMENT_SUFFIXES:
+            logger.warning("Unsupported attachment type skipped: %s", basename)
             continue
-        try:
-            payload = path.read_bytes()
-        except (OSError, PermissionError):
-            logger.warning("Missing or unreadable attachment skipped: %s", path)
+        if supported_candidates >= MAX_ATTACHMENTS:
+            logger.warning("Attachment count limit exceeded; skipped: %s", basename)
+            continue
+        supported_candidates += 1
+        payload, reason = _safe_attachment_payload(
+            path,
+            remaining_total_bytes=MAX_TOTAL_ATTACHMENT_BYTES - total_attachment_bytes,
+        )
+        if payload is None:
+            warning = {
+                "oversized": "Oversized attachment skipped: %s",
+                "total": "Total attachment size limit exceeded; skipped: %s",
+                "unsafe": "Unsafe attachment skipped: %s",
+                "unreadable": "Missing or unreadable attachment skipped: %s",
+            }[reason or "unreadable"]
+            logger.warning(warning, basename)
+            continue
+        if not _valid_attachment_signature(suffix, payload):
+            logger.warning("Invalid attachment signature skipped: %s", basename)
             continue
         if suffix == ".pdf":
             part: MIMEBase = MIMEApplication(payload, _subtype="pdf")
@@ -439,6 +567,7 @@ def send_email(
             part = MIMEAudio(payload, _subtype="mpeg" if suffix == ".mp3" else "wav")
         part.add_header("Content-Disposition", "attachment", filename=path.name)
         attachment_parts.append(part)
+        total_attachment_bytes += len(payload)
 
     # Preserve the historical HTML-only subtype while using mixed for attachments.
     msg = MIMEMultipart("mixed" if attachment_parts else "alternative")

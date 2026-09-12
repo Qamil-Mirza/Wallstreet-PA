@@ -1,5 +1,6 @@
 """Tests for email client module."""
 
+import os
 from datetime import date, datetime
 from email import message_from_string
 from pathlib import Path
@@ -9,6 +10,7 @@ import pytest
 
 from news_bot.classifier import ArticleCategory
 from news_bot.config import Config
+from news_bot import email_client
 from news_bot.email_client import (
     EmailError,
     SECTION_CONFIG,
@@ -298,7 +300,7 @@ class TestSendEmail:
         self, mock_config, tmp_path: Path
     ):
         wav = tmp_path / "brief.wav"
-        wav.write_bytes(b"RIFF-test")
+        wav.write_bytes(b"RIFF\x04\x00\x00\x00WAVE")
         with patch("news_bot.email_client.smtplib.SMTP") as smtp_class:
             smtp = MagicMock()
             smtp_class.return_value.__enter__.return_value = smtp
@@ -321,6 +323,291 @@ class TestSendEmail:
         assert message.get_content_subtype() == "alternative"
         assert "unsupported attachment" in caplog.text.lower()
         assert "missing or unreadable attachment" in caplog.text.lower()
+
+    @pytest.mark.parametrize(
+        ("filename", "payload"),
+        (
+            ("fake.pdf", b"not-a-pdf"),
+            ("fake.wav", b"RIFFxxxx-not-wave"),
+            ("fake.mp3", b"not-an-mp3"),
+        ),
+    )
+    def test_send_email_rejects_invalid_attachment_signatures(
+        self,
+        mock_config,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+        filename: str,
+        payload: bytes,
+    ):
+        attachment = tmp_path / filename
+        attachment.write_bytes(payload)
+
+        with patch("news_bot.email_client.smtplib.SMTP") as smtp_class:
+            smtp = MagicMock()
+            smtp_class.return_value.__enter__.return_value = smtp
+            with caplog.at_level("WARNING"):
+                send_email(
+                    mock_config,
+                    "Research",
+                    "<p>Body</p>",
+                    attachment_paths=(attachment,),
+                )
+
+        message = message_from_string(smtp.sendmail.call_args.args[2])
+        assert message.get_content_subtype() == "alternative"
+        assert "invalid attachment" in caplog.text.lower()
+        assert filename in caplog.text
+
+    @pytest.mark.parametrize(
+        ("payload", "expected_subtype"),
+        (
+            (b"\xff\xfb\x90\x64frame", "mixed"),
+            (b"\xff\xe0\x00\x00invalid", "alternative"),
+        ),
+    )
+    def test_send_email_accepts_only_valid_mpeg_frame_headers(
+        self,
+        mock_config,
+        tmp_path: Path,
+        payload: bytes,
+        expected_subtype: str,
+    ):
+        attachment = tmp_path / "frame.mp3"
+        attachment.write_bytes(payload)
+        with patch("news_bot.email_client.smtplib.SMTP") as smtp_class:
+            smtp = MagicMock()
+            smtp_class.return_value.__enter__.return_value = smtp
+            send_email(
+                mock_config,
+                "Research",
+                "<p>Body</p>",
+                attachment_paths=(attachment,),
+            )
+
+        message = message_from_string(smtp.sendmail.call_args.args[2])
+        assert message.get_content_subtype() == expected_subtype
+
+    def test_send_email_rejects_symlink_directory_and_fifo_without_path_leak(
+        self,
+        mock_config,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        private_dir = tmp_path / "sensitive-parent"
+        private_dir.mkdir()
+        target = private_dir / "target.pdf"
+        target.write_bytes(b"%PDF-secret")
+        symlink = tmp_path / "linked.pdf"
+        symlink.symlink_to(target)
+        directory = tmp_path / "folder.pdf"
+        directory.mkdir()
+        fifo = tmp_path / "pipe.wav"
+        os.mkfifo(fifo)
+        real_read_bytes = Path.read_bytes
+
+        def never_block_on_fifo(path: Path) -> bytes:
+            if path == fifo:
+                raise OSError("test prevented a blocking FIFO read")
+            return real_read_bytes(path)
+
+        monkeypatch.setattr(Path, "read_bytes", never_block_on_fifo)
+
+        with patch("news_bot.email_client.smtplib.SMTP") as smtp_class:
+            smtp = MagicMock()
+            smtp_class.return_value.__enter__.return_value = smtp
+            with caplog.at_level("WARNING"):
+                send_email(
+                    mock_config,
+                    "Research",
+                    "<p>Body</p>",
+                    attachment_paths=(symlink, directory, fifo),
+                )
+
+        message = message_from_string(smtp.sendmail.call_args.args[2])
+        assert message.get_content_subtype() == "alternative"
+        assert "linked.pdf" in caplog.text
+        assert "folder.pdf" in caplog.text
+        assert "pipe.wav" in caplog.text
+        assert "sensitive-parent" not in caplog.text
+        assert str(tmp_path) not in caplog.text
+
+    def test_send_email_skips_per_file_oversize_without_reading_payload(
+        self,
+        mock_config,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ):
+        oversized = tmp_path / "oversized.pdf"
+        with oversized.open("wb") as handle:
+            handle.write(b"%PDF-")
+            handle.seek(email_client.MAX_ATTACHMENT_BYTES)
+            handle.write(b"x")
+
+        with patch("news_bot.email_client.os.read", wraps=os.read) as read:
+            with patch("news_bot.email_client.smtplib.SMTP") as smtp_class:
+                smtp = MagicMock()
+                smtp_class.return_value.__enter__.return_value = smtp
+                with caplog.at_level("WARNING"):
+                    send_email(
+                        mock_config,
+                        "Research",
+                        "<p>Body</p>",
+                        attachment_paths=(oversized,),
+                    )
+
+        assert read.call_count == 0
+        assert "oversized.pdf" in caplog.text
+        assert "oversized" in caplog.text.lower()
+
+    def test_send_email_enforces_attachment_count_in_original_order(
+        self,
+        mock_config,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ):
+        attachments = []
+        max_attachments = email_client.MAX_ATTACHMENTS
+        for index in range(max_attachments + 2):
+            attachment = tmp_path / f"report-{index:02d}.pdf"
+            attachment.write_bytes(b"%PDF-valid")
+            attachments.append(attachment)
+
+        with patch("news_bot.email_client.smtplib.SMTP") as smtp_class:
+            smtp = MagicMock()
+            smtp_class.return_value.__enter__.return_value = smtp
+            with caplog.at_level("WARNING"):
+                send_email(
+                    mock_config,
+                    "Research",
+                    "<p>Body</p>",
+                    attachment_paths=attachments,
+                )
+
+        message = message_from_string(smtp.sendmail.call_args.args[2])
+        parts = [part for part in message.walk() if part.get_content_type() == "application/pdf"]
+        assert len(parts) == max_attachments
+        assert [part.get_filename() for part in parts] == [
+            path.name for path in attachments[:max_attachments]
+        ]
+        assert attachments[max_attachments].name in caplog.text
+        assert attachments[max_attachments + 1].name in caplog.text
+
+    def test_send_email_count_limit_caps_supported_files_even_when_invalid(
+        self,
+        mock_config,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ):
+        attachments = []
+        for index in range(email_client.MAX_ATTACHMENTS):
+            attachment = tmp_path / f"invalid-{index:02d}.pdf"
+            attachment.write_bytes(b"invalid")
+            attachments.append(attachment)
+        final_valid = tmp_path / "valid-after-limit.pdf"
+        final_valid.write_bytes(b"%PDF-valid")
+        attachments.append(final_valid)
+
+        with patch("news_bot.email_client.smtplib.SMTP") as smtp_class:
+            smtp = MagicMock()
+            smtp_class.return_value.__enter__.return_value = smtp
+            with caplog.at_level("WARNING"):
+                send_email(
+                    mock_config,
+                    "Research",
+                    "<p>Body</p>",
+                    attachment_paths=attachments,
+                )
+
+        message = message_from_string(smtp.sendmail.call_args.args[2])
+        assert message.get_content_subtype() == "alternative"
+        assert final_valid.name in caplog.text
+        assert "count" in caplog.text.lower()
+
+    def test_send_email_enforces_cumulative_attachment_limit(
+        self,
+        mock_config,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ):
+        payload_size = (email_client.MAX_TOTAL_ATTACHMENT_BYTES // 3) + 1
+        attachments = []
+        for index in range(3):
+            attachment = tmp_path / f"part-{index}.pdf"
+            attachment.write_bytes(b"%PDF-" + b"x" * (payload_size - 5))
+            attachments.append(attachment)
+
+        assert payload_size < email_client.MAX_ATTACHMENT_BYTES
+        with patch("news_bot.email_client.smtplib.SMTP") as smtp_class:
+            smtp = MagicMock()
+            smtp_class.return_value.__enter__.return_value = smtp
+            with caplog.at_level("WARNING"):
+                send_email(
+                    mock_config,
+                    "Research",
+                    "<p>Body</p>",
+                    attachment_paths=attachments,
+                )
+
+        message = message_from_string(smtp.sendmail.call_args.args[2])
+        parts = [part for part in message.walk() if part.get_content_type() == "application/pdf"]
+        assert len(parts) == 2
+        assert attachments[2].name in caplog.text
+        assert "total" in caplog.text.lower()
+
+    def test_send_email_does_not_open_unsupported_attachment(
+        self, mock_config, tmp_path: Path
+    ):
+        unsupported = tmp_path / "payload.bin"
+        unsupported.write_bytes(b"opaque")
+
+        with patch("news_bot.email_client.os.open", wraps=os.open) as safe_open:
+            with patch("news_bot.email_client.smtplib.SMTP") as smtp_class:
+                smtp = MagicMock()
+                smtp_class.return_value.__enter__.return_value = smtp
+                send_email(
+                    mock_config,
+                    "Research",
+                    "<p>Body</p>",
+                    attachment_paths=(unsupported,),
+                )
+
+        safe_open.assert_not_called()
+        message = message_from_string(smtp.sendmail.call_args.args[2])
+        assert message.get_content_subtype() == "alternative"
+
+    def test_send_email_rejects_file_replaced_between_lstat_and_open(
+        self,
+        mock_config,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ):
+        attachment = tmp_path / "raced.pdf"
+        attachment.write_bytes(b"%PDF-valid")
+        real_fstat = os.fstat
+
+        def mismatched_fstat(fd: int):
+            result = real_fstat(fd)
+            values = list(result)
+            values[1] += 1
+            return os.stat_result(values)
+
+        with patch("news_bot.email_client.os.fstat", side_effect=mismatched_fstat):
+            with patch("news_bot.email_client.smtplib.SMTP") as smtp_class:
+                smtp = MagicMock()
+                smtp_class.return_value.__enter__.return_value = smtp
+                with caplog.at_level("WARNING"):
+                    send_email(
+                        mock_config,
+                        "Research",
+                        "<p>Body</p>",
+                        attachment_paths=(attachment,),
+                    )
+
+        message = message_from_string(smtp.sendmail.call_args.args[2])
+        assert message.get_content_subtype() == "alternative"
+        assert "raced.pdf" in caplog.text
 
 
 class TestBuildSectionedEmailHtml:

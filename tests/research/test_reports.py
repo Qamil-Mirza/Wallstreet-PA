@@ -83,6 +83,23 @@ def section(title: str, body: str = "Evidence E-001 supports this view.") -> Rep
     return ReportSection(title=title, body=body, evidence_ids=("E-001",))
 
 
+def publication_privacy_context(**updates: object) -> object:
+    context_type = getattr(report_models, "PublicationPrivacyContext")
+    values: dict[str, object] = {
+        "sensitive_literals": (),
+        "account_identifiers": (),
+        "portfolio_values": (),
+    }
+    values.update(updates)
+    return context_type(**values)
+
+
+def renderer(output_dir: Path) -> ReportRenderer:
+    return ReportRenderer(
+        output_dir, privacy_context=publication_privacy_context()
+    )
+
+
 def event_report(*, title: str | None = None) -> EventUpdate:
     meta = metadata("event_update")
     if title is not None:
@@ -318,7 +335,7 @@ def test_valuation_and_scenario_builders_validate_units_and_values() -> None:
 def test_all_templates_include_audit_metadata_and_disclosure(
     tmp_path: Path, method: str, report: object
 ) -> None:
-    artifact = getattr(ReportRenderer(tmp_path), method)(report)
+    artifact = getattr(renderer(tmp_path), method)(report)
     assert "Evidence E-001" in artifact.html
     assert "Inference mode: local_only" in artifact.html
     assert "Research only; no order or transaction instruction." in artifact.html
@@ -329,7 +346,7 @@ def test_all_templates_include_audit_metadata_and_disclosure(
 
 
 def test_renderer_autoescapes_all_display_values(tmp_path: Path) -> None:
-    artifact = ReportRenderer(tmp_path).render_event_update(
+    artifact = renderer(tmp_path).render_event_update(
         event_report(title='<script>alert("x")</script>')
     )
     assert "<script>" not in artifact.html
@@ -337,10 +354,10 @@ def test_renderer_autoescapes_all_display_values(tmp_path: Path) -> None:
 
 
 def test_renderer_uses_strict_undefined(tmp_path: Path) -> None:
-    renderer = ReportRenderer(tmp_path)
-    assert renderer.environment.undefined is StrictUndefined
+    report_renderer = renderer(tmp_path)
+    assert report_renderer.environment.undefined is StrictUndefined
     with pytest.raises(Exception):
-        renderer.environment.from_string("{{ missing }}").render()
+        report_renderer.environment.from_string("{{ missing }}").render()
 
 
 def test_renderer_contains_paths_and_sanitizes_filenames(tmp_path: Path) -> None:
@@ -348,7 +365,7 @@ def test_renderer_contains_paths_and_sanitizes_filenames(tmp_path: Path) -> None
     values["report_id"] = "../escape"
     with pytest.raises(ValidationError):
         ReportMetadata.model_validate(values)
-    artifact = ReportRenderer(tmp_path).render_event_update(event_report())
+    artifact = renderer(tmp_path).render_event_update(event_report())
     assert artifact.html_path.parent == tmp_path.resolve()
     assert ".." not in artifact.html_path.name
 
@@ -358,10 +375,10 @@ def test_pdf_failure_retains_html_without_partial_pdf(tmp_path: Path, monkeypatc
         raise RuntimeError("renderer unavailable")
 
     monkeypatch.setattr(ReportRenderer, "_atomic_pdf", fail_pdf)
-    artifact = ReportRenderer(tmp_path).render_event_update(event_report())
+    artifact = renderer(tmp_path).render_event_update(event_report())
     assert artifact.html_path.exists()
     assert artifact.pdf_path is None
-    assert "renderer unavailable" in (artifact.pdf_error or "")
+    assert artifact.pdf_error == "pdf_render_failed"
     assert list(tmp_path.glob("*.pdf")) == []
     assert list(tmp_path.glob("*.tmp")) == []
 
@@ -369,10 +386,10 @@ def test_pdf_failure_retains_html_without_partial_pdf(tmp_path: Path, monkeypatc
 def test_pdf_failure_removes_stale_deterministic_pdf(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    renderer = ReportRenderer(tmp_path)
+    report_renderer = renderer(tmp_path)
     report = event_report()
     stale_pdf = tmp_path / (
-        renderer._filename(
+        report_renderer._filename(
             report.metadata.report_type,
             report.metadata.report_id,
             report.metadata.as_of,
@@ -385,7 +402,7 @@ def test_pdf_failure_removes_stale_deterministic_pdf(
         raise RuntimeError("failed")
 
     monkeypatch.setattr(ReportRenderer, "_atomic_pdf", fail_pdf)
-    artifact = renderer.render_event_update(report)
+    artifact = report_renderer.render_event_update(report)
 
     assert artifact.html_path.exists()
     assert artifact.pdf_path is None
@@ -393,9 +410,9 @@ def test_pdf_failure_removes_stale_deterministic_pdf(
 
 
 def test_remote_resource_fetcher_blocks_network(tmp_path: Path) -> None:
-    renderer = ReportRenderer(tmp_path)
+    report_renderer = renderer(tmp_path)
     with pytest.raises(ValueError, match="remote"):
-        renderer.url_fetcher("https://tracker.example/pixel.png")
+        report_renderer.url_fetcher("https://tracker.example/pixel.png")
 
 
 @pytest.mark.parametrize(
@@ -406,9 +423,14 @@ def test_remote_resource_fetcher_blocks_network(tmp_path: Path) -> None:
         "Raw brokerage account U1234567",
         "account_id=12345678",
         "Account number is 12345678",
+        "The account identifier is 12345678",
+        "Account ID: 12 345 678",
         "NAV: USD 1,234.56",
+        "NAV totals USD 1,234.56",
+        "NAV: USD .50",
         "cash balance = $1200.25",
         "position value: USD 9876.54",
+        "An arbitrary portfolio amount is USD .50",
     ],
 )
 def test_all_display_text_rejects_private_material(private_text: str) -> None:
@@ -431,12 +453,22 @@ def test_all_display_text_rejects_private_material(private_text: str) -> None:
         "https://example.com/source?next=NAV%3DUSD%201234.56",
         "https://example.com/source#token=secret",
         "https://example.com/source#access_token%3Dsecret",
+        "https://example.com/source?X-Amz-Signature=secret",
+        "https://example.com/source?X-Goog-Signature=secret",
+        "https://example.com/source?sig=secret",
+        "https://example.com/source?se=2026-09-09&sp=r&sv=1",
+        "https://example.com/source?credential=secret",
+        "https://example.com/source?%58-Amz-Signature=secret",
+        "https://example.com/source?benign=tracking",
+        "https://example.com/source#section-1",
+        "https://example.com/source?",
+        "https://example.com/source#",
     ],
 )
 def test_citation_url_rejects_embedded_credentials(url: str) -> None:
     values = metadata("event_update").citations[0].model_dump()
     values["url"] = url
-    with pytest.raises(ValidationError, match="credential|sensitive"):
+    with pytest.raises(ValidationError, match="canonical|credential|sensitive"):
         Citation.model_validate(values)
 
 
@@ -445,7 +477,148 @@ def test_renderer_revalidates_copied_models_at_privacy_boundary(tmp_path: Path) 
         update={"thesis": section("Thesis").model_copy(update={"body": "token=secret"})}
     )
     with pytest.raises(ValidationError, match="private|sensitive"):
-        ReportRenderer(tmp_path).render_event_update(unsafe)
+        renderer(tmp_path).render_event_update(unsafe)
+
+
+def test_renderer_requires_explicit_publication_privacy_context(tmp_path: Path) -> None:
+    with pytest.raises(TypeError, match="privacy_context"):
+        ReportRenderer(tmp_path)
+
+
+def test_publication_privacy_context_is_strict_and_frozen() -> None:
+    context_type = getattr(report_models, "PublicationPrivacyContext")
+    context = publication_privacy_context(sensitive_literals=("opaque-secret",))
+    with pytest.raises(ValidationError):
+        context_type(sensitive_literals=["opaque-secret"])
+    with pytest.raises(ValidationError):
+        context.sensitive_literals = ()
+
+
+@pytest.mark.parametrize(
+    "private_body",
+    (
+        "Operational note blue heron remains pending.",
+        "Reference code 12-345 678 is internal.",
+        "An arbitrary metric is USD .50.",
+        "An arbitrary metric is (USD 1,234.56).",
+    ),
+)
+def test_runtime_privacy_context_blocks_registered_values_before_html_write(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    private_body: str,
+) -> None:
+    context = publication_privacy_context(
+        sensitive_literals=("blue heron",),
+        account_identifiers=("12345678",),
+        portfolio_values=(Decimal(".50"), Decimal("1234.56")),
+    )
+    unsafe = event_report().model_copy(
+        update={
+            "thesis": section("Thesis").model_copy(update={"body": private_body})
+        }
+    )
+    publication_error = getattr(report_models, "ReportPublicationError")
+
+    with pytest.raises(publication_error) as exc_info:
+        ReportRenderer(tmp_path, privacy_context=context).render_event_update(unsafe)
+
+    assert str(exc_info.value) == "report publication blocked by privacy policy"
+    assert "blue heron" not in caplog.text
+    assert "12345678" not in caplog.text
+    assert not tuple(tmp_path.glob("*.html"))
+
+
+def test_runtime_privacy_context_allows_unrelated_valuation_prose(
+    tmp_path: Path,
+) -> None:
+    context = publication_privacy_context(
+        sensitive_literals=("unrelated-secret",),
+        account_identifiers=("87654321",),
+        portfolio_values=(Decimal("999.99"),),
+    )
+    safe = event_report().model_copy(
+        update={
+            "thesis": section(
+                "Thesis",
+                "NAV was -20%; NAV multiple was 5x; valuation range is USD 70–100.",
+            )
+        }
+    )
+
+    artifact = ReportRenderer(
+        tmp_path, privacy_context=context
+    ).render_event_update(safe)
+
+    assert "NAV was -20%" in artifact.html
+
+
+def test_runtime_privacy_context_scans_nested_metadata_and_percent_encoding(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    context = publication_privacy_context(sensitive_literals=("blue heron",))
+    unsafe_metadata = event_report().metadata.model_copy(
+        update={"title": "Review of blue%20heron operations"}
+    )
+    unsafe = event_report().model_copy(update={"metadata": unsafe_metadata})
+    publication_error = getattr(report_models, "ReportPublicationError")
+
+    with pytest.raises(publication_error) as exc_info:
+        ReportRenderer(tmp_path, privacy_context=context).render_event_update(unsafe)
+
+    assert str(exc_info.value) == "report publication blocked by privacy policy"
+    assert "blue heron" not in caplog.text
+    assert not tuple(tmp_path.glob("*.html"))
+
+
+def test_runtime_privacy_context_scans_exhibit_strings_before_write(
+    tmp_path: Path,
+) -> None:
+    stored = StoredExposureRow(
+        row_id="NVDA",
+        symbol="NVDA",
+        label="NVIDIA",
+        weight=Decimal("1"),
+        currency="USD",
+        source_note="blue heron statement",
+        source_date=date(2026, 9, 8),
+    )
+    authority = calculation(
+        "exposure",
+        (CalculatedRow(row_id="NVDA", values={"weight": Decimal("1")}),),
+    )
+    exhibit = build_exposure_exhibit(
+        (stored,), calculation=authority, evidence_ids=("E-001",)
+    )
+    unsafe = event_report().model_copy(update={"exhibits": (exhibit,)})
+    publication_error = getattr(report_models, "ReportPublicationError")
+
+    with pytest.raises(publication_error, match="publication blocked"):
+        ReportRenderer(
+            tmp_path,
+            privacy_context=publication_privacy_context(
+                sensitive_literals=("blue heron",)
+            ),
+        ).render_event_update(unsafe)
+
+    assert not tuple(tmp_path.glob("*.html"))
+
+
+def test_runtime_privacy_context_fails_closed_on_exact_typed_numeric_collision(
+    tmp_path: Path,
+) -> None:
+    publication_error = getattr(report_models, "ReportPublicationError")
+
+    with pytest.raises(publication_error, match="publication blocked"):
+        ReportRenderer(
+            tmp_path,
+            privacy_context=publication_privacy_context(
+                portfolio_values=(Decimal("25"),)
+            ),
+        ).render_portfolio_brief(portfolio_report())
+
+    assert not tuple(tmp_path.glob("*.html"))
 
 
 @pytest.mark.parametrize("sign", PRIVACY_AMOUNT_SIGNS)
@@ -460,7 +633,7 @@ def test_renderer_rejects_copied_private_compatibility_sign_amounts(
     )
 
     with pytest.raises(ValidationError, match="private|sensitive"):
-        ReportRenderer(tmp_path).render_event_update(unsafe)
+        renderer(tmp_path).render_event_update(unsafe)
 
 
 def test_display_privacy_rejects_invisible_keyword_split() -> None:
@@ -525,7 +698,7 @@ def test_industry_definition_is_required() -> None:
 
 
 def test_industry_definition_renders_before_value_chain(tmp_path: Path) -> None:
-    html = ReportRenderer(tmp_path).render_industry_landscape(industry_report()).html
+    html = renderer(tmp_path).render_industry_landscape(industry_report()).html
     assert html.index("Industry definition") < html.index("Value chain")
 
 
@@ -596,7 +769,7 @@ def test_event_renderer_preserves_typed_exhibit_rows_and_citation(tmp_path: Path
     )
     report = event_report().model_copy(update={"exhibits": (exhibit,)})
 
-    artifact = ReportRenderer(tmp_path).render_event_update(report)
+    artifact = renderer(tmp_path).render_event_update(report)
 
     assert "100.0%" in artifact.html
     assert "Statement (2026-09-08)" in artifact.html
@@ -618,7 +791,7 @@ def test_renderer_revalidates_copied_exhibit_at_authority_boundary(tmp_path: Pat
     report = event_report().model_copy(update={"exhibits": (exhibit,)})
 
     with pytest.raises(ValidationError, match="reconcile"):
-        ReportRenderer(tmp_path).render_event_update(report)
+        renderer(tmp_path).render_event_update(report)
 
 
 def test_valuation_and_scenario_builders_reconcile_authoritative_values() -> None:
@@ -672,7 +845,9 @@ def test_typed_portfolio_brief_exposes_only_rounded_research_views() -> None:
         change_history=(ResearchViewChange(symbol="NVDA", previous_rating=RecommendationRating.BUY, new_rating=RecommendationRating.HOLD, rationale="Valuation now balanced", changed_on=date(2026, 9, 9), evidence_ids=("E-001",)),),
         concentration_and_correlation=ConcentrationCorrelation(summary="High semiconductor concentration", risk_level="high", evidence_ids=("E-001",)),
     )
-    html = ReportRenderer(Path(os.environ.get("TMPDIR", "/tmp")) / "typed-report-test").render_portfolio_brief(report).html
+    html = renderer(
+        Path(os.environ.get("TMPDIR", "/tmp")) / "typed-report-test"
+    ).render_portfolio_brief(report).html
     assert "25%" in html
     assert "Supports demand durability" in html
     assert "hold" in html
@@ -703,10 +878,10 @@ def test_pdf_backend_import_failure_retains_html(tmp_path: Path, monkeypatch: py
         return real_import(name, *args, **kwargs)
 
     monkeypatch.setattr(builtins, "__import__", unavailable)
-    artifact = ReportRenderer(tmp_path).render_event_update(event_report())
+    artifact = renderer(tmp_path).render_event_update(event_report())
     assert artifact.html_path.exists()
     assert artifact.pdf_path is None
-    assert "backend unavailable" in (artifact.pdf_error or "")
+    assert artifact.pdf_error == "pdf_backend_unavailable"
     assert not tuple(tmp_path.glob("*.pdf"))
 
 
@@ -973,12 +1148,14 @@ def test_portfolio_history_maps_exactly_once_to_each_current_view() -> None:
 
 
 def test_pdf_stale_cleanup_failure_never_escapes_or_surfaces_stale_path(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    renderer = ReportRenderer(tmp_path)
+    report_renderer = renderer(tmp_path)
     report = event_report()
     stale_pdf = tmp_path / (
-        renderer._filename(
+        report_renderer._filename(
             report.metadata.report_type,
             report.metadata.report_id,
             report.metadata.as_of,
@@ -994,10 +1171,14 @@ def test_pdf_stale_cleanup_failure_never_escapes_or_surfaces_stale_path(
         real_unlink(path, *args, **kwargs)
 
     monkeypatch.setattr(Path, "unlink", deny_stale_unlink)
-    artifact = renderer.render_event_update(report)
+    publication_error = getattr(report_models, "ReportPublicationError")
+    with pytest.raises(publication_error) as exc_info:
+        report_renderer.render_event_update(report)
 
-    assert artifact.html_path.exists()
-    assert artifact.pdf_path is None
-    assert "cleanup denied" in (artifact.pdf_error or "")
+    assert str(exc_info.value) == "report output conflict"
+    assert tuple(tmp_path.glob("*.html"))
+    assert "cleanup denied" not in caplog.text
+    assert "cleanup denied" not in str(exc_info.value)
+    assert str(stale_pdf) not in caplog.text
     assert stale_pdf.read_bytes() == b"%PDF-stale"
     assert not tuple(tmp_path.glob("*.tmp"))

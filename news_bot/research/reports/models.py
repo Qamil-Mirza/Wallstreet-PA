@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from collections.abc import Mapping
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Literal
-from urllib.parse import parse_qsl, unquote, urlsplit
+from urllib.parse import unquote, urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -31,41 +32,42 @@ _SECRET_ASSIGNMENT = re.compile(
 _RAW_SECRET = re.compile(r"\b(?:sk-[A-Za-z0-9_-]{8,}|AKIA[A-Z0-9]{12,})\b")
 _IBKR_ACCOUNT = re.compile(r"(?i)\b(?:DU|U|F|FA|I|M)\d{5,}\b")
 _ACCOUNT_ASSIGNMENT = re.compile(
-    r"(?i)\b(?:account|acct)[_\s-]?(?:id|number|no\.?)\b"
-    r"\s*(?:is|of|[:=])\s*[A-Za-z0-9-]{5,}"
+    r"(?i)\b(?:account|acct)[_\s-]?(?:id|identifier|number|no\.?)\b"
+    r"\s*(?:is|of|[:=])\s*"
+    r"(?=(?:[^\d]*\d){5,})[A-Za-z0-9](?:[A-Za-z0-9\s-]*[A-Za-z0-9])?"
 )
 _ACCOUNT_REFERENCE = re.compile(
     r"(?i)\b(?:brokerage\s+)?(?:account|acct)\b\s*(?:is|of|[:=#-])?\s*"
-    r"(?=[A-Za-z0-9-]*\d)[A-Za-z0-9-]{5,}\b"
+    r"(?=(?:[^\d]*\d){5,})[A-Za-z0-9](?:[A-Za-z0-9\s-]*[A-Za-z0-9])?"
 )
+_MONEY_NUMBER = r"(?:\d(?:[\d,]*\d)?(?:\.\d+)?|\.\d+)"
 _EXACT_PORTFOLIO_VALUE = re.compile(
     r"(?ix)\b(?:net\s+asset\s+value|nav|cash(?:\s+balance)?|position(?:\s+value)?|market\s+value)\b"
-    r"\s*(?:is|was|were|of|at|stood\s+at|[:=])?\s*[+−-]?\s*(?:\(\s*)?"
+    r"\s*(?:is|was|were|of|at|totals?|totaled|stood\s+at|[:=])?\s*[+−-]?\s*(?:\(\s*)?"
     r"[+−-]?\s*(?:USD|EUR|GBP|JPY|MYR|[$€£])?\s*[+−-]?\s*"
-    r"\d(?:[\d,]*\d)?(?:\.\d+)?(?![\d,.])\s*\)?(?!\s*[%x×])"
+    + _MONEY_NUMBER
+    + r"(?![\d,]|\.\d)\s*\)?(?!\s*(?:[%x×]|[–—-]\s*\d))"
 )
 _MONEY_AMOUNT = re.compile(
     r"(?ix)(?:\(\s*)?(?:"
-    r"[+−-]?\s*(?:USD|EUR|GBP|JPY|MYR|[$€£])\s*[+−-]?\s*\d(?:[\d,]*\d)?(?:\.\d+)?"
-    r"|[+−-]?\s*\d(?:[\d,]*\d)?(?:\.\d+)?\s*(?:USD|EUR|GBP|JPY|MYR|[$€£])"
-    r")\s*\)?"
+    r"[+−-]?\s*(?:USD|EUR|GBP|JPY|MYR|[$€£])\s*[+−-]?\s*"
+    + _MONEY_NUMBER
+    + r"|[+−-]?\s*"
+    + _MONEY_NUMBER
+    + r"\s*(?:USD|EUR|GBP|JPY|MYR|[$€£])"
+    r")(?![\d,]|\.\d)\s*\)?(?!\s*(?:[%x×]|[–—-]\s*\d))"
+)
+_PUBLICATION_NUMBER = re.compile(
+    r"(?ix)(?<![\w.])(?P<paren>\()?\s*"
+    r"(?:(?:USD|EUR|GBP|JPY|MYR|[$€£])\s*)?"
+    r"(?P<sign>[+−-])?\s*(?P<number>"
+    + _MONEY_NUMBER
+    + r")\s*\)?(?![\d,]|\.\d)"
 )
 _PERCENT_ESCAPE = re.compile(r"%[0-9A-Fa-f]{2}")
 _MAX_PERCENT_DECODE_ROUNDS = 4
-_SENSITIVE_URL_KEYS = {
-    "access_token",
-    "api_key",
-    "apikey",
-    "auth",
-    "authorization",
-    "client_secret",
-    "credential",
-    "password",
-    "passwd",
-    "secret",
-    "signature",
-    "token",
-}
+class ReportPublicationError(RuntimeError):
+    """Sanitized hard failure at the report publication boundary."""
 
 
 def _contains_private_material_once(value: str) -> bool:
@@ -76,6 +78,7 @@ def _contains_private_material_once(value: str) -> bool:
         or _ACCOUNT_ASSIGNMENT.search(value)
         or _ACCOUNT_REFERENCE.search(value)
         or _EXACT_PORTFOLIO_VALUE.search(value)
+        or _MONEY_AMOUNT.search(value)
     )
 
 
@@ -173,6 +176,141 @@ class DisplayModel(BaseModel):
     )
 
 
+def _context_text(value: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError("privacy context values must be text")
+    normalized = _privacy_analysis_copy(value).strip()
+    if not normalized:
+        raise ValueError("privacy context values must be nonblank")
+    return value
+
+
+def _account_key(value: str) -> str:
+    return "".join(
+        character
+        for character in _privacy_analysis_copy(value).casefold()
+        if character.isalnum()
+    )
+
+
+def _publication_number_values(value: str) -> tuple[Decimal, ...]:
+    normalized = _privacy_analysis_copy(value).replace("−", "-")
+    matches: list[Decimal] = []
+    for match in _PUBLICATION_NUMBER.finditer(normalized):
+        before = normalized[: match.start()].rstrip()
+        after = normalized[match.end() :].lstrip()
+        if after.startswith(("%", "x", "×")):
+            continue
+        if after.startswith(("-", "–", "—")) or before.endswith(("-", "–", "—")):
+            continue
+        try:
+            numeric = Decimal(match.group("number").replace(",", ""))
+        except Exception:
+            continue
+        if match.group("sign") == "-" or match.group("paren"):
+            numeric = -numeric
+        matches.append(numeric)
+    return tuple(matches)
+
+
+class PublicationPrivacyContext(DisplayModel):
+    """Caller-supplied local values that must never cross publication."""
+
+    sensitive_literals: tuple[str, ...]
+    account_identifiers: tuple[str, ...]
+    portfolio_values: tuple[Decimal, ...]
+
+    _literals = field_validator("sensitive_literals")(
+        lambda values: tuple(_context_text(value) for value in values)
+    )
+    _accounts = field_validator("account_identifiers")(
+        lambda values: tuple(_context_text(value) for value in values)
+    )
+
+    @field_validator("account_identifiers")
+    @classmethod
+    def _valid_accounts(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        for value in values:
+            key = _account_key(value)
+            if len(key) < 5 or not any(character.isdigit() for character in key):
+                raise ValueError("privacy account identifiers must be specific")
+        return values
+
+    @field_validator("portfolio_values")
+    @classmethod
+    def _finite_values(cls, values: tuple[Decimal, ...]) -> tuple[Decimal, ...]:
+        if any(not value.is_finite() for value in values):
+            raise ValueError("privacy portfolio values must be finite")
+        return values
+
+    def assert_safe(self, report: BaseModel) -> None:
+        literal_keys = tuple(
+            variant.casefold()
+            for literal in self.sensitive_literals
+            for variant in _privacy_decoded_variants(literal)
+        )
+        account_keys = tuple(_account_key(value) for value in self.account_identifiers)
+        portfolio_values = tuple(abs(value) for value in self.portfolio_values)
+
+        def inspect(value: object) -> None:
+            if isinstance(value, BaseModel):
+                for field_value in value.__dict__.values():
+                    inspect(field_value)
+                return
+            if isinstance(value, Mapping):
+                for key, item in value.items():
+                    inspect(key)
+                    inspect(item)
+                return
+            if isinstance(value, (tuple, list, set, frozenset)):
+                for item in value:
+                    inspect(item)
+                return
+            if isinstance(value, str):
+                try:
+                    variants = _privacy_decoded_variants(value)
+                except ValueError:
+                    raise ReportPublicationError(
+                        "report publication blocked by privacy policy"
+                    ) from None
+                for variant in variants:
+                    folded = variant.casefold()
+                    if any(literal in folded for literal in literal_keys):
+                        raise ReportPublicationError(
+                            "report publication blocked by privacy policy"
+                        )
+                    account_text = _account_key(variant)
+                    if any(account in account_text for account in account_keys):
+                        raise ReportPublicationError(
+                            "report publication blocked by privacy policy"
+                        )
+                    if any(
+                        abs(number) in portfolio_values
+                        for number in _publication_number_values(variant)
+                    ):
+                        raise ReportPublicationError(
+                            "report publication blocked by privacy policy"
+                        )
+                return
+            if isinstance(value, Decimal):
+                if abs(value) in portfolio_values:
+                    raise ReportPublicationError(
+                        "report publication blocked by privacy policy"
+                    )
+                return
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                try:
+                    numeric = abs(Decimal(str(value)))
+                except Exception:
+                    return
+                if numeric in portfolio_values:
+                    raise ReportPublicationError(
+                        "report publication blocked by privacy policy"
+                    )
+
+        inspect(report)
+
+
 class Citation(DisplayModel):
     evidence_id: str
     source: str
@@ -193,25 +331,8 @@ class Citation(DisplayModel):
             raise ValueError("must be an absolute public HTTP(S) URL")
         if parsed.username is not None or parsed.password is not None:
             raise ValueError("citation URL must not contain credentials")
-        query_keys = {
-            key.casefold().replace("-", "_")
-            for key, _ in parse_qsl(parsed.query, keep_blank_values=True)
-        }
-        if query_keys & _SENSITIVE_URL_KEYS:
-            raise ValueError("citation URL contains sensitive query credentials")
-        decoded_query = unquote(parsed.query)
-        if _contains_private_material(decoded_query):
-            raise ValueError("citation URL contains sensitive query credentials")
-        fragment_keys = {
-            key.casefold().replace("-", "_")
-            for key, _ in parse_qsl(parsed.fragment, keep_blank_values=True)
-        }
-        decoded_fragment = unquote(parsed.fragment)
-        if (
-            fragment_keys & _SENSITIVE_URL_KEYS
-            or _contains_private_material(decoded_fragment)
-        ):
-            raise ValueError("citation URL contains sensitive fragment credentials")
+        if "?" in value or "#" in value:
+            raise ValueError("citation URL must be canonical without query or fragment")
         return value
 
     @field_validator("content_hash")
@@ -503,7 +624,9 @@ class RenderedReportArtifact(DisplayModel):
     html: str
     html_path: Path
     pdf_path: Path | None
-    pdf_error: str | None = None
+    pdf_error: Literal[
+        "pdf_backend_unavailable", "pdf_render_failed", "pdf_cleanup_failed"
+    ] | None = None
 
 
 # Explicit long-form aliases make the view-model purpose discoverable.

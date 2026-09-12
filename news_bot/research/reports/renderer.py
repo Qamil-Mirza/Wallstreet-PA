@@ -10,14 +10,16 @@ from urllib.parse import unquote, urlsplit
 
 from jinja2 import PackageLoader, StrictUndefined, select_autoescape
 from jinja2.sandbox import SandboxedEnvironment
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from .models import (
     EmergingCompanyMonitor,
     EventUpdate,
     IndustryLandscape,
     PortfolioBrief,
+    PublicationPrivacyContext,
     RenderedReportArtifact,
+    ReportPublicationError,
 )
 
 
@@ -27,9 +29,17 @@ _FILENAME_CHARACTER = re.compile(r"[^A-Za-z0-9_.-]+")
 class ReportRenderer:
     """Render validated display models without granting templates I/O access."""
 
-    def __init__(self, output_dir: Path) -> None:
+    def __init__(
+        self,
+        output_dir: Path,
+        *,
+        privacy_context: PublicationPrivacyContext,
+    ) -> None:
+        if not isinstance(privacy_context, PublicationPrivacyContext):
+            raise TypeError("privacy_context must be a PublicationPrivacyContext")
         self.output_dir = Path(output_dir).resolve()
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.privacy_context = privacy_context
         self.template_root = Path(__file__).with_name("templates").resolve()
         self.environment = SandboxedEnvironment(
             loader=PackageLoader("news_bot.research.reports", "templates"),
@@ -76,10 +86,19 @@ class ReportRenderer:
             "emerging_monitor.html", self._revalidate(EmergingCompanyMonitor, report)
         )
 
-    @staticmethod
-    def _revalidate(model_type: type[BaseModel], report: BaseModel) -> BaseModel:
+    def _revalidate(
+        self, model_type: type[BaseModel], report: BaseModel
+    ) -> BaseModel:
         """Re-run every validator because model_copy(update=...) is not validated."""
-        return model_type.model_validate(report)
+        try:
+            validated = model_type.model_validate(report)
+        except ValidationError:
+            # Registered values still receive the stable publication-boundary error,
+            # while unrelated model-copy bypasses retain their validation details.
+            self.privacy_context.assert_safe(report)
+            raise
+        self.privacy_context.assert_safe(validated)
+        return validated
 
     def _render(self, template_name: str, report: object) -> RenderedReportArtifact:
         metadata = report.metadata
@@ -89,15 +108,20 @@ class ReportRenderer:
         pdf_path = self._contained_path(f"{stem}.pdf")
         self._atomic_write(html_path, html.encode("utf-8"))
 
-        pdf_error = self._remove_existing_pdf(pdf_path)
-        if pdf_error is None:
-            try:
-                self._atomic_pdf(pdf_path, html)
-            except Exception as exc:  # HTML is independently useful.
-                pdf_error = self._error_text(exc)
-                cleanup_error = self._remove_existing_pdf(pdf_path)
-                if cleanup_error is not None:
-                    pdf_error = f"{pdf_error}; cleanup failed: {cleanup_error}"
+        if not self._remove_existing_pdf(pdf_path):
+            raise ReportPublicationError("report output conflict")
+
+        pdf_error = None
+        try:
+            self._atomic_pdf(pdf_path, html)
+        except Exception as exc:  # HTML is independently useful.
+            pdf_error = (
+                "pdf_backend_unavailable"
+                if isinstance(exc, ImportError)
+                else "pdf_render_failed"
+            )
+            if not self._remove_existing_pdf(pdf_path):
+                raise ReportPublicationError("report output conflict") from None
 
         current_pdf_path = None if pdf_error is not None else pdf_path
 
@@ -111,18 +135,14 @@ class ReportRenderer:
             pdf_error=pdf_error,
         )
 
-    @staticmethod
-    def _error_text(exc: Exception) -> str:
-        return f"{type(exc).__name__}: {exc}"
-
     @classmethod
-    def _remove_existing_pdf(cls, path: Path) -> str | None:
+    def _remove_existing_pdf(cls, path: Path) -> bool:
         try:
-            if path.exists():
+            if path.is_symlink() or path.exists():
                 path.unlink()
-        except Exception as exc:
-            return cls._error_text(exc)
-        return None
+        except Exception:
+            return False
+        return True
 
     @staticmethod
     def _filename(report_type: str, report_id: str, as_of: object) -> str:
