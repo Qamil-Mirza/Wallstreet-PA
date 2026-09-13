@@ -8,6 +8,7 @@ Optionally generates TTS audio broadcast from summaries.
 
 import logging
 import sys
+from collections.abc import Callable, Sequence
 from datetime import date, datetime
 from pathlib import Path
 
@@ -231,17 +232,63 @@ def run_daily() -> None:
         sys.exit(1)
 
 
-def main() -> None:
-    """CLI entry point."""
+def main(
+    *,
+    research_config_loader: Callable[[], object] | None = None,
+    research_entrypoint: Callable[[Sequence[str]], int] | None = None,
+    legacy_runner: Callable[[], None] | None = None,
+    today: Callable[[], date] = date.today,
+) -> int:
+    """Select research or the unchanged legacy newsletter pipeline."""
+    from .research.config import ResearchConfigError, research_enabled_from_env
+
+    if research_entrypoint is None:
+        from .research.cli import main as research_cli_main
+
+        research_entrypoint = research_cli_main
+    if legacy_runner is None:
+        legacy_runner = run_daily
+
     try:
-        run_daily()
+        if research_config_loader is None:
+            research_enabled = research_enabled_from_env()
+        else:
+            research_config = research_config_loader()
+            research_enabled = bool(getattr(research_config, "enabled", False))
+    except ResearchConfigError:
+        logger.error("Research configuration is invalid")
+        return 1
     except KeyboardInterrupt:
         logger.info("Interrupted by user")
-        sys.exit(130)
+        return 130
+    except Exception:
+        logger.error("Research configuration could not be loaded")
+        return 1
+
+    if research_enabled:
+        try:
+            return int(
+                research_entrypoint(
+                    ["daily", "--as-of", today().isoformat()]
+                )
+            )
+        except KeyboardInterrupt:
+            logger.info("Interrupted by user")
+            return 130
+        except Exception:
+            logger.error("Research workflow failed")
+            return 1
+
+    try:
+        legacy_runner()
+    except KeyboardInterrupt:
+        logger.info("Interrupted by user")
+        return 130
     except Exception as e:
         logger.exception(f"Unexpected error: {e}")
-        sys.exit(1)
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

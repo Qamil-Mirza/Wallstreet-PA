@@ -111,6 +111,110 @@ ollama serve
 python -m news_bot.main
 ```
 
+## Portfolio Research Mode
+
+Portfolio research is an opt-in, read-only workflow for a small, low-liquidity
+account. Set `RESEARCH_ENABLED=true` to make `python -m news_bot.main` run the
+research daily workflow; leave it false (the default) to retain the original
+newsletter behavior. Research output is informational research, not investment,
+tax, or legal advice. The application has no broker trading/order adapter and
+must never be given order-placement permissions.
+
+### Read-only IBKR Flex setup
+
+In IBKR Client Portal, create an **Activity Flex Query** under Performance &
+Reports. Include the account-information, cash-report, and open-position fields
+needed to reconstruct holdings, then create a Flex Web Service token for that
+query. Flex is used only for reporting snapshots: do not enable Client Portal
+Web API trading, TWS API order access, or any other order endpoint.
+
+Keep the three values in separate files outside the repository:
+
+```text
+/run/secrets/ibkr_flex_token
+/run/secrets/ibkr_flex_query_id
+/run/secrets/ibkr_flex_account_salt
+```
+
+Point `IBKR_FLEX_TOKEN_FILE`, `IBKR_FLEX_QUERY_ID_FILE`, and
+`IBKR_FLEX_ACCOUNT_SALT_FILE` at those files. The salt should be unique and at
+least 16 random bytes; it is used to hash account identifiers. Restrict file
+permissions to the runtime user. For Docker, mount a host `secrets/` directory
+read-only at `/run/secrets`; never bake secrets into an image, Compose file, or
+environment committed to git.
+
+### Model mode and cost ceiling
+
+Zero-key mode is the default: leave `OPENAI_API_KEY` and
+`OPENAI_API_KEY_FILE` unset and run Ollama at `OLLAMA_BASE_URL` with
+`OLLAMA_RESEARCH_MODEL` available. To use the API-first external model route,
+set `OPENAI_API_KEY_FILE` to a mounted secret (or set `OPENAI_API_KEY` only in a
+secure local environment). If an external key exists, external inference is
+selected; if it does not, the configured Ollama model is used.
+
+The monthly external-model limits are enforced as a hard safety boundary:
+
+```dotenv
+MODEL_BUDGET_SOFT_USD=4.00
+MODEL_BUDGET_HARD_USD=5.00
+```
+
+The hard value cannot exceed **$5.00 per UTC calendar month**. Startup and
+health checks do not call paid providers.
+
+### Workflow commands
+
+Use the project virtualenv directly. Dates are strict `YYYY-MM-DD` values:
+
+```bash
+venv/bin/python -m news_bot.research.cli daily --as-of 2026-08-24
+venv/bin/python -m news_bot.research.cli weekly --as-of 2026-08-24
+venv/bin/python -m news_bot.research.cli monthly --as-of 2026-08-24
+venv/bin/python -m news_bot.research.cli backfill --as-of 2026-08-24 --max-documents 100
+venv/bin/python -m news_bot.research.cli dry-run --as-of 2026-08-24
+venv/bin/python -m news_bot.research.cli regenerate --as-of 2026-08-24
+```
+
+`dry-run` never sends email or publishes externally. Backfill is bounded to
+1–1000 documents and produces evidence only unless
+`--authorize-analysis` is explicitly supplied. `regenerate` uses the date as a
+stable lookup key for an existing stored run/report and renders it without
+refetching data. None of these commands calls a trade or order endpoint.
+
+### Storage, scheduling, and backups
+
+`RESEARCH_DATA_DIR` defaults to `research_data`. It contains:
+
+- `research.db` — durable SQLite workflow/evidence state;
+- `cache/` — fetched source cache;
+- `reports/` — generated HTML/PDF report artifacts;
+- `backups/` — SQLite online-backup output.
+
+Keep backups on storage separate from the live database and copy the whole
+backup artifact, not the live WAL files. The scheduler and one-shot CLI share a
+fenced SQLite run lease, so they cannot publish concurrently and unfinished
+task state survives process restarts.
+
+Configure APScheduler with five-field UTC cron expressions:
+
+```dotenv
+RESEARCH_DAILY_SCHEDULE=0 7 * * 1-5
+RESEARCH_WEEKLY_SCHEDULE=0 8 * * 1
+RESEARCH_MONTHLY_SCHEDULE=0 9 1 * *
+```
+
+Start it with:
+
+```bash
+venv/bin/python -m news_bot.research.scheduler
+```
+
+For a low-liquidity account, keep the posture conservative: no margin or
+borrowing assumptions, no forced liquidation to fund an idea, no options/order
+automation, and no sizing that assumes an immediate exit. Thinly traded names
+and unavailable cash should be flagged for human review, not converted into an
+action.
+
 ## Deployment
 
 ### Option 1: Docker (Recommended)

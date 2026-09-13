@@ -19,11 +19,8 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 # Change to project directory
 cd "$PROJECT_DIR"
 
-# Activate virtual environment
-source venv/bin/activate
-
 # Run the newsletter bot
-python -m news_bot.main
+"$PROJECT_DIR/venv/bin/python" -m news_bot.main
 
 # Capture exit code
 EXIT_CODE=$?

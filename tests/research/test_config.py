@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from news_bot.research.config import ResearchConfig, ResearchConfigError
+from news_bot.research.config import CronSchedule, ResearchConfig, ResearchConfigError
 from news_bot.research.models import (
     AgentRunResult,
     AgentRole,
@@ -35,6 +35,15 @@ def clear_research_environment(monkeypatch):
         "OLLAMA_RESEARCH_MODEL",
         "MODEL_BUDGET_SOFT_USD",
         "MODEL_BUDGET_HARD_USD",
+        "RESEARCH_DAILY_SCHEDULE",
+        "RESEARCH_WEEKLY_SCHEDULE",
+        "RESEARCH_MONTHLY_SCHEDULE",
+        "IBKR_FLEX_TOKEN",
+        "IBKR_FLEX_TOKEN_FILE",
+        "IBKR_FLEX_QUERY_ID",
+        "IBKR_FLEX_QUERY_ID_FILE",
+        "IBKR_FLEX_ACCOUNT_SALT",
+        "IBKR_FLEX_ACCOUNT_SALT_FILE",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -60,6 +69,32 @@ def test_missing_openai_key_selects_local_only(monkeypatch, tmp_path):
     config = ResearchConfig.from_env()
     assert config.inference_mode is InferenceMode.LOCAL_ONLY
     assert config.ollama_base_url == "http://localhost:11434"
+
+
+def test_scheduler_cron_settings_are_typed_from_environment(monkeypatch):
+    monkeypatch.setenv("RESEARCH_DAILY_SCHEDULE", "5 6 * * *")
+    monkeypatch.setenv("RESEARCH_WEEKLY_SCHEDULE", "10 7 * * tue")
+    monkeypatch.setenv("RESEARCH_MONTHLY_SCHEDULE", "15 8 2 * *")
+
+    config = ResearchConfig.from_env()
+
+    assert config.daily_schedule == CronSchedule.from_crontab("5 6 * * *")
+    assert config.weekly_schedule == CronSchedule.from_crontab("10 7 * * tue")
+    assert config.monthly_schedule == CronSchedule.from_crontab("15 8 2 * *")
+
+
+def test_invalid_scheduler_cron_is_rejected(monkeypatch):
+    monkeypatch.setenv("RESEARCH_DAILY_SCHEDULE", "not a cron")
+
+    with pytest.raises(ResearchConfigError, match="RESEARCH_DAILY_SCHEDULE"):
+        ResearchConfig.from_env()
+
+
+def test_out_of_range_scheduler_cron_is_rejected(monkeypatch):
+    monkeypatch.setenv("RESEARCH_DAILY_SCHEDULE", "0 99 * * *")
+
+    with pytest.raises(ResearchConfigError, match="RESEARCH_DAILY_SCHEDULE"):
+        ResearchConfig.from_env()
 
 
 def test_secret_file_wins_over_environment(monkeypatch, tmp_path):
