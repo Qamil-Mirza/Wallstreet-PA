@@ -875,6 +875,106 @@ def test_renderer_allows_decimal_comma_percent_and_range_semantics(
 
 
 @pytest.mark.parametrize(
+    ("registered_value", "formatted_value"),
+    (
+        (Decimal("123456.78"), "1.2345678E+5"),
+        (Decimal("123456.78"), "1.2345678e+5"),
+        (Decimal("123456.78"), "1.2345678E5"),
+        (Decimal("0.000012345678"), "1.2345678E-5"),
+        (Decimal("123456.78"), "+1.2345678E+5"),
+        (Decimal("123456.78"), "-1.2345678E+5"),
+        (Decimal("123456.78"), "−1.2345678E+5"),
+        (Decimal("123456.78"), "＋1.2345678E+5"),
+        (Decimal("123456.78"), "(1.2345678E+5)"),
+        (Decimal("123456.78"), "USD 1.2345678E+5"),
+        (Decimal("123456.78"), "$1.2345678E+5"),
+        (Decimal("123456.78"), "1.2345678E+5 EUR"),
+        (Decimal("123456.78"), "1.2345678E+5 €"),
+        (Decimal("123456.78"), "(USD 1.2345678E+5)"),
+    ),
+)
+def test_runtime_privacy_context_blocks_registered_scientific_notation(
+    tmp_path: Path,
+    registered_value: Decimal,
+    formatted_value: str,
+) -> None:
+    unsafe = event_report().model_copy(
+        update={
+            "thesis": section("Thesis").model_copy(
+                update={"body": f"Portfolio metric was {formatted_value}."}
+            )
+        }
+    )
+    publication_error = getattr(report_models, "ReportPublicationError")
+
+    with pytest.raises(publication_error, match="publication blocked"):
+        ReportRenderer(
+            tmp_path,
+            privacy_context=publication_privacy_context(
+                portfolio_values=(registered_value,)
+            ),
+        ).render_event_update(unsafe)
+
+    assert not tuple(tmp_path.glob("*.html"))
+
+
+def test_privacy_number_parser_consumes_complete_scientific_notation() -> None:
+    values = report_models._publication_number_values("Metric was USD 1.2345678E+5.")
+    assert values == (Decimal("123456.78"),)
+    assert all(value.is_finite() for value in values)
+
+
+@pytest.mark.parametrize(
+    "body",
+    (
+        "The strategy uses category E for classification.",
+        "Public metric was USD 1.2345678E+4.",
+    ),
+)
+def test_renderer_allows_letter_e_and_noncolliding_scientific_prose(
+    tmp_path: Path,
+    body: str,
+) -> None:
+    safe = event_report().model_copy(
+        update={
+            "thesis": section("Thesis").model_copy(update={"body": body})
+        }
+    )
+
+    artifact = ReportRenderer(
+        tmp_path,
+        privacy_context=publication_privacy_context(
+            portfolio_values=(Decimal("123456.78"),)
+        ),
+    ).render_event_update(safe)
+
+    assert body in artifact.html
+
+
+def test_renderer_allows_scientific_percent_and_range_semantics(
+    tmp_path: Path,
+) -> None:
+    body = (
+        "Metric moved 1.2345678E+5%; public target range is "
+        "USD 1.2345678E+5–2E+5."
+    )
+    safe = event_report().model_copy(
+        update={
+            "thesis": section("Thesis").model_copy(update={"body": body})
+        }
+    )
+
+    artifact = ReportRenderer(
+        tmp_path,
+        privacy_context=publication_privacy_context(
+            portfolio_values=(Decimal("123456.78"), Decimal("200000"))
+        ),
+    ).render_event_update(safe)
+
+    assert body in artifact.html
+
+
+@pytest.mark.parametrize(
     "formatted_value",
     (
         "1 234,56",

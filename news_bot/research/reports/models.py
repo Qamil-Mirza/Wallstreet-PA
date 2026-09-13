@@ -51,6 +51,7 @@ _MONEY_NUMBER = (
     r"(?:\d{1,3}(?:\.\d{3})+,\d+|"
     r"\d{1,3}(?:[ ]\d{3})+,\d+|"
     r"\d{1,3}(?:[ ,]\d{3})+(?:\.\d+)?|\d+,\d+|\d+(?:\.\d+)?|\.\d+)"
+    r"(?:[eE][+−-]?\d+)?"
 )
 _EXACT_PORTFOLIO_VALUE = re.compile(
     r"(?ix)\b(?:net\s+asset\s+value|nav|cash(?:\s+balance)?|position(?:\s+value)?|market\s+value|portfolio\s+(?:value|amount|worth))\b"
@@ -283,27 +284,42 @@ def _publication_number_values(value: str) -> tuple[Decimal, ...]:
             # comma/space thousands separators. A lone comma is a decimal mark,
             # and a three-digit suffix is also retained as the grouped candidate.
             token = match.group("number")
-            if "," in token and (
-                " " in token
-                or ("." in token and token.rfind(",") > token.rfind("."))
-            ):
-                canonicals = (
-                    token.replace(" ", "").replace(".", "").replace(",", "."),
+            exponent_index = next(
+                (index for index, character in enumerate(token) if character in "eE"),
+                len(token),
+            )
+            mantissa = token[:exponent_index]
+            exponent = token[exponent_index:]
+            if "," in mantissa and (
+                " " in mantissa
+                or (
+                    "." in mantissa
+                    and mantissa.rfind(",") > mantissa.rfind(".")
                 )
-            elif token.count(",") == 1 and "." not in token:
-                integer, fraction = token.split(",", 1)
-                decimal = token.replace(",", ".")
-                canonicals = (
-                    (token.replace(",", ""), decimal)
+            ):
+                canonical_mantissas = (
+                    mantissa.replace(" ", "").replace(".", "").replace(",", "."),
+                )
+            elif mantissa.count(",") == 1 and "." not in mantissa:
+                integer, fraction = mantissa.split(",", 1)
+                decimal = mantissa.replace(",", ".")
+                canonical_mantissas = (
+                    (mantissa.replace(",", ""), decimal)
                     if len(integer) <= 3 and len(fraction) == 3
                     else (decimal,)
                 )
             else:
-                canonicals = (token.replace(",", "").replace(" ", ""),)
-            numerics = tuple(Decimal(canonical) for canonical in canonicals)
+                canonical_mantissas = (
+                    mantissa.replace(",", "").replace(" ", ""),
+                )
+            numerics = tuple(
+                Decimal(canonical + exponent) for canonical in canonical_mantissas
+            )
         except Exception:
             continue
         for numeric in numerics:
+            if not numeric.is_finite():
+                continue
             if match.group("sign") == "-" or match.group("paren"):
                 numeric = -numeric
             matches.append(numeric)
