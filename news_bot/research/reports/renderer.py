@@ -37,6 +37,9 @@ class ReportRenderer:
     ) -> None:
         if not isinstance(privacy_context, PublicationPrivacyContext):
             raise TypeError("privacy_context must be a PublicationPrivacyContext")
+        privacy_context = PublicationPrivacyContext.model_validate(
+            privacy_context, strict=True
+        )
         self.output_dir = Path(output_dir).resolve()
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.privacy_context = privacy_context

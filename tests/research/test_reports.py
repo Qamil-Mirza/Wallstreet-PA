@@ -544,6 +544,29 @@ def test_publication_privacy_context_requires_affirmative_consistent_mode() -> N
 
 
 @pytest.mark.parametrize(
+    "update",
+    (
+        {"mode": "no_sensitive_data"},
+        {"sensitive_literals": tuple("x" for _ in range(10_000))},
+        {"sensitive_literals": (123,)},
+    ),
+)
+def test_renderer_revalidates_copied_privacy_context_at_boundary(
+    tmp_path: Path,
+    update: dict[str, object],
+) -> None:
+    context = publication_privacy_context(
+        sensitive_literals=("private-marker",)
+    ).model_copy(update=update)
+    output_dir = tmp_path / "reports"
+
+    with pytest.raises(ValidationError):
+        ReportRenderer(output_dir, privacy_context=context)
+
+    assert not output_dir.exists()
+
+
+@pytest.mark.parametrize(
     "private_body",
     (
         "Operational note blue heron remains pending.",
@@ -678,6 +701,10 @@ def test_runtime_privacy_context_fails_closed_on_exact_typed_numeric_collision(
         "1\u202f234.56",
         "1\u2009234.56",
         "1,234.56",
+        "1 234,56",
+        "1\u00a0234,56",
+        "1\u202f234,56",
+        "1\u2009234,56",
         "+1 234.56",
         "−1\u202f234.56",
         "(1 234.56)",
@@ -708,6 +735,37 @@ def test_runtime_privacy_context_blocks_grouped_registered_decimal_forms(
 
     assert str(exc_info.value) == "report publication blocked by privacy policy"
     assert not tuple(tmp_path.glob("*.html"))
+
+
+@pytest.mark.parametrize(
+    "formatted_value",
+    (
+        "1 234,56",
+        "1\u00a0234,56",
+        "1\u202f234,56",
+        "1\u2009234,56",
+    ),
+)
+def test_renderer_allows_noncolliding_grouped_decimal_comma_prose(
+    tmp_path: Path,
+    formatted_value: str,
+) -> None:
+    safe = event_report().model_copy(
+        update={
+            "thesis": section("Thesis").model_copy(
+                update={"body": f"DCF fair value is EUR {formatted_value} per share."}
+            )
+        }
+    )
+
+    artifact = ReportRenderer(
+        tmp_path,
+        privacy_context=publication_privacy_context(
+            portfolio_values=(Decimal("999.99"),)
+        ),
+    ).render_event_update(safe)
+
+    assert formatted_value in artifact.html
 
 
 @pytest.mark.parametrize(

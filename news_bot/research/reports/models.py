@@ -49,6 +49,7 @@ _ACCOUNT_REFERENCE = re.compile(
 )
 _MONEY_NUMBER = (
     r"(?:\d{1,3}(?:\.\d{3})+,\d+|"
+    r"\d{1,3}(?:[ ]\d{3})+,\d+|"
     r"\d{1,3}(?:[ ,]\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?|\.\d+)"
 )
 _EXACT_PORTFOLIO_VALUE = re.compile(
@@ -279,11 +280,14 @@ def _publication_number_values(value: str) -> tuple[Decimal, ...]:
             continue
         try:
             # Supported grouping is canonical decimal-point notation with either
-            # comma/space thousands separators. Dot-thousands/comma-decimal is
-            # accepted only when both separators make the locale unambiguous.
+            # comma/space thousands separators. Dot/space-thousands with a comma
+            # decimal is accepted only when grouping makes the locale unambiguous.
             token = match.group("number")
-            if "." in token and "," in token and token.rfind(",") > token.rfind("."):
-                canonical = token.replace(".", "").replace(",", ".")
+            if "," in token and (
+                " " in token
+                or ("." in token and token.rfind(",") > token.rfind("."))
+            ):
+                canonical = token.replace(" ", "").replace(".", "").replace(",", ".")
             else:
                 canonical = token.replace(",", "").replace(" ", "")
             numeric = Decimal(canonical)
