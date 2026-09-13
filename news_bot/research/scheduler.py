@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import date, timedelta, timezone
+from datetime import datetime, timedelta, timezone
+from threading import Event, Lock, Thread
 from typing import TYPE_CHECKING, Protocol
 from uuid import uuid4
 
@@ -31,6 +32,14 @@ class RunAlreadyActive(RuntimeError):
     """Raised when a one-shot or scheduled research run owns the shared lease."""
 
 
+class RunLeaseLost(RuntimeError):
+    """Raised when a runner no longer owns its renewable lease fence."""
+
+
+class SchedulerClockError(RuntimeError):
+    """Raised when a scheduled job is not given a strict UTC clock."""
+
+
 class SchedulerRunError(RuntimeError):
     """Raised so APScheduler records a non-successful CLI job execution."""
 
@@ -49,6 +58,11 @@ class RunLease:
     _orchestrator: ResearchOrchestrator
     _lease: WorkflowLease
     _released: bool = field(default=False, init=False)
+    _stop: Event = field(default_factory=Event, init=False, repr=False)
+    _lost: Event = field(default_factory=Event, init=False, repr=False)
+    _lock: Lock = field(default_factory=Lock, init=False, repr=False)
+    _thread: Thread | None = field(default=None, init=False, repr=False)
+    _ttl_seconds: float = field(default=0, init=False, repr=False)
 
     @classmethod
     def acquire(
@@ -74,15 +88,67 @@ class RunLease:
             )
         except WorkflowBusy as exc:
             raise RunAlreadyActive("research run is already active") from exc
-        return cls(orchestrator, lease)
+        result = cls(orchestrator, lease)
+        result._ttl_seconds = float(ttl_seconds)
+        result._start_heartbeat()
+        return result
+
+    def _start_heartbeat(self) -> None:
+        interval = max(0.01, min(self._ttl_seconds / 3, 30.0))
+
+        def heartbeat() -> None:
+            while not self._stop.wait(interval):
+                with self._lock:
+                    try:
+                        if self._released:
+                            return
+                        self._lease = self._orchestrator.renew_lease(
+                            self._lease,
+                            duration=timedelta(seconds=self._ttl_seconds),
+                        )
+                    except Exception:
+                        # Record loss before unlocking so assert_current cannot
+                        # race a failed renewal and accept a stale result.
+                        self._lost.set()
+                        self._stop.set()
+                        return
+
+        self._thread = Thread(
+            target=heartbeat,
+            name="research-run-lease-heartbeat",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def assert_current(self) -> None:
+        """Renew synchronously and reject results after ownership is lost."""
+        try:
+            with self._lock:
+                if self._lost.is_set():
+                    raise RunLeaseLost("research run lease was lost")
+                if self._released:
+                    raise RunLeaseLost("research run lease was released")
+                self._lease = self._orchestrator.renew_lease(
+                    self._lease,
+                    duration=timedelta(seconds=self._ttl_seconds),
+                )
+        except WorkflowConflict as exc:
+            self._lost.set()
+            raise RunLeaseLost("research run lease was lost") from exc
 
     def release(self) -> None:
         """Release only this token; stale/idempotent releases are harmless."""
         if self._released:
             return
-        self._released = True
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join()
         try:
-            self._orchestrator.release_lease(self._lease)
+            with self._lock:
+                if self._released:
+                    return
+                self._released = True
+                self._orchestrator.release_lease(self._lease)
         except WorkflowConflict:
             # The lease expired or was fenced by a newer owner.  The token-aware
             # DELETE guarantees this stale handle cannot release that owner.
@@ -103,16 +169,27 @@ class _Scheduler(Protocol):
 def _scheduled_job(
     command: str,
     services: CliServices | None,
-    today: Callable[[], date],
+    clock: Callable[[], datetime],
+    extra_arguments: tuple[str, ...] = (),
 ) -> None:
     from .cli import ExitCode, main
 
+    now = clock()
+    if (
+        not isinstance(now, datetime)
+        or now.tzinfo is None
+        or now.utcoffset() != timedelta(0)
+    ):
+        raise SchedulerClockError("scheduler clock must return an aware UTC datetime")
     code = main(
-        [command, "--as-of", today().isoformat()],
+        [command, "--as-of", now.astimezone(timezone.utc).date().isoformat(),
+         *extra_arguments],
         services=services,
     )
     if code is not ExitCode.OK and code != int(ExitCode.OK):
-        raise SchedulerRunError(f"scheduled research job failed with exit code {int(code)}")
+        raise SchedulerRunError(
+            f"scheduled research job failed with exit code {int(code)}"
+        )
 
 
 def build_scheduler(
@@ -120,11 +197,15 @@ def build_scheduler(
     *,
     services: CliServices | None = None,
     scheduler_factory: Callable[[], _Scheduler] | None = None,
-    today: Callable[[], date] = date.today,
+    clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
 ) -> _Scheduler:
     """Register UTC research jobs without initializing workflow services."""
     if not isinstance(config, ResearchConfig):
         raise TypeError("config must be ResearchConfig")
+    if config.monthly_industry is None:
+        from .config import ResearchConfigError
+
+        raise ResearchConfigError("RESEARCH_MONTHLY_INDUSTRY is required")
     if scheduler_factory is None:
         try:
             from apscheduler.schedulers.blocking import BlockingScheduler
@@ -136,18 +217,22 @@ def build_scheduler(
         scheduler = scheduler_factory()
 
     cadences = (
-        ("daily", config.daily_schedule),
-        ("weekly", config.weekly_schedule),
-        ("monthly", config.monthly_schedule),
+        ("daily", config.daily_schedule, ()),
+        ("weekly", config.weekly_schedule, ()),
+        (
+            "monthly",
+            config.monthly_schedule,
+            ("--industry", config.monthly_industry),
+        ),
     )
-    for command, cadence in cadences:
+    for command, cadence, extra_arguments in cadences:
         scheduler.add_job(
             _scheduled_job,
             trigger="cron",
             **cadence.as_kwargs(),
             timezone=timezone.utc,
             id=f"research-{command}",
-            args=(command, services, today),
+            args=(command, services, clock, extra_arguments),
             max_instances=1,
             coalesce=True,
             replace_existing=True,
@@ -179,6 +264,8 @@ __all__ = [
     "RUN_LEASE_NAME",
     "RunAlreadyActive",
     "RunLease",
+    "RunLeaseLost",
+    "SchedulerClockError",
     "SchedulerRunError",
     "build_scheduler",
     "main",

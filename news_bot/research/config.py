@@ -14,6 +14,7 @@ class ResearchConfigError(ValueError):
 
 
 _CRON_ATOM = re.compile(r"[A-Za-z0-9*/?,\-]+")
+_INDUSTRY_KEY = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
 
 
 def _validate_cron_part(
@@ -166,6 +167,13 @@ def _get_text(name: str, default: str) -> str:
     return value.strip() or default
 
 
+def _get_optional_text(name: str) -> str | None:
+    value = os.getenv(name)
+    if value is None:
+        return None
+    return value.strip() or None
+
+
 @dataclass(frozen=True)
 class ResearchConfig:
     """Typed settings required by research foundation components."""
@@ -181,6 +189,7 @@ class ResearchConfig:
     daily_schedule: CronSchedule = CronSchedule.from_crontab("0 7 * * 1-5")
     weekly_schedule: CronSchedule = CronSchedule.from_crontab("0 8 * * 1")
     monthly_schedule: CronSchedule = CronSchedule.from_crontab("0 9 1 * *")
+    monthly_industry: str | None = None
     ibkr_flex_token: str | None = field(default=None, repr=False)
     ibkr_flex_query_id: str | None = field(default=None, repr=False)
     ibkr_flex_account_salt: str | None = field(default=None, repr=False)
@@ -233,6 +242,7 @@ class ResearchConfig:
                 _get_text("RESEARCH_MONTHLY_SCHEDULE", "0 9 1 * *"),
                 setting="RESEARCH_MONTHLY_SCHEDULE",
             ),
+            monthly_industry=_get_optional_text("RESEARCH_MONTHLY_INDUSTRY"),
             ibkr_flex_token=_read_secret("IBKR_FLEX_TOKEN"),
             ibkr_flex_query_id=_read_secret("IBKR_FLEX_QUERY_ID"),
             ibkr_flex_account_salt=_read_secret("IBKR_FLEX_ACCOUNT_SALT"),
@@ -262,6 +272,26 @@ class ResearchConfig:
         ):
             raise ResearchConfigError(
                 "IBKR Flex token, query ID, and account salt must be configured together"
+            )
+        if self.ibkr_flex_account_salt is not None:
+            try:
+                encoded_salt = self.ibkr_flex_account_salt.encode(
+                    "utf-8", errors="strict"
+                )
+            except UnicodeEncodeError:
+                raise ResearchConfigError(
+                    "IBKR Flex account salt must be valid UTF-8"
+                ) from None
+            if len(encoded_salt) < 16:
+                raise ResearchConfigError(
+                    "IBKR Flex account salt must be at least 16 UTF-8 bytes"
+                )
+        if self.monthly_industry is not None and (
+            not isinstance(self.monthly_industry, str)
+            or _INDUSTRY_KEY.fullmatch(self.monthly_industry) is None
+        ):
+            raise ResearchConfigError(
+                "RESEARCH_MONTHLY_INDUSTRY must be a safe industry key"
             )
         for field_name, value in (
             ("ollama_base_url", self.ollama_base_url),

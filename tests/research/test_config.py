@@ -38,6 +38,7 @@ def clear_research_environment(monkeypatch):
         "RESEARCH_DAILY_SCHEDULE",
         "RESEARCH_WEEKLY_SCHEDULE",
         "RESEARCH_MONTHLY_SCHEDULE",
+        "RESEARCH_MONTHLY_INDUSTRY",
         "IBKR_FLEX_TOKEN",
         "IBKR_FLEX_TOKEN_FILE",
         "IBKR_FLEX_QUERY_ID",
@@ -95,6 +96,21 @@ def test_out_of_range_scheduler_cron_is_rejected(monkeypatch):
 
     with pytest.raises(ResearchConfigError, match="RESEARCH_DAILY_SCHEDULE"):
         ResearchConfig.from_env()
+
+
+def test_short_flex_account_salt_is_rejected() -> None:
+    with pytest.raises(ResearchConfigError, match="at least 16 UTF-8 bytes"):
+        replace(
+            valid_research_config(),
+            ibkr_flex_token="token",
+            ibkr_flex_query_id="query",
+            ibkr_flex_account_salt="too-short",
+        )
+
+
+def test_monthly_industry_is_typed_from_environment(monkeypatch) -> None:
+    monkeypatch.setenv("RESEARCH_MONTHLY_INDUSTRY", "robotic-actuators")
+    assert ResearchConfig.from_env().monthly_industry == "robotic-actuators"
 
 
 def test_secret_file_wins_over_environment(monkeypatch, tmp_path):

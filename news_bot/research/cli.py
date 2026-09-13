@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -46,7 +47,8 @@ class CliServices:
     load_config: Callable[[], ResearchConfig]
     open_store: Callable[[ResearchConfig], ResearchStore]
     build_workflows: Callable[[ResearchConfig, ResearchStore], WorkflowService]
-    validate_credentials: Callable[[str, ResearchConfig], None]
+    validate_credentials: Callable[[str, ResearchConfig, bool], None]
+    lease_ttl_seconds: float = 3600
 
 
 class _SafeArgumentParser(argparse.ArgumentParser):
@@ -80,28 +82,40 @@ def _bounded_documents(value: str) -> int:
     return parsed
 
 
+def _industry_key(value: str) -> str:
+    if re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", value) is None:
+        raise CliInputError("industry must be a safe key")
+    return value
+
+
+def _runtime_identifier(value: str) -> str:
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}", value) is None:
+        raise CliInputError("run/report identifier is invalid")
+    return value
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = _SafeArgumentParser(prog="portfolio-research", add_help=True)
     subparsers = parser.add_subparsers(dest="command", required=True)
-    for command in ("daily", "weekly", "monthly", "dry-run", "regenerate"):
+    for command in ("daily", "weekly"):
         child = subparsers.add_parser(command)
         child.add_argument("--as-of", required=True, type=_strict_date)
+    monthly = subparsers.add_parser("monthly")
+    monthly.add_argument("--as-of", required=True, type=_strict_date)
+    monthly.add_argument("--industry", required=True, type=_industry_key)
+    dry_run = subparsers.add_parser("dry-run")
+    dry_run.add_argument("--as-of", required=True, type=_strict_date)
+    dry_run.add_argument("--synthetic-portfolio", action="store_true")
+    regenerate = subparsers.add_parser("regenerate")
+    regenerate.add_argument("--as-of", required=True, type=_strict_date)
+    identity = regenerate.add_mutually_exclusive_group(required=True)
+    identity.add_argument("--run-id", type=_runtime_identifier)
+    identity.add_argument("--report-id", type=_runtime_identifier)
     backfill = subparsers.add_parser("backfill")
     backfill.add_argument("--as-of", required=True, type=_strict_date)
     backfill.add_argument("--max-documents", type=_bounded_documents, default=100)
     backfill.add_argument("--authorize-analysis", action="store_true")
     return parser
-
-
-class _UnconfiguredWorkflows:
-    def _unavailable(self, **_kwargs: object) -> object:
-        raise RuntimeError("research workflow runtime is not configured")
-
-    run_daily = _unavailable
-    run_weekly = _unavailable
-    run_monthly = _unavailable
-    run_backfill = _unavailable
-    regenerate = _unavailable
 
 
 def _open_store(config: ResearchConfig) -> ResearchStore:
@@ -110,18 +124,11 @@ def _open_store(config: ResearchConfig) -> ResearchStore:
     return store
 
 
-def _build_workflows(
-    _config: ResearchConfig, _store: ResearchStore
-) -> WorkflowService:
-    # Concrete connectors/stage adapters are injected by the runtime composition
-    # root.  Keeping this fallback inert guarantees a bare command makes no paid
-    # call and cannot trade or publish accidentally.
-    return _UnconfiguredWorkflows()
-
-
-def _validate_credentials(command: str, config: ResearchConfig) -> None:
+def _validate_credentials(
+    command: str, config: ResearchConfig, requires_portfolio: bool
+) -> None:
     config.validate()
-    if command == "regenerate":
+    if not requires_portfolio:
         return
     credentials = (
         config.ibkr_flex_token,
@@ -129,14 +136,32 @@ def _validate_credentials(command: str, config: ResearchConfig) -> None:
         config.ibkr_flex_account_salt,
     )
     if not all(isinstance(value, str) and bool(value.strip()) for value in credentials):
-        raise ResearchConfigError("required read-only IBKR Flex credentials are missing")
+        raise ResearchConfigError(
+            "required read-only IBKR Flex credentials are missing"
+        )
 
 
-def default_services() -> CliServices:
+def default_services(
+    *,
+    config_loader: Callable[[], ResearchConfig] = ResearchConfig.from_env,
+    store_factory: Callable[[ResearchConfig], ResearchStore] = _open_store,
+    runtime_factories: object | None = None,
+) -> CliServices:
+    from .runtime import RuntimeFactories, RuntimeWorkflowService
+
+    factories = (
+        RuntimeFactories()
+        if runtime_factories is None
+        else runtime_factories
+    )
+    if not isinstance(factories, RuntimeFactories):
+        raise TypeError("runtime_factories must be RuntimeFactories")
     return CliServices(
-        load_config=ResearchConfig.from_env,
-        open_store=_open_store,
-        build_workflows=_build_workflows,
+        load_config=config_loader,
+        open_store=store_factory,
+        build_workflows=lambda config, store: RuntimeWorkflowService(
+            config, store, factories
+        ),
         validate_credentials=_validate_credentials,
     )
 
@@ -150,9 +175,15 @@ def _dispatch(
     if command == "weekly":
         return workflows.run_weekly(as_of=as_of)
     if command == "monthly":
-        return workflows.run_monthly(as_of=as_of)
+        return workflows.run_monthly(
+            as_of=as_of, industry_key=arguments.industry
+        )
     if command == "dry-run":
-        return workflows.run_daily(as_of=as_of, dry_run=True)
+        return workflows.run_daily(
+            as_of=as_of,
+            dry_run=True,
+            synthetic_portfolio=arguments.synthetic_portfolio,
+        )
     if command == "backfill":
         return workflows.run_backfill(
             as_of=as_of,
@@ -162,7 +193,11 @@ def _dispatch(
     if command == "regenerate":
         # The as-of date is the deterministic existing-run lookup key.  This
         # separate service method must render stored data without refetching.
-        return workflows.regenerate(as_of=as_of)
+        return workflows.regenerate(
+            as_of=as_of,
+            run_id=arguments.run_id,
+            report_id=arguments.report_id,
+        )
     raise CliInputError("unsupported command")
 
 
@@ -219,10 +254,21 @@ def main(
     try:
         config = dependencies.load_config()
         store = dependencies.open_store(config)
-        dependencies.validate_credentials(arguments.command, config)
-        lease = RunLease.acquire(store, RUN_LEASE_NAME, ttl_seconds=3600)
+        requires_portfolio = arguments.command in {"daily", "weekly"} or (
+            arguments.command == "dry-run"
+            and not arguments.synthetic_portfolio
+        )
+        dependencies.validate_credentials(
+            arguments.command, config, requires_portfolio
+        )
+        lease = RunLease.acquire(
+            store,
+            RUN_LEASE_NAME,
+            ttl_seconds=dependencies.lease_ttl_seconds,
+        )
         workflows = dependencies.build_workflows(config, store)
         result = _dispatch(arguments.command, arguments, workflows)
+        lease.assert_current()
         status = _status_value(result)
         _print_summary(arguments.command, result, status)
         if status == "blocked":

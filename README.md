@@ -169,17 +169,34 @@ Use the project virtualenv directly. Dates are strict `YYYY-MM-DD` values:
 ```bash
 venv/bin/python -m news_bot.research.cli daily --as-of 2026-08-24
 venv/bin/python -m news_bot.research.cli weekly --as-of 2026-08-24
-venv/bin/python -m news_bot.research.cli monthly --as-of 2026-08-24
+venv/bin/python -m news_bot.research.cli monthly --as-of 2026-08-24 --industry robotic-actuators
 venv/bin/python -m news_bot.research.cli backfill --as-of 2026-08-24 --max-documents 100
 venv/bin/python -m news_bot.research.cli dry-run --as-of 2026-08-24
-venv/bin/python -m news_bot.research.cli regenerate --as-of 2026-08-24
+venv/bin/python -m news_bot.research.cli dry-run --as-of 2026-08-24 --synthetic-portfolio
+venv/bin/python -m news_bot.research.cli regenerate --as-of 2026-08-24 --run-id <existing-run-id>
+# Or select exactly one stored report:
+venv/bin/python -m news_bot.research.cli regenerate --as-of 2026-08-24 --report-id <existing-report-id>
 ```
 
+Daily, weekly, and ordinary dry-run workflows require all three IBKR Flex
+secret files. Monthly, regenerate, and evidence-only backfill do not require
+Flex credentials. `--synthetic-portfolio` opts a dry run into a deterministic
+zero-value test snapshot, so it also does not require Flex. No workflow requires
+an external-model API key because Ollama remains the zero-key fallback.
+
 `dry-run` never sends email or publishes externally. Backfill is bounded to
-1–1000 documents and produces evidence only unless
-`--authorize-analysis` is explicitly supplied. `regenerate` uses the date as a
-stable lookup key for an existing stored run/report and renders it without
-refetching data. None of these commands calls a trade or order endpoint.
+1–1000 documents and produces evidence only unless `--authorize-analysis` is
+explicitly supplied. Monthly requires a stable lowercase `--industry` key.
+`regenerate` requires exactly one existing run or report identifier and renders
+only stored reviewed/published content; it does not refetch, infer, email, or
+trade. None of these commands calls a trade or order endpoint.
+
+The production composition always creates a durable orchestrator run before
+executing work. Its portfolio stage performs the real read-only Flex sync (or
+the explicitly requested synthetic dry-run snapshot). Repository components
+that do not yet have a cross-stage production adapter are recorded as durable
+deferred tasks; the runtime fails closed instead of claiming that unavailable
+work succeeded.
 
 ### Storage, scheduling, and backups
 
@@ -201,7 +218,13 @@ Configure APScheduler with five-field UTC cron expressions:
 RESEARCH_DAILY_SCHEDULE=0 7 * * 1-5
 RESEARCH_WEEKLY_SCHEDULE=0 8 * * 1
 RESEARCH_MONTHLY_SCHEDULE=0 9 1 * *
+RESEARCH_MONTHLY_INDUSTRY=robotic-actuators
 ```
+
+Scheduled runs derive `--as-of` from timezone-aware UTC and use the configured
+monthly industry key. Each job uses `max_instances=1` and coalescing, while the
+shared renewable lease also prevents scheduled and one-shot processes from
+publishing concurrently during long runs.
 
 Start it with:
 

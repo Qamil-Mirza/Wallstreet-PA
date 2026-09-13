@@ -80,6 +80,10 @@ class StageLeaseLost(WorkflowConflict):
     """Raised when a runner can no longer safely continue claimed stage work."""
 
 
+class RequiredStageUnavailable(WorkflowError):
+    """Raised when a required production stage has no usable adapter/source."""
+
+
 class StageExecutionControl:
     """Cooperative cancellation and fencing control for one runner invocation.
 
@@ -1453,6 +1457,10 @@ class ResearchOrchestrator:
             omissions=tuple(json.loads(row[5])), dry_run=bool(row[6]),
         )
 
+    def replay_run(self, workflow_id: str) -> WorkflowRunResult:
+        """Return a safe stored result without executing or recovering stages."""
+        return self._stored_result(_identifier(workflow_id), replay=True)
+
     def _defer_optional(self, workflow_id: str, stages: Sequence[str], reason: str) -> None:
         with self.store.transaction() as connection:
             now = self._now()
@@ -1724,6 +1732,16 @@ class ResearchOrchestrator:
                 ):
                     self._mark_publication_unknown(publication_effect, claim)
                 raise
+            except RequiredStageUnavailable:
+                try:
+                    self.finalize_task(
+                        claim, failure_code="required_stage_unavailable"
+                    )
+                except WorkflowConflict:
+                    terminal = WorkflowRunState.FAILED
+                else:
+                    terminal = WorkflowRunState.BLOCKED
+                break
             except Exception:
                 if publication_effect is not None:
                     if publication_effect.state is PublicationEffectState.CLAIMED:
@@ -1894,7 +1912,8 @@ class ResearchOrchestrator:
 __all__ = [
     "DurableTaskView", "PublicationEffectState", "PublicationEffectView",
     "RecommendationTrigger", "ResearchOrchestrator", "StageContext",
-    "StageExecutionControl", "StageLeaseLost", "StageOutcome", "StageRunner",
+    "RequiredStageUnavailable", "StageExecutionControl", "StageLeaseLost",
+    "StageOutcome", "StageRunner",
     "TaskClaim", "WorkflowBusy", "WorkflowConflict", "WorkflowKind", "WorkflowLease",
     "WorkflowRunResult", "WorkflowRunState", "WorkflowTaskState",
 ]
