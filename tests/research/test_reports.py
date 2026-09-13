@@ -738,6 +738,143 @@ def test_runtime_privacy_context_blocks_grouped_registered_decimal_forms(
 
 
 @pytest.mark.parametrize(
+    ("registered_value", "formatted_value"),
+    (
+        (Decimal("123.45"), "123,45"),
+        (Decimal("1.23"), "1,23"),
+        (Decimal("123.45"), "USD 123,45"),
+        (Decimal("123.45"), "$123,45"),
+        (Decimal("123.45"), "123,45 EUR"),
+        (Decimal("123.45"), "123,45 €"),
+        (Decimal("123.45"), "(123,45)"),
+        (Decimal("123.45"), "USD\u00a0123,45"),
+        (Decimal("123.45"), "USD\u202f123,45"),
+        (Decimal("123.45"), "USD\u2009123,45"),
+    ),
+)
+def test_runtime_privacy_context_blocks_ungrouped_decimal_comma_forms(
+    tmp_path: Path,
+    registered_value: Decimal,
+    formatted_value: str,
+) -> None:
+    unsafe = event_report().model_copy(
+        update={
+            "thesis": section("Thesis").model_copy(
+                update={"body": f"Portfolio metric was {formatted_value}."}
+            )
+        }
+    )
+    publication_error = getattr(report_models, "ReportPublicationError")
+
+    with pytest.raises(publication_error, match="publication blocked"):
+        ReportRenderer(
+            tmp_path,
+            privacy_context=publication_privacy_context(
+                portfolio_values=(registered_value,)
+            ),
+        ).render_event_update(unsafe)
+
+    assert not tuple(tmp_path.glob("*.html"))
+
+
+@pytest.mark.parametrize("sign", PRIVACY_AMOUNT_SIGNS)
+def test_runtime_privacy_context_blocks_signed_ungrouped_decimal_comma_forms(
+    tmp_path: Path,
+    sign: str,
+) -> None:
+    unsafe = event_report().model_copy(
+        update={
+            "thesis": section("Thesis").model_copy(
+                update={"body": f"Portfolio metric was {sign}123,45."}
+            )
+        }
+    )
+    publication_error = getattr(report_models, "ReportPublicationError")
+
+    with pytest.raises(publication_error, match="publication blocked"):
+        ReportRenderer(
+            tmp_path,
+            privacy_context=publication_privacy_context(
+                portfolio_values=(Decimal("123.45"),)
+            ),
+        ).render_event_update(unsafe)
+
+    assert not tuple(tmp_path.glob("*.html"))
+
+
+@pytest.mark.parametrize("registered_value", (Decimal("1234"), Decimal("1.234")))
+def test_runtime_privacy_context_blocks_each_ambiguous_comma_candidate(
+    tmp_path: Path,
+    registered_value: Decimal,
+) -> None:
+    unsafe = event_report().model_copy(
+        update={
+            "thesis": section("Thesis").model_copy(
+                update={"body": "Portfolio metric was 1,234."}
+            )
+        }
+    )
+    publication_error = getattr(report_models, "ReportPublicationError")
+
+    with pytest.raises(publication_error, match="publication blocked"):
+        ReportRenderer(
+            tmp_path,
+            privacy_context=publication_privacy_context(
+                portfolio_values=(registered_value,)
+            ),
+        ).render_event_update(unsafe)
+
+    assert not tuple(tmp_path.glob("*.html"))
+
+
+def test_privacy_number_parser_returns_each_ambiguous_comma_candidate() -> None:
+    assert report_models._publication_number_values("Metric was 1,234.") == (
+        Decimal("1234"),
+        Decimal("1.234"),
+    )
+
+
+def test_renderer_allows_noncolliding_ungrouped_decimal_comma_prose(
+    tmp_path: Path,
+) -> None:
+    body = "DCF fair value is EUR 124,45 per share."
+    safe = event_report().model_copy(
+        update={
+            "thesis": section("Thesis").model_copy(update={"body": body})
+        }
+    )
+
+    artifact = ReportRenderer(
+        tmp_path,
+        privacy_context=publication_privacy_context(
+            portfolio_values=(Decimal("123.45"),)
+        ),
+    ).render_event_update(safe)
+
+    assert body in artifact.html
+
+
+def test_renderer_allows_decimal_comma_percent_and_range_semantics(
+    tmp_path: Path,
+) -> None:
+    body = "Metric moved 123,45%; public target range is EUR 123,45–200,00."
+    safe = event_report().model_copy(
+        update={
+            "thesis": section("Thesis").model_copy(update={"body": body})
+        }
+    )
+
+    artifact = ReportRenderer(
+        tmp_path,
+        privacy_context=publication_privacy_context(
+            portfolio_values=(Decimal("123.45"), Decimal("200.00"))
+        ),
+    ).render_event_update(safe)
+
+    assert body in artifact.html
+
+
+@pytest.mark.parametrize(
     "formatted_value",
     (
         "1 234,56",

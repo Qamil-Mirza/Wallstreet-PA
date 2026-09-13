@@ -50,7 +50,7 @@ _ACCOUNT_REFERENCE = re.compile(
 _MONEY_NUMBER = (
     r"(?:\d{1,3}(?:\.\d{3})+,\d+|"
     r"\d{1,3}(?:[ ]\d{3})+,\d+|"
-    r"\d{1,3}(?:[ ,]\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?|\.\d+)"
+    r"\d{1,3}(?:[ ,]\d{3})+(?:\.\d+)?|\d+,\d+|\d+(?:\.\d+)?|\.\d+)"
 )
 _EXACT_PORTFOLIO_VALUE = re.compile(
     r"(?ix)\b(?:net\s+asset\s+value|nav|cash(?:\s+balance)?|position(?:\s+value)?|market\s+value|portfolio\s+(?:value|amount|worth))\b"
@@ -280,22 +280,33 @@ def _publication_number_values(value: str) -> tuple[Decimal, ...]:
             continue
         try:
             # Supported grouping is canonical decimal-point notation with either
-            # comma/space thousands separators. Dot/space-thousands with a comma
-            # decimal is accepted only when grouping makes the locale unambiguous.
+            # comma/space thousands separators. A lone comma is a decimal mark,
+            # and a three-digit suffix is also retained as the grouped candidate.
             token = match.group("number")
             if "," in token and (
                 " " in token
                 or ("." in token and token.rfind(",") > token.rfind("."))
             ):
-                canonical = token.replace(" ", "").replace(".", "").replace(",", ".")
+                canonicals = (
+                    token.replace(" ", "").replace(".", "").replace(",", "."),
+                )
+            elif token.count(",") == 1 and "." not in token:
+                integer, fraction = token.split(",", 1)
+                decimal = token.replace(",", ".")
+                canonicals = (
+                    (token.replace(",", ""), decimal)
+                    if len(integer) <= 3 and len(fraction) == 3
+                    else (decimal,)
+                )
             else:
-                canonical = token.replace(",", "").replace(" ", "")
-            numeric = Decimal(canonical)
+                canonicals = (token.replace(",", "").replace(" ", ""),)
+            numerics = tuple(Decimal(canonical) for canonical in canonicals)
         except Exception:
             continue
-        if match.group("sign") == "-" or match.group("paren"):
-            numeric = -numeric
-        matches.append(numeric)
+        for numeric in numerics:
+            if match.group("sign") == "-" or match.group("paren"):
+                numeric = -numeric
+            matches.append(numeric)
     return tuple(matches)
 
 
