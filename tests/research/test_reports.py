@@ -5,10 +5,12 @@ from __future__ import annotations
 from datetime import date, datetime, timezone
 from decimal import Decimal
 import builtins
+import inspect
 import os
 from pathlib import Path
 import subprocess
 import sys
+import time
 import tomllib
 from urllib.parse import quote
 
@@ -86,11 +88,21 @@ def section(title: str, body: str = "Evidence E-001 supports this view.") -> Rep
 def publication_privacy_context(**updates: object) -> object:
     context_type = getattr(report_models, "PublicationPrivacyContext")
     values: dict[str, object] = {
+        "mode": "no_sensitive_data",
         "sensitive_literals": (),
         "account_identifiers": (),
         "portfolio_values": (),
     }
     values.update(updates)
+    if "mode" not in updates and any(
+        values[field]
+        for field in (
+            "sensitive_literals",
+            "account_identifiers",
+            "portfolio_values",
+        )
+    ):
+        values["mode"] = "enforced"
     return context_type(**values)
 
 
@@ -489,9 +501,46 @@ def test_publication_privacy_context_is_strict_and_frozen() -> None:
     context_type = getattr(report_models, "PublicationPrivacyContext")
     context = publication_privacy_context(sensitive_literals=("opaque-secret",))
     with pytest.raises(ValidationError):
-        context_type(sensitive_literals=["opaque-secret"])
+        context_type(
+            mode="enforced",
+            sensitive_literals=["opaque-secret"],
+            account_identifiers=(),
+            portfolio_values=(),
+        )
     with pytest.raises(ValidationError):
         context.sensitive_literals = ()
+
+
+def test_publication_privacy_context_requires_affirmative_consistent_mode() -> None:
+    context_type = getattr(report_models, "PublicationPrivacyContext")
+    no_sensitive = context_type(
+        mode="no_sensitive_data",
+        sensitive_literals=(),
+        account_identifiers=(),
+        portfolio_values=(),
+    )
+    enforced = context_type(
+        mode="enforced",
+        sensitive_literals=("private-marker",),
+        account_identifiers=(),
+        portfolio_values=(),
+    )
+    assert no_sensitive.mode == "no_sensitive_data"
+    assert enforced.mode == "enforced"
+    with pytest.raises(ValidationError, match="enforced|sensitive"):
+        context_type(
+            mode="enforced",
+            sensitive_literals=(),
+            account_identifiers=(),
+            portfolio_values=(),
+        )
+    with pytest.raises(ValidationError, match="no_sensitive_data|empty"):
+        context_type(
+            mode="no_sensitive_data",
+            sensitive_literals=("private-marker",),
+            account_identifiers=(),
+            portfolio_values=(),
+        )
 
 
 @pytest.mark.parametrize(
@@ -619,6 +668,238 @@ def test_runtime_privacy_context_fails_closed_on_exact_typed_numeric_collision(
         ).render_portfolio_brief(portfolio_report())
 
     assert not tuple(tmp_path.glob("*.html"))
+
+
+@pytest.mark.parametrize(
+    "formatted_value",
+    (
+        "1 234.56",
+        "1\u00a0234.56",
+        "1\u202f234.56",
+        "1\u2009234.56",
+        "1,234.56",
+        "+1 234.56",
+        "−1\u202f234.56",
+        "(1 234.56)",
+        "USD 1 234.56",
+        "1.234,56",
+    ),
+)
+def test_runtime_privacy_context_blocks_grouped_registered_decimal_forms(
+    tmp_path: Path,
+    formatted_value: str,
+) -> None:
+    unsafe = event_report().model_copy(
+        update={
+            "thesis": section("Thesis").model_copy(
+                update={"body": f"Portfolio worth {formatted_value}."}
+            )
+        }
+    )
+    publication_error = getattr(report_models, "ReportPublicationError")
+
+    with pytest.raises(publication_error) as exc_info:
+        ReportRenderer(
+            tmp_path,
+            privacy_context=publication_privacy_context(
+                portfolio_values=(Decimal("1234.56"),)
+            ),
+        ).render_event_update(unsafe)
+
+    assert str(exc_info.value) == "report publication blocked by privacy policy"
+    assert not tuple(tmp_path.glob("*.html"))
+
+
+@pytest.mark.parametrize(
+    "body",
+    (
+        "DCF fair value is USD 100 per share.",
+        "Price target is $100.",
+        "Revenue reached USD 5 billion.",
+    ),
+)
+def test_display_text_allows_public_valuation_and_revenue_prose(body: str) -> None:
+    value = ReportSection(title="Valuation", body=body, evidence_ids=("E-001",))
+    assert value.body == body
+
+
+@pytest.mark.parametrize(
+    "mode",
+    ("no_sensitive_data", "enforced"),
+)
+def test_renderer_allows_noncolliding_public_money_prose(
+    tmp_path: Path,
+    mode: str,
+) -> None:
+    context = (
+        publication_privacy_context()
+        if mode == "no_sensitive_data"
+        else publication_privacy_context(portfolio_values=(Decimal("999.99"),))
+    )
+    safe = event_report().model_copy(
+        update={
+            "thesis": section("Thesis").model_copy(
+                update={"body": "DCF fair value is USD 100 per share."}
+            )
+        }
+    )
+
+    artifact = ReportRenderer(
+        tmp_path, privacy_context=context
+    ).render_event_update(safe)
+
+    assert "DCF fair value is USD 100 per share." in artifact.html
+
+
+def test_renderer_blocks_known_value_even_in_valuation_prose(tmp_path: Path) -> None:
+    unsafe = event_report().model_copy(
+        update={
+            "thesis": section("Thesis").model_copy(
+                update={"body": "DCF fair value is USD 100 per share."}
+            )
+        }
+    )
+    publication_error = getattr(report_models, "ReportPublicationError")
+
+    with pytest.raises(publication_error, match="publication blocked"):
+        ReportRenderer(
+            tmp_path,
+            privacy_context=publication_privacy_context(
+                portfolio_values=(Decimal("100"),)
+            ),
+        ).render_event_update(unsafe)
+
+    assert not tuple(tmp_path.glob("*.html"))
+
+
+def test_privacy_scanner_has_bounded_linear_adjacent_checks() -> None:
+    source = inspect.getsource(report_models._publication_number_values)
+    assert "normalized[: match.start()]" not in source
+    assert "normalized[match.end() :]" not in source
+
+
+def test_privacy_number_parser_never_splits_malformed_grouping() -> None:
+    parser = report_models._publication_number_values
+    assert parser("Malformed 12 34.56 and 1,23.45 values.") == ()
+
+
+def test_publication_limits_reject_oversize_field_without_echoing_input() -> None:
+    max_chars = getattr(report_models, "MAX_PUBLICATION_STRING_CHARS")
+    marker = "PRIVATE-OVERSIZE-MARKER"
+    with pytest.raises(ValidationError) as exc_info:
+        ReportSection(
+            title="Analysis",
+            body="x" * (max_chars + 1) + marker,
+            evidence_ids=("E-001",),
+        )
+    assert marker not in str(exc_info.value)
+
+
+@pytest.mark.parametrize(
+    ("field", "limit_name", "prefix"),
+    (
+        ("sensitive_literals", "MAX_PRIVACY_LITERAL_CHARS", "x"),
+        ("account_identifiers", "MAX_PRIVACY_ACCOUNT_CHARS", "A1"),
+    ),
+)
+def test_publication_limits_reject_oversize_context_without_echoing_input(
+    field: str,
+    limit_name: str,
+    prefix: str,
+) -> None:
+    max_chars = getattr(report_models, limit_name)
+    marker = "PRIVATE-CONTEXT-MARKER"
+    context_type = getattr(report_models, "PublicationPrivacyContext")
+    values: dict[str, object] = {
+        "mode": "enforced",
+        "sensitive_literals": (),
+        "account_identifiers": (),
+        "portfolio_values": (),
+    }
+    values[field] = (prefix + "x" * max_chars + marker,)
+    with pytest.raises(ValidationError) as exc_info:
+        context_type(**values)
+    assert marker not in str(exc_info.value)
+
+
+@pytest.mark.parametrize(
+    "field",
+    ("sensitive_literals", "account_identifiers", "portfolio_values"),
+)
+def test_publication_limits_reject_excess_context_items(field: str) -> None:
+    limit = getattr(report_models, "MAX_PRIVACY_CONTEXT_ITEMS")
+    values: dict[str, object] = {
+        "mode": "enforced",
+        "sensitive_literals": (),
+        "account_identifiers": (),
+        "portfolio_values": (),
+    }
+    if field == "sensitive_literals":
+        values[field] = tuple(f"secret-{index}" for index in range(limit + 1))
+    elif field == "account_identifiers":
+        values[field] = tuple(f"A{index:05d}" for index in range(limit + 1))
+    else:
+        values[field] = tuple(Decimal(index) for index in range(limit + 1))
+    context_type = getattr(report_models, "PublicationPrivacyContext")
+    with pytest.raises(ValidationError, match="length|items|tuple"):
+        context_type(**values)
+
+
+def test_publication_limits_reject_aggregate_report_text_before_write(
+    tmp_path: Path,
+) -> None:
+    per_string = getattr(report_models, "MAX_PUBLICATION_STRING_CHARS")
+    total_text = getattr(report_models, "MAX_PUBLICATION_TOTAL_TEXT_CHARS")
+    body = "x" * (per_string - 100)
+    section_count = (total_text // len(body)) + 1
+    oversized_sections = tuple(
+        ReportSection(title=f"Section {index}", body=body, evidence_ids=("E-001",))
+        for index in range(section_count)
+    )
+    unsafe = event_report().model_copy(
+        update={"event_decomposition": oversized_sections}
+    )
+    publication_error = getattr(report_models, "ReportPublicationError")
+
+    with pytest.raises(publication_error) as exc_info:
+        renderer(tmp_path).render_event_update(unsafe)
+
+    assert str(exc_info.value) == "report publication blocked by privacy policy"
+    assert not tuple(tmp_path.glob("*.html"))
+
+
+def test_publication_limits_reject_excess_report_nodes_before_write(
+    tmp_path: Path,
+) -> None:
+    node_limit = getattr(report_models, "MAX_PUBLICATION_NODES")
+    repeated = section("Repeated")
+    unsafe = event_report().model_copy(
+        update={"event_decomposition": (repeated,) * (node_limit + 1)}
+    )
+    publication_error = getattr(report_models, "ReportPublicationError")
+
+    with pytest.raises(publication_error, match="publication blocked"):
+        renderer(tmp_path).render_event_update(unsafe)
+
+    assert not tuple(tmp_path.glob("*.html"))
+
+
+def test_large_allowed_numeric_report_scans_within_generous_bound() -> None:
+    max_chars = getattr(report_models, "MAX_PUBLICATION_STRING_CHARS")
+    body = ("Metric 12,345.67; " * 10_000)[: max_chars - 1]
+    report = event_report().model_copy(
+        update={
+            "thesis": section("Thesis").model_copy(update={"body": body})
+        }
+    )
+    context = publication_privacy_context(
+        portfolio_values=(Decimal("999999999.99"),)
+    )
+
+    started = time.monotonic()
+    context.assert_safe(report)
+
+    assert time.monotonic() - started < 2.0
 
 
 @pytest.mark.parametrize("sign", PRIVACY_AMOUNT_SIGNS)

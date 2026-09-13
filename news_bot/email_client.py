@@ -406,6 +406,18 @@ def _attachment_basename(path: Path) -> str:
     return "".join(character if character.isprintable() else "?" for character in name)
 
 
+def _attachment_identity(value: os.stat_result) -> tuple[int, int, int, int, int, int]:
+    """Fields that must remain stable while one attachment descriptor is read."""
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_size,
+        value.st_mode,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+
+
 def _safe_attachment_payload(
     path: Path,
     *,
@@ -432,8 +444,7 @@ def _safe_attachment_payload(
         opened = os.fstat(descriptor)
         if (
             not stat.S_ISREG(opened.st_mode)
-            or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
-            or opened.st_size != before.st_size
+            or _attachment_identity(opened) != _attachment_identity(before)
             or opened.st_size > MAX_ATTACHMENT_BYTES
             or opened.st_size > remaining_total_bytes
         ):
@@ -460,8 +471,7 @@ def _safe_attachment_payload(
         after = os.fstat(descriptor)
         if (
             not stat.S_ISREG(after.st_mode)
-            or (after.st_dev, after.st_ino, after.st_size)
-            != (opened.st_dev, opened.st_ino, opened.st_size)
+            or _attachment_identity(after) != _attachment_identity(opened)
         ):
             return None, "unsafe"
         return b"".join(chunks), None
@@ -517,7 +527,8 @@ def send_email(
         subject: Email subject line.
         html_body: HTML content for the email body.
         attachment_path: Legacy optional path to one attachment.
-        attachment_paths: Optional ordered collection of attachments.
+        attachment_paths: Optional ordered collection of attachments. Files must
+            be finalized and atomically published before this function reads them.
     
     Raises:
         EmailError: If sending fails.

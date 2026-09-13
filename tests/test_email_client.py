@@ -609,6 +609,55 @@ class TestSendEmail:
         assert message.get_content_subtype() == "alternative"
         assert "raced.pdf" in caplog.text
 
+    def test_send_email_rejects_same_inode_size_mutation_during_read(
+        self,
+        mock_config,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ):
+        attachment = tmp_path / "mutated.pdf"
+        original = b"%PDF-original"
+        attacker = b"%PDF-attacker"
+        assert len(original) == len(attacker)
+        attachment.write_bytes(original)
+        original_stat = attachment.stat()
+        real_read = os.read
+        mutated = False
+
+        def mutate_after_read(fd: int, size: int) -> bytes:
+            nonlocal mutated
+            payload = real_read(fd, size)
+            if not mutated:
+                mutated = True
+                attachment.write_bytes(attacker)
+                os.utime(
+                    attachment,
+                    ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns + 1_000_000),
+                )
+            return payload
+
+        with patch("news_bot.email_client.os.read", side_effect=mutate_after_read):
+            with patch("news_bot.email_client.smtplib.SMTP") as smtp_class:
+                smtp = MagicMock()
+                smtp_class.return_value.__enter__.return_value = smtp
+                with caplog.at_level("WARNING"):
+                    send_email(
+                        mock_config,
+                        "Research",
+                        "<p>Body</p>",
+                        attachment_paths=(attachment,),
+                    )
+
+        message = message_from_string(smtp.sendmail.call_args.args[2])
+        assert message.get_content_subtype() == "alternative"
+        assert "mutated.pdf" in caplog.text
+        assert str(tmp_path) not in caplog.text
+
+    def test_send_email_documents_finalized_atomic_attachment_contract(self):
+        documentation = send_email.__doc__ or ""
+        assert "finalized" in documentation.lower()
+        assert "atomic" in documentation.lower()
+
 
 class TestBuildSectionedEmailHtml:
     """Tests for sectioned email HTML builder."""

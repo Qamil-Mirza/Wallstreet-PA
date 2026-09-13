@@ -23,6 +23,13 @@ ReportType = Literal[
     "industry_landscape",
     "emerging_monitor",
 ]
+MAX_PUBLICATION_STRING_CHARS = 64 * 1024
+MAX_PUBLICATION_TOTAL_TEXT_CHARS = 512 * 1024
+MAX_PUBLICATION_NODES = 10_000
+MAX_PRIVACY_CONTEXT_ITEMS = 100
+MAX_PRIVACY_LITERAL_CHARS = 4 * 1024
+MAX_PRIVACY_ACCOUNT_CHARS = 256
+_MAX_ADJACENT_WHITESPACE = 16
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 _PROVIDER_MODEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/+-]{0,255}$")
 _SHA256 = re.compile(r"^[0-9a-fA-F]{64}$")
@@ -40,9 +47,12 @@ _ACCOUNT_REFERENCE = re.compile(
     r"(?i)\b(?:brokerage\s+)?(?:account|acct)\b\s*(?:is|of|[:=#-])?\s*"
     r"(?=(?:[^\d]*\d){5,})[A-Za-z0-9](?:[A-Za-z0-9\s-]*[A-Za-z0-9])?"
 )
-_MONEY_NUMBER = r"(?:\d(?:[\d,]*\d)?(?:\.\d+)?|\.\d+)"
+_MONEY_NUMBER = (
+    r"(?:\d{1,3}(?:\.\d{3})+,\d+|"
+    r"\d{1,3}(?:[ ,]\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?|\.\d+)"
+)
 _EXACT_PORTFOLIO_VALUE = re.compile(
-    r"(?ix)\b(?:net\s+asset\s+value|nav|cash(?:\s+balance)?|position(?:\s+value)?|market\s+value)\b"
+    r"(?ix)\b(?:net\s+asset\s+value|nav|cash(?:\s+balance)?|position(?:\s+value)?|market\s+value|portfolio\s+(?:value|amount|worth))\b"
     r"\s*(?:is|was|were|of|at|totals?|totaled|stood\s+at|[:=])?\s*[+−-]?\s*(?:\(\s*)?"
     r"[+−-]?\s*(?:USD|EUR|GBP|JPY|MYR|[$€£])?\s*[+−-]?\s*"
     + _MONEY_NUMBER
@@ -58,7 +68,7 @@ _MONEY_AMOUNT = re.compile(
     r")(?![\d,]|\.\d)\s*\)?(?!\s*(?:[%x×]|[–—-]\s*\d))"
 )
 _PUBLICATION_NUMBER = re.compile(
-    r"(?ix)(?<![\w.])(?P<paren>\()?\s*"
+    r"(?ix)(?<![\w.,])(?P<paren>\()?\s*"
     r"(?:(?:USD|EUR|GBP|JPY|MYR|[$€£])\s*)?"
     r"(?P<sign>[+−-])?\s*(?P<number>"
     + _MONEY_NUMBER
@@ -78,7 +88,6 @@ def _contains_private_material_once(value: str) -> bool:
         or _ACCOUNT_ASSIGNMENT.search(value)
         or _ACCOUNT_REFERENCE.search(value)
         or _EXACT_PORTFOLIO_VALUE.search(value)
-        or _MONEY_AMOUNT.search(value)
     )
 
 
@@ -86,6 +95,8 @@ def _privacy_analysis_copy(value: str) -> str:
     if any(unicodedata.category(char) == "Cf" for char in value):
         raise ValueError("display text contains invisible format characters")
     normalized = unicodedata.normalize("NFKC", value)
+    if len(normalized) > MAX_PUBLICATION_STRING_CHARS:
+        raise ValueError("display text exceeds publication length limit")
     if any(unicodedata.category(char) == "Cf" for char in normalized):
         raise ValueError("display text contains invisible format characters")
     return normalized
@@ -115,6 +126,8 @@ def _contains_private_material(value: str) -> bool:
 def _display_text(value: str) -> str:
     if not isinstance(value, str):
         raise ValueError("must be text")
+    if len(value) > MAX_PUBLICATION_STRING_CHARS:
+        raise ValueError("display text exceeds publication length limit")
     value = unicodedata.normalize("NFC", value).strip()
     if not value or any(
         unicodedata.category(char) == "Cc" and char not in {"\n", "\t"}
@@ -172,14 +185,22 @@ class DisplayModel(BaseModel):
     """Base contract that prevents coercion, mutation, and surprise fields."""
 
     model_config = ConfigDict(
-        extra="forbid", frozen=True, strict=True, revalidate_instances="always"
+        extra="forbid",
+        frozen=True,
+        strict=True,
+        revalidate_instances="always",
+        hide_input_in_errors=True,
     )
 
 
-def _context_text(value: str) -> str:
+def _context_text(value: str, *, max_chars: int) -> str:
     if not isinstance(value, str):
         raise ValueError("privacy context values must be text")
+    if len(value) > max_chars:
+        raise ValueError("privacy context value exceeds length limit")
     normalized = _privacy_analysis_copy(value).strip()
+    if len(normalized) > max_chars:
+        raise ValueError("privacy context value exceeds length limit")
     if not normalized:
         raise ValueError("privacy context values must be nonblank")
     return value
@@ -197,14 +218,75 @@ def _publication_number_values(value: str) -> tuple[Decimal, ...]:
     normalized = _privacy_analysis_copy(value).replace("−", "-")
     matches: list[Decimal] = []
     for match in _PUBLICATION_NUMBER.finditer(normalized):
-        before = normalized[: match.start()].rstrip()
-        after = normalized[match.end() :].lstrip()
-        if after.startswith(("%", "x", "×")):
+        number_before_index = match.start("number") - 1
+        number_before_steps = 0
+        while (
+            number_before_index >= 0
+            and normalized[number_before_index].isspace()
+            and number_before_steps < _MAX_ADJACENT_WHITESPACE
+        ):
+            number_before_index -= 1
+            number_before_steps += 1
+        number_after_index = match.end("number")
+        number_after_steps = 0
+        while (
+            number_after_index < len(normalized)
+            and normalized[number_after_index].isspace()
+            and number_after_steps < _MAX_ADJACENT_WHITESPACE
+        ):
+            number_after_index += 1
+            number_after_steps += 1
+        number_before = (
+            normalized[number_before_index] if number_before_index >= 0 else ""
+        )
+        number_after = (
+            normalized[number_after_index]
+            if number_after_index < len(normalized)
+            else ""
+        )
+        if number_before.isdigit() or number_after.isdigit():
             continue
-        if after.startswith(("-", "–", "—")) or before.endswith(("-", "–", "—")):
+
+        before_index = match.start() - 1
+        before_steps = 0
+        while (
+            before_index >= 0
+            and normalized[before_index].isspace()
+            and before_steps < _MAX_ADJACENT_WHITESPACE
+        ):
+            before_index -= 1
+            before_steps += 1
+        after_index = match.end()
+        after_steps = 0
+        while (
+            after_index < len(normalized)
+            and normalized[after_index].isspace()
+            and after_steps < _MAX_ADJACENT_WHITESPACE
+        ):
+            after_index += 1
+            after_steps += 1
+        after_character = (
+            normalized[after_index] if after_index < len(normalized) else ""
+        )
+        before_character = normalized[before_index] if before_index >= 0 else ""
+        if after_character in {"%", "x", "×"}:
+            continue
+        if after_character in {"-", "–", "—"} or before_character in {
+            "-",
+            "–",
+            "—",
+        }:
             continue
         try:
-            numeric = Decimal(match.group("number").replace(",", ""))
+            # Supported grouping is canonical decimal-point notation with either
+            # comma/space thousands separators. Dot-thousands/comma-decimal is
+            # accepted only when both separators make the locale unambiguous.
+            token = match.group("number")
+            if "." in token and "," in token and token.rfind(",") > token.rfind("."):
+                canonical = token.replace(".", "").replace(",", ".")
+            else:
+                canonical = token.replace(",", "").replace(" ", "")
+            numeric = Decimal(canonical)
         except Exception:
             continue
         if match.group("sign") == "-" or match.group("paren"):
@@ -214,17 +296,30 @@ def _publication_number_values(value: str) -> tuple[Decimal, ...]:
 
 
 class PublicationPrivacyContext(DisplayModel):
-    """Caller-supplied local values that must never cross publication."""
+    """Affirm whether local sensitive values exist before publication."""
 
-    sensitive_literals: tuple[str, ...]
-    account_identifiers: tuple[str, ...]
-    portfolio_values: tuple[Decimal, ...]
+    mode: Literal["enforced", "no_sensitive_data"]
+    sensitive_literals: tuple[str, ...] = Field(
+        max_length=MAX_PRIVACY_CONTEXT_ITEMS
+    )
+    account_identifiers: tuple[str, ...] = Field(
+        max_length=MAX_PRIVACY_CONTEXT_ITEMS
+    )
+    portfolio_values: tuple[Decimal, ...] = Field(
+        max_length=MAX_PRIVACY_CONTEXT_ITEMS
+    )
 
     _literals = field_validator("sensitive_literals")(
-        lambda values: tuple(_context_text(value) for value in values)
+        lambda values: tuple(
+            _context_text(value, max_chars=MAX_PRIVACY_LITERAL_CHARS)
+            for value in values
+        )
     )
     _accounts = field_validator("account_identifiers")(
-        lambda values: tuple(_context_text(value) for value in values)
+        lambda values: tuple(
+            _context_text(value, max_chars=MAX_PRIVACY_ACCOUNT_CHARS)
+            for value in values
+        )
     )
 
     @field_validator("account_identifiers")
@@ -243,6 +338,19 @@ class PublicationPrivacyContext(DisplayModel):
             raise ValueError("privacy portfolio values must be finite")
         return values
 
+    @model_validator(mode="after")
+    def _consistent_mode(self) -> "PublicationPrivacyContext":
+        has_sensitive_data = bool(
+            self.sensitive_literals
+            or self.account_identifiers
+            or self.portfolio_values
+        )
+        if self.mode == "enforced" and not has_sensitive_data:
+            raise ValueError("enforced privacy mode requires sensitive data")
+        if self.mode == "no_sensitive_data" and has_sensitive_data:
+            raise ValueError("no_sensitive_data mode requires empty privacy values")
+        return self
+
     def assert_safe(self, report: BaseModel) -> None:
         literal_keys = tuple(
             variant.casefold()
@@ -251,8 +359,16 @@ class PublicationPrivacyContext(DisplayModel):
         )
         account_keys = tuple(_account_key(value) for value in self.account_identifiers)
         portfolio_values = tuple(abs(value) for value in self.portfolio_values)
+        nodes = 0
+        total_text_chars = 0
 
         def inspect(value: object) -> None:
+            nonlocal nodes, total_text_chars
+            nodes += 1
+            if nodes > MAX_PUBLICATION_NODES:
+                raise ReportPublicationError(
+                    "report publication blocked by privacy policy"
+                )
             if isinstance(value, BaseModel):
                 for field_value in value.__dict__.values():
                     inspect(field_value)
@@ -267,6 +383,17 @@ class PublicationPrivacyContext(DisplayModel):
                     inspect(item)
                 return
             if isinstance(value, str):
+                if len(value) > MAX_PUBLICATION_STRING_CHARS:
+                    raise ReportPublicationError(
+                        "report publication blocked by privacy policy"
+                    )
+                total_text_chars += len(value)
+                if total_text_chars > MAX_PUBLICATION_TOTAL_TEXT_CHARS:
+                    raise ReportPublicationError(
+                        "report publication blocked by privacy policy"
+                    )
+                if not literal_keys and not account_keys and not portfolio_values:
+                    return
                 try:
                     variants = _privacy_decoded_variants(value)
                 except ValueError:
