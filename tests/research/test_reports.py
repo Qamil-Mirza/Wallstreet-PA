@@ -1451,6 +1451,40 @@ def test_reports_import_without_pdf_backend(tmp_path: Path) -> None:
     assert "models available" in result.stdout
 
 
+def test_subprocess_pdf_backend_failure_keeps_diagnostics_private(
+    tmp_path: Path,
+) -> None:
+    blocker = tmp_path / "weasyprint.py"
+    blocker.write_text(
+        "import os\n"
+        "os.write(1, b'native loader stdout private NAV=8888\\n')\n"
+        "os.write(2, b'native loader stderr private DU123456\\n')\n"
+        "raise ImportError('native library unavailable')\n",
+        encoding="utf-8",
+    )
+    env = os.environ.copy()
+    env["PYTHONPATH"] = os.pathsep.join((str(tmp_path), str(Path.cwd())))
+    output_dir = tmp_path / "output"
+    script = (
+        "from pathlib import Path; "
+        "from tests.research.test_reports import event_report, renderer; "
+        f"artifact = renderer(Path({str(output_dir)!r})).render_event_update(event_report()); "
+        "print(artifact.pdf_error)"
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        text=True,
+        capture_output=True,
+        env=env,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert result.stdout == "pdf_backend_unavailable\n"
+    assert result.stderr == ""
+
+
 def test_pdf_backend_import_failure_retains_html(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     real_import = builtins.__import__
 

@@ -36,12 +36,14 @@ from news_bot.research.models import (
     ReviewVerdict,
 )
 from news_bot.research.orchestrator import (
+    DurableTaskView,
     ResearchOrchestrator,
     StageOutcome,
     WorkflowBusy,
     WorkflowKind,
     WorkflowRunResult,
     WorkflowRunState,
+    WorkflowTaskState,
 )
 from news_bot.research.quality import PublicationVerdict, QualityGateResult
 from news_bot.research.reports import ReportRenderer
@@ -59,20 +61,23 @@ from news_bot.research.store import ResearchStore
 def FakeResult(
     *,
     status: str = "completed",
+    workflow_kind: WorkflowKind = WorkflowKind.DAILY,
     report_ids: tuple[str, ...] = ("report-private-123",),
+    pending_tasks: tuple[DurableTaskView, ...] = (),
     omissions: tuple[str, ...] = (),
+    dry_run: bool = False,
 ) -> WorkflowRunResult:
     valid_statuses = {state.value: state for state in WorkflowRunState}
     result = WorkflowRunResult(
         workflow_id="wf-cli-result",
-        workflow_kind=WorkflowKind.DAILY,
+        workflow_kind=workflow_kind,
         status=valid_statuses.get(status, WorkflowRunState.COMPLETED),
         completed_stages=(),
         report_ids=report_ids,
         new_agent_runs=0,
-        pending_tasks=(),
+        pending_tasks=pending_tasks,
         omissions=omissions,
-        dry_run=False,
+        dry_run=dry_run,
     )
     if status not in valid_statuses:
         return result.model_copy(update={"status": status})
@@ -81,12 +86,24 @@ def FakeResult(
 
 class RecordingWorkflows:
     def __init__(self, result: object | None = None) -> None:
-        self.result = result or FakeResult()
+        self.result = result
         self.calls: list[tuple[str, dict[str, object]]] = []
 
     def _record(self, command: str, **kwargs: object) -> object:
         self.calls.append((command, kwargs))
-        return self.result
+        if self.result is not None:
+            return self.result
+        workflow_kind = {
+            "daily": WorkflowKind.DAILY,
+            "weekly": WorkflowKind.WEEKLY,
+            "monthly": WorkflowKind.MONTHLY,
+            "backfill": WorkflowKind.BACKFILL,
+            "regenerate": WorkflowKind.DAILY,
+        }[command]
+        return FakeResult(
+            workflow_kind=workflow_kind,
+            dry_run=bool(kwargs.get("dry_run", False)),
+        )
 
     def run_daily(self, **kwargs: object) -> object:
         return self._record("daily", **kwargs)
@@ -366,6 +383,7 @@ def test_summary_prints_counts_not_private_identifiers_or_values(
 ) -> None:
     result = FakeResult(
         status="partial",
+        workflow_kind=WorkflowKind.WEEKLY,
         report_ids=("report-private-123", "account-DU123456-NAV-9999"),
         omissions=("missing_claim_lineage",),
     )
@@ -385,7 +403,10 @@ def test_summary_prints_counts_not_private_identifiers_or_values(
 
 def test_blocked_required_output_has_explicit_exit_code(tmp_path: Path) -> None:
     services, _, _ = fake_services(
-        tmp_path, workflows=RecordingWorkflows(FakeResult(status="blocked"))
+        tmp_path,
+        workflows=RecordingWorkflows(
+            FakeResult(status="blocked", workflow_kind=WorkflowKind.MONTHLY)
+        ),
     )
     assert (
         main(
@@ -423,47 +444,139 @@ def test_exit_status_matrix_is_fail_closed(
     services, _, _ = fake_services(
         tmp_path,
         workflows=RecordingWorkflows(
-            FakeResult(status=status, omissions=omissions)
+            FakeResult(
+                status=status,
+                workflow_kind=WorkflowKind.WEEKLY,
+                omissions=omissions,
+            )
         ),
     )
 
     assert main(["weekly", "--as-of", "2026-08-24"], services=services) == expected
 
 
+def _cli_task(state: WorkflowTaskState) -> DurableTaskView:
+    return DurableTaskView(
+        task_id="task-cli-pending",
+        idempotency_key="a" * 64,
+        stage="publish",
+        dependency_ids=(),
+        state=state,
+        attempt_count=0,
+        max_attempts=2,
+    )
+
+
 @pytest.mark.parametrize(
-    "result",
+    ("argv", "result"),
     [
-        SimpleNamespace(status="partial", report_ids=(), omissions=[None]),
-        WorkflowRunResult(
-            workflow_id="wf-malformed-partial",
-            workflow_kind=WorkflowKind.DAILY,
-            status=WorkflowRunState.PARTIAL,
-            completed_stages=(),
-            report_ids=(),
-            new_agent_runs=0,
-            pending_tasks=(),
-            omissions=("dry_run",),
-            dry_run=True,
-        ).model_copy(update={"omissions": [None]}),
-        FakeResult(status="partial", omissions=()),
-        FakeResult(status="completed", omissions=("dry_run",)),
+        (
+            ["dry-run", "--as-of", "2026-08-24"],
+            SimpleNamespace(status="partial", report_ids=(), omissions=[None]),
+        ),
+        (
+            ["dry-run", "--as-of", "2026-08-24"],
+            WorkflowRunResult(
+                workflow_id="wf-malformed-partial",
+                workflow_kind=WorkflowKind.DAILY,
+                status=WorkflowRunState.PARTIAL,
+                completed_stages=(),
+                report_ids=(),
+                new_agent_runs=0,
+                pending_tasks=(),
+                omissions=("dry_run",),
+                dry_run=True,
+            ).model_copy(update={"omissions": [None]}),
+        ),
+        (
+            ["dry-run", "--as-of", "2026-08-24"],
+            FakeResult(status="partial", omissions=(), dry_run=True),
+        ),
+        (
+            ["dry-run", "--as-of", "2026-08-24"],
+            FakeResult(
+                status="completed", omissions=("dry_run",), dry_run=True
+            ),
+        ),
+        (
+            ["dry-run", "--as-of", "2026-08-24"],
+            FakeResult(
+                pending_tasks=(_cli_task(WorkflowTaskState.PENDING),),
+                dry_run=True,
+            ),
+        ),
+        (
+            ["dry-run", "--as-of", "2026-08-24"],
+            FakeResult(
+                status="partial",
+                pending_tasks=(_cli_task(WorkflowTaskState.COMPLETED),),
+                omissions=("dry_run",),
+                dry_run=True,
+            ),
+        ),
+        (
+            ["weekly", "--as-of", "2026-08-24"],
+            FakeResult(workflow_kind=WorkflowKind.WEEKLY, dry_run=True),
+        ),
+        (
+            ["weekly", "--as-of", "2026-08-24"],
+            FakeResult(workflow_kind=WorkflowKind.MONTHLY),
+        ),
     ],
 )
 def test_cli_rejects_malformed_partial_before_printing_summary(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
+    argv: list[str],
     result: object,
 ) -> None:
     services, _, _ = fake_services(
         tmp_path, workflows=RecordingWorkflows(result)
     )
 
-    assert main(
-        ["dry-run", "--as-of", "2026-08-24"], services=services
-    ) == ExitCode.OPERATIONAL_FAILURE
+    assert main(argv, services=services) == ExitCode.OPERATIONAL_FAILURE
     captured = capsys.readouterr()
     assert captured.out == ""
     assert captured.err == "research error: operational failure\n"
+
+
+def test_cli_accepts_semantically_valid_completed_dry_run(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    result = FakeResult(dry_run=True)
+    services, _, _ = fake_services(
+        tmp_path, workflows=RecordingWorkflows(result)
+    )
+
+    assert main(
+        ["dry-run", "--as-of", "2026-08-24"], services=services
+    ) == ExitCode.OK
+    assert capsys.readouterr().out == (
+        "research command=dry-run status=completed reports=1 omissions=0\n"
+    )
+
+
+def test_cli_accepts_partial_with_canonical_pending_task(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    result = FakeResult(
+        status="partial",
+        pending_tasks=(_cli_task(WorkflowTaskState.PENDING),),
+        omissions=("dry_run",),
+        dry_run=True,
+    )
+    services, _, _ = fake_services(
+        tmp_path, workflows=RecordingWorkflows(result)
+    )
+
+    assert main(
+        ["dry-run", "--as-of", "2026-08-24"], services=services
+    ) == ExitCode.OK
+    assert capsys.readouterr().out == (
+        "research command=dry-run status=partial reports=1 omissions=1\n"
+    )
 
 
 def test_unrelated_commands_do_not_read_unused_secret_files(
@@ -1138,6 +1251,7 @@ def test_synthetic_cli_suppresses_pdf_backend_diagnostics(
     def noisy_pdf(
         _renderer: ReportRenderer, destination: Path, _html: str
     ) -> None:
+        os.write(1, b"private PDF stdout NAV=8888 DU654321\n")
         os.write(2, b"private PDF diagnostic NAV=9999 DU123456\n")
         destination.write_bytes(b"%PDF-test")
 

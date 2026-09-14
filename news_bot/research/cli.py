@@ -13,7 +13,12 @@ from enum import IntEnum
 from typing import Protocol
 
 from .config import ResearchConfig, ResearchConfigError
-from .orchestrator import WorkflowBusy, WorkflowRunResult
+from .orchestrator import (
+    WorkflowBusy,
+    WorkflowKind,
+    WorkflowRunResult,
+    WorkflowTaskState,
+)
 from .scheduler import (
     DEFAULT_RUN_LEASE_TTL_SECONDS,
     RUN_LEASE_NAME,
@@ -250,6 +255,36 @@ def _validated_result(result: object) -> WorkflowRunResult:
         raise RuntimeError("workflow returned an invalid result") from None
 
 
+def _validate_result_semantics(
+    command: str, result: WorkflowRunResult
+) -> None:
+    expected_kind = {
+        "daily": WorkflowKind.DAILY,
+        "dry-run": WorkflowKind.DAILY,
+        "weekly": WorkflowKind.WEEKLY,
+        "monthly": WorkflowKind.MONTHLY,
+        "backfill": WorkflowKind.BACKFILL,
+    }.get(command)
+    # Regeneration replays the original workflow, so its kind and dry-run bit
+    # intentionally describe that stored run rather than the replay command.
+    if expected_kind is not None and result.workflow_kind is not expected_kind:
+        raise RuntimeError("workflow returned a mismatched kind")
+    expected_dry_run = command == "dry-run"
+    if command != "regenerate" and result.dry_run is not expected_dry_run:
+        raise RuntimeError("workflow returned a mismatched dry-run state")
+    if any(
+        task.state is not WorkflowTaskState.PENDING
+        for task in result.pending_tasks
+    ):
+        raise RuntimeError("workflow returned invalid pending tasks")
+    if result.status.value == "completed" and (
+        result.pending_tasks or result.omissions
+    ):
+        raise RuntimeError("completed workflow returned partial state")
+    if result.status.value == "partial" and not result.omissions:
+        raise RuntimeError("partial workflow returned no omissions")
+
+
 def _count_field(result: object, name: str) -> int:
     value = getattr(result, name, ())
     if isinstance(value, (str, bytes)):
@@ -330,6 +365,7 @@ def main(
         result = _validated_result(
             _dispatch(arguments.command, arguments, workflows)
         )
+        _validate_result_semantics(arguments.command, result)
         lease.assert_current()
         status = _status_value(result)
         exit_code = _result_exit_code(result, status)

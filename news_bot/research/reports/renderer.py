@@ -33,17 +33,44 @@ _PDF_DIAGNOSTIC_LOCK = Lock()
 
 @contextmanager
 def _captured_pdf_diagnostics() -> Iterator[None]:
-    """Keep backend/native diagnostics off the process stderr boundary."""
+    """Keep backend/native diagnostics off process stdout and stderr."""
     with _PDF_DIAGNOSTIC_LOCK, tempfile.TemporaryFile(mode="w+b") as sink:
-        saved_stderr = os.dup(2)
+        saved_descriptors: dict[int, int] = {}
+        body_error: BaseException | None = None
         try:
-            sys.stderr.flush()
-            os.dup2(sink.fileno(), 2)
+            for descriptor in (1, 2):
+                saved_descriptors[descriptor] = os.dup(descriptor)
+            for stream in (sys.stdout, sys.stderr):
+                try:
+                    stream.flush()
+                except Exception:
+                    pass
+            for descriptor in saved_descriptors:
+                os.dup2(sink.fileno(), descriptor)
             yield
+        except BaseException as error:
+            body_error = error
+            raise
         finally:
-            sys.stderr.flush()
-            os.dup2(saved_stderr, 2)
-            os.close(saved_stderr)
+            for stream in (sys.stdout, sys.stderr):
+                try:
+                    stream.flush()
+                except Exception:
+                    pass
+            restore_error: OSError | None = None
+            for descriptor, saved in saved_descriptors.items():
+                try:
+                    os.dup2(saved, descriptor)
+                except OSError as error:
+                    if restore_error is None:
+                        restore_error = error
+                try:
+                    os.close(saved)
+                except OSError as error:
+                    if restore_error is None:
+                        restore_error = error
+            if restore_error is not None and body_error is None:
+                raise restore_error
 
 
 class ReportRenderer:

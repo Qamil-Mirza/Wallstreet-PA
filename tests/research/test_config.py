@@ -142,30 +142,42 @@ def test_default_weekday_crons_have_deterministic_next_fire_times() -> None:
 
 @pytest.mark.parametrize(
     "value",
-    ("*/60 7 * * mon", "0 7 * * */7"),
+    (
+        "*/60 7 * * mon",
+        "0 7 */31 * mon",
+        "0 7 * */12 mon",
+        "0 7 * * */7",
+        "1-2/2 7 * * mon",
+        "0 7 * jan-feb/2 mon",
+    ),
 )
-def test_cron_steps_cannot_exceed_apscheduler_field_maximum(value: str) -> None:
+def test_cron_steps_cannot_exceed_apscheduler_available_span(value: str) -> None:
     with pytest.raises(ResearchConfigError):
         CronSchedule.from_crontab(value)
 
 
-def test_cron_steps_accept_apscheduler_field_maximum_boundaries() -> None:
-    schedule = CronSchedule.from_crontab("*/59 */23 */31 */12 */6")
+def test_cron_steps_accept_apscheduler_span_boundaries() -> None:
+    schedule = CronSchedule.from_crontab("*/59 */23 */30 */11 */6")
 
     assert schedule.as_kwargs() == {
         "minute": "*/59",
         "hour": "*/23",
-        "day": "*/31",
-        "month": "*/12",
+        "day": "*/30",
+        "month": "*/11",
         "day_of_week": "*/6",
     }
+    assert CronSchedule.from_crontab("1-3/2 7 * * mon").minute == "1-3/2"
 
 
-def test_real_cron_trigger_accepts_maximum_step_boundaries() -> None:
+def test_real_cron_trigger_matches_validated_step_spans() -> None:
     cron_module = pytest.importorskip("apscheduler.triggers.cron")
-    schedule = CronSchedule.from_crontab("*/59 */23 */31 */12 */6")
+    schedule = CronSchedule.from_crontab("*/59 */23 */30 */11 */6")
 
     cron_module.CronTrigger(**schedule.as_kwargs(), timezone=timezone.utc)
+    cron_module.CronTrigger(
+        **CronSchedule.from_crontab("1-3/2 7 * * mon").as_kwargs(),
+        timezone=timezone.utc,
+    )
 
 
 def test_short_flex_account_salt_is_rejected() -> None:

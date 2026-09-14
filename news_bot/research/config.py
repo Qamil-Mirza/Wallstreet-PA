@@ -44,6 +44,7 @@ def _validate_cron_part(
         if len(pieces) > 2:
             raise ResearchConfigError("cron field contains too many steps")
         base = pieces[0]
+        step: int | None = None
         if len(pieces) == 2:
             try:
                 step = int(pieces[1])
@@ -51,9 +52,9 @@ def _validate_cron_part(
                 raise ResearchConfigError("cron step must be an integer") from exc
             if step <= 0:
                 raise ResearchConfigError("cron step must be positive")
-            if step > maximum:
-                raise ResearchConfigError("cron step is too large")
         if base == "*":
+            if step is not None and step > maximum - minimum:
+                raise ResearchConfigError("cron step is too large")
             continue
         endpoints = base.split("-")
         if len(endpoints) > 2 or any(not endpoint for endpoint in endpoints):
@@ -61,6 +62,13 @@ def _validate_cron_part(
         values = tuple(value(endpoint) for endpoint in endpoints)
         if len(values) == 2 and values[0] > values[1]:
             raise ResearchConfigError("cron range is reversed")
+        available_span = (
+            maximum - values[0]
+            if len(values) == 1
+            else values[1] - values[0]
+        )
+        if step is not None and step > available_span:
+            raise ResearchConfigError("cron step is too large")
 
 
 def _validate_cron_fields(parts: tuple[str, ...]) -> None:
