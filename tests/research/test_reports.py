@@ -106,6 +106,14 @@ def publication_privacy_context(**updates: object) -> object:
     return context_type(**values)
 
 
+def test_privacy_context_scales_to_full_portfolio_value_sets() -> None:
+    values = tuple(Decimal(index) + Decimal("0.01") for index in range(10_001))
+
+    context = publication_privacy_context(portfolio_values=values)
+
+    assert context.portfolio_values == values
+
+
 def renderer(output_dir: Path) -> ReportRenderer:
     return ReportRenderer(
         output_dir, privacy_context=publication_privacy_context()
@@ -1119,7 +1127,7 @@ def test_publication_limits_reject_oversize_context_without_echoing_input(
 
 @pytest.mark.parametrize(
     "field",
-    ("sensitive_literals", "account_identifiers", "portfolio_values"),
+    ("sensitive_literals", "account_identifiers"),
 )
 def test_publication_limits_reject_excess_context_items(field: str) -> None:
     limit = getattr(report_models, "MAX_PRIVACY_CONTEXT_ITEMS")
@@ -1133,8 +1141,6 @@ def test_publication_limits_reject_excess_context_items(field: str) -> None:
         values[field] = tuple(f"secret-{index}" for index in range(limit + 1))
     elif field == "account_identifiers":
         values[field] = tuple(f"A{index:05d}" for index in range(limit + 1))
-    else:
-        values[field] = tuple(Decimal(index) for index in range(limit + 1))
     context_type = getattr(report_models, "PublicationPrivacyContext")
     with pytest.raises(ValidationError, match="length|items|tuple"):
         context_type(**values)

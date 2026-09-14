@@ -9,7 +9,7 @@ Optionally generates TTS audio broadcast from summaries.
 import logging
 import sys
 from collections.abc import Callable, Sequence
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 from .article_extractor import ensure_batch_content
@@ -237,7 +237,7 @@ def main(
     research_config_loader: Callable[[], object] | None = None,
     research_entrypoint: Callable[[Sequence[str]], int] | None = None,
     legacy_runner: Callable[[], None] | None = None,
-    today: Callable[[], date] = date.today,
+    today: Callable[[], date] | None = None,
 ) -> int:
     """Select research or the unchanged legacy newsletter pipeline."""
     from .research.config import ResearchConfigError, research_enabled_from_env
@@ -267,9 +267,12 @@ def main(
 
     if research_enabled:
         try:
+            research_date = (
+                datetime.now(timezone.utc).date() if today is None else today()
+            )
             return int(
                 research_entrypoint(
-                    ["daily", "--as-of", today().isoformat()]
+                    ["daily", "--as-of", research_date.isoformat()]
                 )
             )
         except KeyboardInterrupt:

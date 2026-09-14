@@ -179,24 +179,32 @@ venv/bin/python -m news_bot.research.cli regenerate --as-of 2026-08-24 --report-
 ```
 
 Daily, weekly, and ordinary dry-run workflows require all three IBKR Flex
-secret files. Monthly, regenerate, and evidence-only backfill do not require
-Flex credentials. `--synthetic-portfolio` opts a dry run into a deterministic
-zero-value test snapshot, so it also does not require Flex. No workflow requires
-an external-model API key because Ollama remains the zero-key fallback.
+secret files. Monthly, regenerate, both backfill modes, and synthetic dry-run
+do not open Flex or OpenAI secret files, so partial or unreadable unused files
+cannot block those commands. Leaving `OPENAI_API_KEY` and
+`OPENAI_API_KEY_FILE` unset selects the Ollama zero-key fallback. A declared
+secret file is fail-closed when its command actually requires that credential.
+`--synthetic-portfolio` keeps its deterministic identity in workflow state
+rather than inserting it into the live portfolio tables.
 
 `dry-run` never sends email or publishes externally. Backfill is bounded to
 1–1000 documents and produces evidence only unless `--authorize-analysis` is
 explicitly supplied. Monthly requires a stable lowercase `--industry` key.
-`regenerate` requires exactly one existing run or report identifier and renders
-only stored reviewed/published content; it does not refetch, infer, email, or
-trade. None of these commands calls a trade or order endpoint.
+`regenerate` requires exactly one existing run or report identifier. It accepts
+only canonical typed report payloads whose SHA-256 digest and originating
+workflow task are attested, then rebuilds reviewed/published HTML/PDF artifacts
+through the privacy-enforcing renderer. It never writes a stored report body
+verbatim and does not refetch, infer, email, publish, or trade. None of these
+commands calls a trade or order endpoint.
 
 The production composition always creates a durable orchestrator run before
-executing work. Its portfolio stage performs the real read-only Flex sync (or
-the explicitly requested synthetic dry-run snapshot). Repository components
-that do not yet have a cross-stage production adapter are recorded as durable
-deferred tasks; the runtime fails closed instead of claiming that unavailable
-work succeeded.
+executing work. Its portfolio stage performs and verifies the real read-only
+Flex sync. Other stages use an immutable configured adapter map and checkpoint
+their lease before and after each call. A missing required adapter records a
+failed task with the stable `required_stage_unavailable` reason and blocks the
+run. Synthetic dry-run uses deterministic offline adapters end to end, emits a
+reviewed privacy-safe institutional report, and defers external publication
+with an explicit omission instead of faking publication success.
 
 ### Storage, scheduling, and backups
 
@@ -215,8 +223,8 @@ task state survives process restarts.
 Configure APScheduler with five-field UTC cron expressions:
 
 ```dotenv
-RESEARCH_DAILY_SCHEDULE=0 7 * * 1-5
-RESEARCH_WEEKLY_SCHEDULE=0 8 * * 1
+RESEARCH_DAILY_SCHEDULE=0 7 * * mon-fri
+RESEARCH_WEEKLY_SCHEDULE=0 8 * * mon
 RESEARCH_MONTHLY_SCHEDULE=0 9 1 * *
 RESEARCH_MONTHLY_INDUSTRY=robotic-actuators
 ```
@@ -224,7 +232,9 @@ RESEARCH_MONTHLY_INDUSTRY=robotic-actuators
 Scheduled runs derive `--as-of` from timezone-aware UTC and use the configured
 monthly industry key. Each job uses `max_instances=1` and coalescing, while the
 shared renewable lease also prevents scheduled and one-shot processes from
-publishing concurrently during long runs.
+publishing concurrently during long runs. Its default and maximum lifetime is
+30 seconds, it renews while work is active, and successful CLI output is emitted
+only after bounded heartbeat shutdown and confirmed lease release.
 
 Start it with:
 

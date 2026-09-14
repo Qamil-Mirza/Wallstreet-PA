@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import re
+import signal
 import sys
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -13,7 +14,13 @@ from typing import Protocol
 
 from .config import ResearchConfig, ResearchConfigError
 from .orchestrator import WorkflowBusy
-from .scheduler import RUN_LEASE_NAME, RunAlreadyActive, RunLease
+from .scheduler import (
+    DEFAULT_RUN_LEASE_TTL_SECONDS,
+    RUN_LEASE_NAME,
+    RunAlreadyActive,
+    RunLease,
+    RunLeaseLost,
+)
 from .store import ResearchStore
 
 
@@ -48,7 +55,10 @@ class CliServices:
     open_store: Callable[[ResearchConfig], ResearchStore]
     build_workflows: Callable[[ResearchConfig, ResearchStore], WorkflowService]
     validate_credentials: Callable[[str, ResearchConfig, bool], None]
-    lease_ttl_seconds: float = 3600
+    lease_ttl_seconds: float = DEFAULT_RUN_LEASE_TTL_SECONDS
+    load_scoped_config: (
+        Callable[[str, bool, bool], ResearchConfig] | None
+    ) = None
 
 
 class _SafeArgumentParser(argparse.ArgumentParser):
@@ -143,7 +153,7 @@ def _validate_credentials(
 
 def default_services(
     *,
-    config_loader: Callable[[], ResearchConfig] = ResearchConfig.from_env,
+    config_loader: Callable[[], ResearchConfig] | None = None,
     store_factory: Callable[[ResearchConfig], ResearchStore] = _open_store,
     runtime_factories: object | None = None,
 ) -> CliServices:
@@ -156,13 +166,28 @@ def default_services(
     )
     if not isinstance(factories, RuntimeFactories):
         raise TypeError("runtime_factories must be RuntimeFactories")
+    loader = config_loader or ResearchConfig.from_env
     return CliServices(
-        load_config=config_loader,
+        load_config=loader,
         open_store=store_factory,
         build_workflows=lambda config, store: RuntimeWorkflowService(
             config, store, factories
         ),
         validate_credentials=_validate_credentials,
+        load_scoped_config=lambda command, synthetic, authorize: (
+            ResearchConfig.from_env(
+                include_flex=(
+                    command in {"daily", "weekly"}
+                    or (command == "dry-run" and not synthetic)
+                ),
+                include_model_secret=(
+                    command in {"daily", "weekly"}
+                    or (command == "dry-run" and not synthetic)
+                ),
+            )
+            if config_loader is None
+            else loader()
+        ),
     )
 
 
@@ -252,7 +277,14 @@ def main(
     dependencies = services or default_services()
     lease: RunLease | None = None
     try:
-        config = dependencies.load_config()
+        if dependencies.load_scoped_config is None:
+            config = dependencies.load_config()
+        else:
+            config = dependencies.load_scoped_config(
+                arguments.command,
+                bool(getattr(arguments, "synthetic_portfolio", False)),
+                bool(getattr(arguments, "authorize_analysis", False)),
+            )
         store = dependencies.open_store(config)
         requires_portfolio = arguments.command in {"daily", "weekly"} or (
             arguments.command == "dry-run"
@@ -267,13 +299,23 @@ def main(
             ttl_seconds=dependencies.lease_ttl_seconds,
         )
         workflows = dependencies.build_workflows(config, store)
+        bind_run_lease = getattr(workflows, "bind_run_lease", None)
+        if bind_run_lease is not None:
+            if not callable(bind_run_lease):
+                raise TypeError("workflow run-lease binding is invalid")
+            bind_run_lease(lease)
         result = _dispatch(arguments.command, arguments, workflows)
         lease.assert_current()
         status = _status_value(result)
+        if not lease.release():
+            raise RunLeaseLost("research run lease cleanup was not confirmed")
+        lease = None
         _print_summary(arguments.command, result, status)
         if status == "blocked":
             return ExitCode.BLOCKED
-        if status == "failed":
+        if status in {"failed", "running", "deferred"}:
+            return ExitCode.OPERATIONAL_FAILURE
+        if status == "partial" and _count_field(result, "omissions") == 0:
             return ExitCode.OPERATIONAL_FAILURE
         return ExitCode.OK
     except ResearchConfigError:
@@ -287,11 +329,33 @@ def main(
         return ExitCode.OPERATIONAL_FAILURE
     finally:
         if lease is not None:
-            lease.release()
+            try:
+                lease.release()
+            except Exception:
+                # The stable error path above has already failed the operation.
+                # Cleanup exceptions must never escape with private DB details.
+                pass
+
+
+def _process_main() -> int:
+    """Translate SIGTERM into cooperative lease cleanup at the process boundary."""
+    previous = signal.getsignal(signal.SIGTERM)
+
+    def interrupt(_signum: int, _frame: object) -> None:
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, interrupt)
+    try:
+        try:
+            return int(main())
+        except KeyboardInterrupt:
+            return 130
+    finally:
+        signal.signal(signal.SIGTERM, previous)
 
 
 if __name__ == "__main__":  # pragma: no cover - thin process boundary
-    raise SystemExit(main())
+    raise SystemExit(_process_main())
 
 
 __all__ = [

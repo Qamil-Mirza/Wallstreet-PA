@@ -26,6 +26,9 @@ if TYPE_CHECKING:
 
 
 RUN_LEASE_NAME = "research:runner"
+DEFAULT_RUN_LEASE_TTL_SECONDS = 30.0
+MAX_RUN_LEASE_TTL_SECONDS = 30.0
+MAX_RUN_LEASE_JOIN_SECONDS = 1.0
 
 
 class RunAlreadyActive(RuntimeError):
@@ -61,6 +64,10 @@ class RunLease:
     _stop: Event = field(default_factory=Event, init=False, repr=False)
     _lost: Event = field(default_factory=Event, init=False, repr=False)
     _lock: Lock = field(default_factory=Lock, init=False, repr=False)
+    _cancellation_lock: Lock = field(default_factory=Lock, init=False, repr=False)
+    _cancellation_events: set[Event] = field(
+        default_factory=set, init=False, repr=False
+    )
     _thread: Thread | None = field(default=None, init=False, repr=False)
     _ttl_seconds: float = field(default=0, init=False, repr=False)
 
@@ -70,12 +77,14 @@ class RunLease:
         store: ResearchStore,
         name: str = RUN_LEASE_NAME,
         *,
-        ttl_seconds: float = 3600,
+        ttl_seconds: float = DEFAULT_RUN_LEASE_TTL_SECONDS,
     ) -> "RunLease":
         if isinstance(ttl_seconds, bool) or not isinstance(ttl_seconds, (int, float)):
             raise TypeError("ttl_seconds must be numeric")
         if ttl_seconds <= 0:
             raise ValueError("ttl_seconds must be positive")
+        if ttl_seconds > MAX_RUN_LEASE_TTL_SECONDS:
+            raise ValueError("ttl_seconds must be at most 30 seconds")
         orchestrator = ResearchOrchestrator(
             store,
             _LeaseOnlyRunner(),
@@ -109,7 +118,7 @@ class RunLease:
                     except Exception:
                         # Record loss before unlocking so assert_current cannot
                         # race a failed renewal and accept a stale result.
-                        self._lost.set()
+                        self._signal_loss()
                         self._stop.set()
                         return
 
@@ -132,27 +141,63 @@ class RunLease:
                     self._lease,
                     duration=timedelta(seconds=self._ttl_seconds),
                 )
-        except WorkflowConflict as exc:
-            self._lost.set()
-            raise RunLeaseLost("research run lease was lost") from exc
+        except RunLeaseLost:
+            raise
+        except Exception:
+            self._signal_loss()
+            raise RunLeaseLost("research run lease was lost") from None
 
-    def release(self) -> None:
-        """Release only this token; stale/idempotent releases are harmless."""
+    def _signal_loss(self) -> None:
+        self._lost.set()
+        with self._cancellation_lock:
+            for event in tuple(self._cancellation_events):
+                event.set()
+
+    def register_cancellation_event(self, event: object) -> None:
+        if not isinstance(event, Event):
+            raise TypeError("cancellation event must be threading.Event")
+        with self._cancellation_lock:
+            if self._lost.is_set() or self._released:
+                event.set()
+            else:
+                self._cancellation_events.add(event)
+
+    def unregister_cancellation_event(self, event: object) -> None:
+        if isinstance(event, Event):
+            with self._cancellation_lock:
+                self._cancellation_events.discard(event)
+
+    def release(self) -> bool:
+        """Release this token and report whether cleanup remained trustworthy."""
         if self._released:
-            return
+            return not self._lost.is_set()
         self._stop.set()
         if self._thread is not None:
-            self._thread.join()
+            self._thread.join(
+                timeout=min(
+                    MAX_RUN_LEASE_JOIN_SECONDS,
+                    max(0.01, self._ttl_seconds / 3),
+                )
+            )
+            if self._thread.is_alive():
+                self._signal_loss()
+                return False
+        cleanup_confident = not self._lost.is_set()
         try:
             with self._lock:
                 if self._released:
-                    return
-                self._released = True
+                    return cleanup_confident and not self._lost.is_set()
                 self._orchestrator.release_lease(self._lease)
+                self._released = True
         except WorkflowConflict:
             # The lease expired or was fenced by a newer owner.  The token-aware
             # DELETE guarantees this stale handle cannot release that owner.
-            return
+            self._signal_loss()
+            return False
+        except Exception:
+            self._signal_loss()
+            raise RunLeaseLost("research run lease cleanup failed") from None
+        return cleanup_confident
 
     def __enter__(self) -> "RunLease":
         return self
@@ -261,6 +306,8 @@ if __name__ == "__main__":  # pragma: no cover - thin process boundary
 
 
 __all__ = [
+    "DEFAULT_RUN_LEASE_TTL_SECONDS",
+    "MAX_RUN_LEASE_TTL_SECONDS",
     "RUN_LEASE_NAME",
     "RunAlreadyActive",
     "RunLease",

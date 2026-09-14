@@ -22,17 +22,22 @@ def _validate_cron_part(
     *,
     minimum: int,
     maximum: int,
-    names: frozenset[str] = frozenset(),
+    names: tuple[str, ...] = (),
+    allow_numbers: bool = True,
 ) -> None:
-    def value(token: str) -> None:
-        if token.lower() in names:
-            return
+    def value(token: str) -> int:
+        lowered = token.lower()
+        if lowered in names:
+            return minimum + names.index(lowered)
+        if not allow_numbers:
+            raise ResearchConfigError("cron field requires named values")
         try:
             number = int(token)
         except ValueError as exc:
             raise ResearchConfigError("cron field contains an invalid value") from exc
         if not minimum <= number <= maximum:
             raise ResearchConfigError("cron field value is out of range")
+        return number
 
     for item in expression.split(","):
         pieces = item.split("/")
@@ -46,29 +51,37 @@ def _validate_cron_part(
                 raise ResearchConfigError("cron step must be an integer") from exc
             if step <= 0:
                 raise ResearchConfigError("cron step must be positive")
+            if step > maximum - minimum + 1:
+                raise ResearchConfigError("cron step is too large")
         if base == "*":
             continue
         endpoints = base.split("-")
         if len(endpoints) > 2 or any(not endpoint for endpoint in endpoints):
             raise ResearchConfigError("cron range is invalid")
-        for endpoint in endpoints:
-            value(endpoint)
+        values = tuple(value(endpoint) for endpoint in endpoints)
+        if len(values) == 2 and values[0] > values[1]:
+            raise ResearchConfigError("cron range is reversed")
 
 
 def _validate_cron_fields(parts: tuple[str, ...]) -> None:
-    month_names = frozenset(
-        {"jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"}
+    month_names = (
+        "jan", "feb", "mar", "apr", "may", "jun",
+        "jul", "aug", "sep", "oct", "nov", "dec",
     )
-    weekday_names = frozenset({"mon", "tue", "wed", "thu", "fri", "sat", "sun"})
-    for expression, minimum, maximum, names in (
-        (parts[0], 0, 59, frozenset()),
-        (parts[1], 0, 23, frozenset()),
-        (parts[2], 1, 31, frozenset()),
-        (parts[3], 1, 12, month_names),
-        (parts[4], 0, 6, weekday_names),
+    weekday_names = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+    for expression, minimum, maximum, names, allow_numbers in (
+        (parts[0], 0, 59, (), True),
+        (parts[1], 0, 23, (), True),
+        (parts[2], 1, 31, (), True),
+        (parts[3], 1, 12, month_names, True),
+        (parts[4], 0, 6, weekday_names, False),
     ):
         _validate_cron_part(
-            expression, minimum=minimum, maximum=maximum, names=names
+            expression,
+            minimum=minimum,
+            maximum=maximum,
+            names=names,
+            allow_numbers=allow_numbers,
         )
 
 
@@ -81,6 +94,21 @@ class CronSchedule:
     day: str
     month: str
     day_of_week: str
+
+    def __post_init__(self) -> None:
+        parts = (
+            self.minute,
+            self.hour,
+            self.day,
+            self.month,
+            self.day_of_week,
+        )
+        if any(
+            not isinstance(part, str) or _CRON_ATOM.fullmatch(part) is None
+            for part in parts
+        ):
+            raise ResearchConfigError("cron schedule contains an invalid field")
+        _validate_cron_fields(parts)
 
     @classmethod
     def from_crontab(
@@ -186,8 +214,8 @@ class ResearchConfig:
     ollama_model: str
     budget_soft_usd: Decimal
     budget_hard_usd: Decimal
-    daily_schedule: CronSchedule = CronSchedule.from_crontab("0 7 * * 1-5")
-    weekly_schedule: CronSchedule = CronSchedule.from_crontab("0 8 * * 1")
+    daily_schedule: CronSchedule = CronSchedule.from_crontab("0 7 * * mon-fri")
+    weekly_schedule: CronSchedule = CronSchedule.from_crontab("0 8 * * mon")
     monthly_schedule: CronSchedule = CronSchedule.from_crontab("0 9 1 * *")
     monthly_industry: str | None = None
     ibkr_flex_token: str | None = field(default=None, repr=False)
@@ -214,9 +242,20 @@ class ResearchConfig:
         return self.data_dir / "backups"
 
     @classmethod
-    def from_env(cls) -> "ResearchConfig":
+    def from_env(
+        cls,
+        *,
+        include_flex: bool = True,
+        include_model_secret: bool = True,
+    ) -> "ResearchConfig":
         """Build configuration from the process environment without loading `.env`."""
-        openai_key = _read_secret("OPENAI_API_KEY")
+        if not isinstance(include_flex, bool) or not isinstance(
+            include_model_secret, bool
+        ):
+            raise TypeError("configuration scope flags must be bool")
+        openai_key = (
+            _read_secret("OPENAI_API_KEY") if include_model_secret else None
+        )
         return cls(
             enabled=_get_bool("RESEARCH_ENABLED", False),
             data_dir=Path(_get_text("RESEARCH_DATA_DIR", "research_data")),
@@ -231,11 +270,11 @@ class ResearchConfig:
             budget_soft_usd=_get_decimal("MODEL_BUDGET_SOFT_USD", "4.00"),
             budget_hard_usd=_get_decimal("MODEL_BUDGET_HARD_USD", "5.00"),
             daily_schedule=CronSchedule.from_crontab(
-                _get_text("RESEARCH_DAILY_SCHEDULE", "0 7 * * 1-5"),
+                _get_text("RESEARCH_DAILY_SCHEDULE", "0 7 * * mon-fri"),
                 setting="RESEARCH_DAILY_SCHEDULE",
             ),
             weekly_schedule=CronSchedule.from_crontab(
-                _get_text("RESEARCH_WEEKLY_SCHEDULE", "0 8 * * 1"),
+                _get_text("RESEARCH_WEEKLY_SCHEDULE", "0 8 * * mon"),
                 setting="RESEARCH_WEEKLY_SCHEDULE",
             ),
             monthly_schedule=CronSchedule.from_crontab(
@@ -243,9 +282,15 @@ class ResearchConfig:
                 setting="RESEARCH_MONTHLY_SCHEDULE",
             ),
             monthly_industry=_get_optional_text("RESEARCH_MONTHLY_INDUSTRY"),
-            ibkr_flex_token=_read_secret("IBKR_FLEX_TOKEN"),
-            ibkr_flex_query_id=_read_secret("IBKR_FLEX_QUERY_ID"),
-            ibkr_flex_account_salt=_read_secret("IBKR_FLEX_ACCOUNT_SALT"),
+            ibkr_flex_token=(
+                _read_secret("IBKR_FLEX_TOKEN") if include_flex else None
+            ),
+            ibkr_flex_query_id=(
+                _read_secret("IBKR_FLEX_QUERY_ID") if include_flex else None
+            ),
+            ibkr_flex_account_salt=(
+                _read_secret("IBKR_FLEX_ACCOUNT_SALT") if include_flex else None
+            ),
         )
 
     def validate(self) -> None:

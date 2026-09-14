@@ -98,6 +98,48 @@ def test_out_of_range_scheduler_cron_is_rejected(monkeypatch):
         ResearchConfig.from_env()
 
 
+@pytest.mark.parametrize(
+    "schedule",
+    [
+        lambda: CronSchedule("bad", "7", "*", "*", "mon"),
+        lambda: CronSchedule.from_crontab("0 7 * * fri-mon"),
+        lambda: CronSchedule.from_crontab("*/99 7 * * mon"),
+        lambda: CronSchedule.from_crontab("0 7 * * 1-5"),
+    ],
+)
+def test_cron_schedule_rejects_direct_bypass_and_ambiguous_ranges(schedule) -> None:
+    with pytest.raises(ResearchConfigError):
+        schedule()
+
+
+def test_default_weekday_crons_use_apscheduler_names() -> None:
+    config = ResearchConfig.from_env()
+
+    assert config.daily_schedule.day_of_week == "mon-fri"
+    assert config.weekly_schedule.day_of_week == "mon"
+
+
+def test_default_weekday_crons_have_deterministic_next_fire_times() -> None:
+    cron_module = pytest.importorskip("apscheduler.triggers.cron")
+    trigger_type = cron_module.CronTrigger
+    config = ResearchConfig.from_env()
+    friday_after_daily = datetime(2026, 8, 21, 8, tzinfo=timezone.utc)
+
+    daily = trigger_type(
+        **config.daily_schedule.as_kwargs(), timezone=timezone.utc
+    )
+    weekly = trigger_type(
+        **config.weekly_schedule.as_kwargs(), timezone=timezone.utc
+    )
+
+    assert daily.get_next_fire_time(None, friday_after_daily) == datetime(
+        2026, 8, 24, 7, tzinfo=timezone.utc
+    )
+    assert weekly.get_next_fire_time(None, friday_after_daily) == datetime(
+        2026, 8, 24, 8, tzinfo=timezone.utc
+    )
+
+
 def test_short_flex_account_salt_is_rejected() -> None:
     with pytest.raises(ResearchConfigError, match="at least 16 UTF-8 bytes"):
         replace(

@@ -336,9 +336,7 @@ class PublicationPrivacyContext(DisplayModel):
     account_identifiers: tuple[str, ...] = Field(
         max_length=MAX_PRIVACY_CONTEXT_ITEMS
     )
-    portfolio_values: tuple[Decimal, ...] = Field(
-        max_length=MAX_PRIVACY_CONTEXT_ITEMS
-    )
+    portfolio_values: tuple[Decimal, ...]
 
     _literals = field_validator("sensitive_literals")(
         lambda values: tuple(
@@ -389,7 +387,7 @@ class PublicationPrivacyContext(DisplayModel):
             for variant in _privacy_decoded_variants(literal)
         )
         account_keys = tuple(_account_key(value) for value in self.account_identifiers)
-        portfolio_values = tuple(abs(value) for value in self.portfolio_values)
+        portfolio_values = frozenset(abs(value) for value in self.portfolio_values)
         nodes = 0
         total_text_chars = 0
 

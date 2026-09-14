@@ -51,6 +51,7 @@ _INTERNAL_REASON_CODES = {
     "publication_dry_run",
     "publication_outcome_unknown",
     "publication_quality_blocked",
+    "required_stage_unavailable",
     "review_block",
     "review_not_passed",
     "review_requires_revision",
