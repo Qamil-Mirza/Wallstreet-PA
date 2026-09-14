@@ -59,6 +59,10 @@ def _validate_cron_part(
         endpoints = base.split("-")
         if len(endpoints) > 2 or any(not endpoint for endpoint in endpoints):
             raise ResearchConfigError("cron range is invalid")
+        if step is not None and any(
+            endpoint.lower() in names for endpoint in endpoints
+        ):
+            raise ResearchConfigError("named cron fields do not support steps")
         values = tuple(value(endpoint) for endpoint in endpoints)
         if len(values) == 2 and values[0] > values[1]:
             raise ResearchConfigError("cron range is reversed")

@@ -156,6 +156,18 @@ def test_cron_steps_cannot_exceed_apscheduler_available_span(value: str) -> None
         CronSchedule.from_crontab(value)
 
 
+@pytest.mark.parametrize(
+    "value",
+    (
+        "0 7 * jan-mar/2 mon",
+        "0 7 * * mon-fri/2",
+    ),
+)
+def test_named_cron_ranges_reject_ambiguous_steps(value: str) -> None:
+    with pytest.raises(ResearchConfigError):
+        CronSchedule.from_crontab(value)
+
+
 def test_cron_steps_accept_apscheduler_span_boundaries() -> None:
     schedule = CronSchedule.from_crontab("*/59 */23 */30 */11 */6")
 
@@ -178,6 +190,19 @@ def test_real_cron_trigger_matches_validated_step_spans() -> None:
         **CronSchedule.from_crontab("1-3/2 7 * * mon").as_kwargs(),
         timezone=timezone.utc,
     )
+
+
+def test_real_cron_trigger_preserves_step_free_named_ranges() -> None:
+    cron_module = pytest.importorskip("apscheduler.triggers.cron")
+    schedule = CronSchedule.from_crontab("0 7 * jan-mar mon-fri")
+
+    trigger = cron_module.CronTrigger(
+        **schedule.as_kwargs(), timezone=timezone.utc
+    )
+    fields = {field.name: str(field) for field in trigger.fields}
+
+    assert fields["month"] == "jan-mar"
+    assert fields["day_of_week"] == "mon-fri"
 
 
 def test_short_flex_account_salt_is_rejected() -> None:
