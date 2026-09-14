@@ -878,8 +878,11 @@ class RuntimeWorkflowService:
             raise WorkflowConflict("stored report payload is unsafe")
         with self.store.connect() as connection:
             task = connection.execute(
-                "SELECT stage, outcome_json FROM workflow_tasks "
-                "WHERE workflow_id = ? AND task_id = ? AND state = 'completed'",
+                "SELECT task.stage, task.outcome_json, run.as_of "
+                "FROM workflow_tasks AS task JOIN workflow_runs AS run "
+                "ON run.workflow_id = task.workflow_id "
+                "WHERE task.workflow_id = ? AND task.task_id = ? "
+                "AND task.state = 'completed'",
                 (workflow_id, provenance.task_id),
             ).fetchone()
         if task is None or task[1] is None:
@@ -890,6 +893,7 @@ class RuntimeWorkflowService:
             raise WorkflowConflict("stored report provenance is invalid") from None
         if (
             task[0] != _REPORT_ORIGIN_STAGES[provenance.report_type]
+            or _parse_utc(task[2]) != report.metadata.as_of
             or outcome.report_id != report_id
             or outcome.result_ref != report_id
             or outcome.result_hash != provenance.payload_sha256

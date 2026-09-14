@@ -4,8 +4,12 @@ from __future__ import annotations
 
 import os
 import re
+import sys
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
+from threading import Lock
+from typing import Iterator
 from urllib.parse import unquote, urlsplit
 
 from jinja2 import PackageLoader, StrictUndefined, select_autoescape
@@ -24,6 +28,22 @@ from .models import (
 
 
 _FILENAME_CHARACTER = re.compile(r"[^A-Za-z0-9_.-]+")
+_PDF_DIAGNOSTIC_LOCK = Lock()
+
+
+@contextmanager
+def _captured_pdf_diagnostics() -> Iterator[None]:
+    """Keep backend/native diagnostics off the process stderr boundary."""
+    with _PDF_DIAGNOSTIC_LOCK, tempfile.TemporaryFile(mode="w+b") as sink:
+        saved_stderr = os.dup(2)
+        try:
+            sys.stderr.flush()
+            os.dup2(sink.fileno(), 2)
+            yield
+        finally:
+            sys.stderr.flush()
+            os.dup2(saved_stderr, 2)
+            os.close(saved_stderr)
 
 
 class ReportRenderer:
@@ -116,7 +136,8 @@ class ReportRenderer:
 
         pdf_error = None
         try:
-            self._atomic_pdf(pdf_path, html)
+            with _captured_pdf_diagnostics():
+                self._atomic_pdf(pdf_path, html)
         except Exception as exc:  # HTML is independently useful.
             pdf_error = (
                 "pdf_backend_unavailable"

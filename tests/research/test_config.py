@@ -140,6 +140,34 @@ def test_default_weekday_crons_have_deterministic_next_fire_times() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    "value",
+    ("*/60 7 * * mon", "0 7 * * */7"),
+)
+def test_cron_steps_cannot_exceed_apscheduler_field_maximum(value: str) -> None:
+    with pytest.raises(ResearchConfigError):
+        CronSchedule.from_crontab(value)
+
+
+def test_cron_steps_accept_apscheduler_field_maximum_boundaries() -> None:
+    schedule = CronSchedule.from_crontab("*/59 */23 */31 */12 */6")
+
+    assert schedule.as_kwargs() == {
+        "minute": "*/59",
+        "hour": "*/23",
+        "day": "*/31",
+        "month": "*/12",
+        "day_of_week": "*/6",
+    }
+
+
+def test_real_cron_trigger_accepts_maximum_step_boundaries() -> None:
+    cron_module = pytest.importorskip("apscheduler.triggers.cron")
+    schedule = CronSchedule.from_crontab("*/59 */23 */31 */12 */6")
+
+    cron_module.CronTrigger(**schedule.as_kwargs(), timezone=timezone.utc)
+
+
 def test_short_flex_account_salt_is_rejected() -> None:
     with pytest.raises(ResearchConfigError, match="at least 16 UTF-8 bytes"):
         replace(

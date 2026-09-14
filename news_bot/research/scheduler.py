@@ -271,17 +271,20 @@ def build_scheduler(
         ),
     )
     for command, cadence, extra_arguments in cadences:
-        scheduler.add_job(
-            _scheduled_job,
-            trigger="cron",
-            **cadence.as_kwargs(),
-            timezone=timezone.utc,
-            id=f"research-{command}",
-            args=(command, services, clock, extra_arguments),
-            max_instances=1,
-            coalesce=True,
-            replace_existing=True,
-        )
+        try:
+            scheduler.add_job(
+                _scheduled_job,
+                trigger="cron",
+                **cadence.as_kwargs(),
+                timezone=timezone.utc,
+                id=f"research-{command}",
+                args=(command, services, clock, extra_arguments),
+                max_instances=1,
+                coalesce=True,
+                replace_existing=True,
+            )
+        except ValueError:
+            raise RuntimeError("scheduler registration failed") from None
     return scheduler
 
 

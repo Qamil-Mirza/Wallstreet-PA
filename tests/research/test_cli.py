@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
-from dataclasses import dataclass, replace
+from dataclasses import replace
 import time
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -38,9 +39,13 @@ from news_bot.research.orchestrator import (
     ResearchOrchestrator,
     StageOutcome,
     WorkflowBusy,
+    WorkflowKind,
+    WorkflowRunResult,
+    WorkflowRunState,
 )
 from news_bot.research.quality import PublicationVerdict, QualityGateResult
-from news_bot.research.runtime import RuntimeFactories
+from news_bot.research.reports import ReportRenderer
+from news_bot.research.runtime import RuntimeFactories, RuntimeStageRunner
 from news_bot.research.scheduler import (
     RunAlreadyActive,
     RunLease,
@@ -51,11 +56,27 @@ from news_bot.research.scheduler import (
 from news_bot.research.store import ResearchStore
 
 
-@dataclass
-class FakeResult:
-    status: str = "completed"
-    report_ids: tuple[str, ...] = ("report-private-123",)
-    omissions: tuple[str, ...] = ()
+def FakeResult(
+    *,
+    status: str = "completed",
+    report_ids: tuple[str, ...] = ("report-private-123",),
+    omissions: tuple[str, ...] = (),
+) -> WorkflowRunResult:
+    valid_statuses = {state.value: state for state in WorkflowRunState}
+    result = WorkflowRunResult(
+        workflow_id="wf-cli-result",
+        workflow_kind=WorkflowKind.DAILY,
+        status=valid_statuses.get(status, WorkflowRunState.COMPLETED),
+        completed_stages=(),
+        report_ids=report_ids,
+        new_agent_runs=0,
+        pending_tasks=(),
+        omissions=omissions,
+        dry_run=False,
+    )
+    if status not in valid_statuses:
+        return result.model_copy(update={"status": status})
+    return result
 
 
 class RecordingWorkflows:
@@ -344,8 +365,9 @@ def test_summary_prints_counts_not_private_identifiers_or_values(
     tmp_path: Path, capsys
 ) -> None:
     result = FakeResult(
+        status="partial",
         report_ids=("report-private-123", "account-DU123456-NAV-9999"),
-        omissions=("portfolio_value_9999",),
+        omissions=("missing_claim_lineage",),
     )
     services, _, _ = fake_services(
         tmp_path, workflows=RecordingWorkflows(result)
@@ -406,6 +428,42 @@ def test_exit_status_matrix_is_fail_closed(
     )
 
     assert main(["weekly", "--as-of", "2026-08-24"], services=services) == expected
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        SimpleNamespace(status="partial", report_ids=(), omissions=[None]),
+        WorkflowRunResult(
+            workflow_id="wf-malformed-partial",
+            workflow_kind=WorkflowKind.DAILY,
+            status=WorkflowRunState.PARTIAL,
+            completed_stages=(),
+            report_ids=(),
+            new_agent_runs=0,
+            pending_tasks=(),
+            omissions=("dry_run",),
+            dry_run=True,
+        ).model_copy(update={"omissions": [None]}),
+        FakeResult(status="partial", omissions=()),
+        FakeResult(status="completed", omissions=("dry_run",)),
+    ],
+)
+def test_cli_rejects_malformed_partial_before_printing_summary(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    result: object,
+) -> None:
+    services, _, _ = fake_services(
+        tmp_path, workflows=RecordingWorkflows(result)
+    )
+
+    assert main(
+        ["dry-run", "--as-of", "2026-08-24"], services=services
+    ) == ExitCode.OPERATIONAL_FAILURE
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "research error: operational failure\n"
 
 
 def test_unrelated_commands_do_not_read_unused_secret_files(
@@ -1070,6 +1128,39 @@ def test_default_synthetic_dry_run_completes_offline_with_safe_report(
     assert "NAV: USD" not in html
 
 
+def test_synthetic_cli_suppresses_pdf_backend_diagnostics(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    config = research_config(tmp_path)
+
+    def noisy_pdf(
+        _renderer: ReportRenderer, destination: Path, _html: str
+    ) -> None:
+        os.write(2, b"private PDF diagnostic NAV=9999 DU123456\n")
+        destination.write_bytes(b"%PDF-test")
+
+    monkeypatch.setattr(ReportRenderer, "_atomic_pdf", noisy_pdf)
+    services = default_services(
+        config_loader=lambda: config,
+        runtime_factories=RuntimeFactories(
+            flex_client_factory=lambda _config: pytest.fail("Flex was called"),
+            owner_id_factory=lambda: "quiet-pdf-owner",
+        ),
+    )
+
+    assert main(
+        ["dry-run", "--as-of", "2026-08-24", "--synthetic-portfolio"],
+        services=services,
+    ) == ExitCode.OK
+    captured = capfd.readouterr()
+    assert captured.out == (
+        "research command=dry-run status=partial reports=1 omissions=1\n"
+    )
+    assert captured.err == ""
+
+
 def test_regenerate_replays_existing_run_without_workflow_or_source_calls(
     tmp_path: Path,
 ) -> None:
@@ -1259,14 +1350,29 @@ def test_regenerate_rejects_corrupt_existing_pdf_artifact(
         "forged_provenance",
         "active_script",
         "private_portfolio_values",
+        "wrong_as_of",
         "unreviewed",
     ],
 )
 def test_regenerate_rejects_untrusted_or_unsafe_stored_report_without_artifacts(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     mutation: str,
 ) -> None:
     config = research_config(tmp_path)
+    if mutation == "wrong_as_of":
+        original_report = RuntimeStageRunner._synthetic_event_report
+
+        def mismatched_report(self, context):
+            report = original_report(self, context)
+            metadata = report.metadata.model_copy(
+                update={"as_of": datetime(2026, 8, 25, tzinfo=timezone.utc)}
+            )
+            return report.model_copy(update={"metadata": metadata})
+
+        monkeypatch.setattr(
+            RuntimeStageRunner, "_synthetic_event_report", mismatched_report
+        )
     workflow_id, report_id, body, metadata = _seed_trusted_synthetic_report(config)
     store = ResearchStore(config.database_path)
     if mutation == "malformed_json":
@@ -1546,6 +1652,21 @@ class RecordingScheduler:
 
     def add_job(self, function, **kwargs: object) -> None:
         self.jobs.append((function, kwargs))
+
+
+def test_scheduler_registration_value_error_is_stable(tmp_path: Path) -> None:
+    class RejectingScheduler:
+        def add_job(self, _function, **_kwargs: object) -> None:
+            raise ValueError("private scheduler diagnostic")
+
+    with pytest.raises(RuntimeError) as exc_info:
+        build_scheduler(
+            research_config(tmp_path),
+            scheduler_factory=RejectingScheduler,
+        )
+
+    assert str(exc_info.value) == "scheduler registration failed"
+    assert exc_info.value.__cause__ is None
 
 
 def test_scheduler_registers_typed_cadences_and_nonoverlap_options(

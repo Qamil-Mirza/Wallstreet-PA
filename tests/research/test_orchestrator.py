@@ -1476,6 +1476,65 @@ def test_heartbeat_failure_is_surfaced_without_false_completion(
     )
 
 
+def test_blocked_heartbeat_cleanup_is_bounded_and_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ResearchStore(tmp_path / "research.db")
+    store.migrate()
+    renew_entered = Event()
+    release_renewal = Event()
+    invocation_done = Event()
+    errors: list[BaseException] = []
+
+    class WaitForHeartbeatRunner(RecordingRunner):
+        def run(
+            self, context: StageContext, control: StageExecutionControl
+        ) -> StageOutcome:
+            if context.stage == "portfolio":
+                assert renew_entered.wait(timeout=2)
+            return super().run(context, control)
+
+    orchestrator = ResearchOrchestrator(
+        store,
+        WaitForHeartbeatRunner(),
+        owner_id="blocked-heartbeat-owner",
+        lease_duration=timedelta(milliseconds=30),
+    )
+
+    def blocked_renewal(*_args: object, **_kwargs: object) -> None:
+        renew_entered.set()
+        release_renewal.wait(timeout=5)
+
+    monkeypatch.setattr(orchestrator, "_renew_active_execution", blocked_renewal)
+
+    def invoke() -> None:
+        try:
+            orchestrator.run_weekly(as_of=utc(), source_hashes=("a" * 64,))
+        except BaseException as error:
+            errors.append(error)
+        finally:
+            invocation_done.set()
+
+    from threading import Thread
+
+    invocation = Thread(target=invoke, daemon=True)
+    invocation.start()
+    try:
+        assert renew_entered.wait(timeout=2)
+        completed_before_unblock = invocation_done.wait(timeout=0.5)
+    finally:
+        release_renewal.set()
+        invocation.join(timeout=2)
+
+    assert completed_before_unblock is True
+    assert len(errors) == 1
+    assert isinstance(errors[0], StageLeaseLost)
+    with store.connect() as connection:
+        assert connection.execute(
+            "SELECT state FROM workflow_runs"
+        ).fetchone() != ("completed",)
+
+
 def test_cooperative_runner_is_fenced_before_another_owner_reclaims(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -41,6 +41,7 @@ _DEFAULT_LEASE = timedelta(minutes=15)
 _PUBLICATION_LEASE_NAME = "publish:research"
 _MAX_HEARTBEAT_INTERVAL_SECONDS = 30.0
 _MIN_HEARTBEAT_INTERVAL_SECONDS = 0.01
+_MAX_HEARTBEAT_JOIN_SECONDS = 1.0
 _MAX_BACKFILL_DOCUMENTS = 1000
 _INTERNAL_REASON_CODES = {
     "budget_deferred",
@@ -831,7 +832,17 @@ class ResearchOrchestrator:
             runner_error = error
         finally:
             stop.set()
-            thread.join()
+            thread.join(
+                timeout=min(
+                    _MAX_HEARTBEAT_JOIN_SECONDS,
+                    max(_MIN_HEARTBEAT_INTERVAL_SECONDS, interval),
+                )
+            )
+            if thread.is_alive():
+                control._signal_lease_lost()
+                failures.append(
+                    StageLeaseLost("stage execution heartbeat did not stop")
+                )
         if failures:
             raise StageLeaseLost("stage execution lease heartbeat failed") from failures[0]
         if runner_error is not None:

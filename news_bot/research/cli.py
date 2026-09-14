@@ -13,7 +13,7 @@ from enum import IntEnum
 from typing import Protocol
 
 from .config import ResearchConfig, ResearchConfigError
-from .orchestrator import WorkflowBusy
+from .orchestrator import WorkflowBusy, WorkflowRunResult
 from .scheduler import (
     DEFAULT_RUN_LEASE_TTL_SECONDS,
     RUN_LEASE_NAME,
@@ -241,6 +241,15 @@ def _status_value(result: object) -> str:
     return value
 
 
+def _validated_result(result: object) -> WorkflowRunResult:
+    if not isinstance(result, WorkflowRunResult):
+        raise RuntimeError("workflow returned an invalid result")
+    try:
+        return WorkflowRunResult.model_validate(result, strict=True)
+    except Exception:
+        raise RuntimeError("workflow returned an invalid result") from None
+
+
 def _count_field(result: object, name: str) -> int:
     value = getattr(result, name, ())
     if isinstance(value, (str, bytes)):
@@ -258,6 +267,20 @@ def _print_summary(command: str, result: object, status: str) -> None:
         f"reports={_count_field(result, 'report_ids')} "
         f"omissions={_count_field(result, 'omissions')}"
     )
+
+
+def _result_exit_code(result: WorkflowRunResult, status: str) -> ExitCode:
+    if status == "completed":
+        if result.omissions:
+            raise RuntimeError("completed workflow returned omissions")
+        return ExitCode.OK
+    if status == "partial":
+        if not result.omissions:
+            raise RuntimeError("partial workflow returned no omissions")
+        return ExitCode.OK
+    if status == "blocked":
+        return ExitCode.BLOCKED
+    return ExitCode.OPERATIONAL_FAILURE
 
 
 def main(
@@ -304,20 +327,17 @@ def main(
             if not callable(bind_run_lease):
                 raise TypeError("workflow run-lease binding is invalid")
             bind_run_lease(lease)
-        result = _dispatch(arguments.command, arguments, workflows)
+        result = _validated_result(
+            _dispatch(arguments.command, arguments, workflows)
+        )
         lease.assert_current()
         status = _status_value(result)
+        exit_code = _result_exit_code(result, status)
         if not lease.release():
             raise RunLeaseLost("research run lease cleanup was not confirmed")
         lease = None
         _print_summary(arguments.command, result, status)
-        if status == "blocked":
-            return ExitCode.BLOCKED
-        if status in {"failed", "running", "deferred"}:
-            return ExitCode.OPERATIONAL_FAILURE
-        if status == "partial" and _count_field(result, "omissions") == 0:
-            return ExitCode.OPERATIONAL_FAILURE
-        return ExitCode.OK
+        return exit_code
     except ResearchConfigError:
         print("research error: invalid configuration", file=sys.stderr)
         return ExitCode.INVALID_CONFIG

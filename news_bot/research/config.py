@@ -51,7 +51,7 @@ def _validate_cron_part(
                 raise ResearchConfigError("cron step must be an integer") from exc
             if step <= 0:
                 raise ResearchConfigError("cron step must be positive")
-            if step > maximum - minimum + 1:
+            if step > maximum:
                 raise ResearchConfigError("cron step is too large")
         if base == "*":
             continue
