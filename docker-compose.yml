@@ -1,87 +1,150 @@
-# =============================================================================
-# Newsletter Bot - Docker Compose Configuration
-# =============================================================================
-# Usage:
-#   docker compose up -d          # Start all services
-#   docker compose run bot        # Run newsletter once
-#   docker compose logs -f        # View logs
-#   docker compose down           # Stop all services
-#
-# First-time setup:
-#   1. Copy env.example to .env and configure
-#   2. docker compose up -d ollama
-#   3. docker compose exec ollama ollama pull llama3
-#   4. docker compose run bot
+name: portfolio-research
+
+x-research-runtime: &research-runtime
+  build:
+    context: .
+    target: production
+  user: "10001:10001"
+  env_file:
+    - path: .env
+      required: false
+  environment:
+    RESEARCH_ENABLED: "true"
+    RESEARCH_DATA_DIR: /app/data
+    OLLAMA_BASE_URL: http://ollama:11434
+  volumes:
+    - research-data:/app/data
+    - research-reports:/app/data/reports
+    - research-cache:/app/data/cache
+    - research-cache:/app/data/source_cache
+    - research-backups:/app/data/backups
+    - research-backups:/app/backups
+    - research-logs:/app/logs
+    - research-audio:/app/audio_output
+    - ./secrets:/run/secrets:ro
+  networks:
+    - research-net
+  init: true
 
 services:
-  # ===========================================================================
-  # Newsletter Bot
-  # ===========================================================================
-  bot:
-    build:
-      context: .
-      target: production
-    container_name: newsletter-bot
-    env_file:
-      - .env
-    environment:
-      # Override Ollama URL to use Docker networking
-      - OLLAMA_BASE_URL=http://ollama:11434
-    volumes:
-      # Persist generated audio files
-      - ./audio_output:/app/audio_output
-      # Persist logs
-      - ./logs:/app/logs
+  research-bot:
+    <<: *research-runtime
+    command: ["python", "-m", "news_bot.research.scheduler"]
+    restart: unless-stopped
     depends_on:
-      - ollama
-    # Run once and exit (for cron-based scheduling)
-    restart: "no"
-    networks:
-      - newsletter-net
+      ollama:
+        condition: service_healthy
+      ollama-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          from news_bot.research.config import ResearchConfig;
+          from news_bot.research.store import ResearchStore;
+          c=ResearchConfig.from_env(include_flex=False, include_model_secret=False);
+          s=ResearchStore(c.database_path); s.migrate();
+          db=s.connect(); ok=db.execute('PRAGMA quick_check').fetchone()[0]; db.close();
+          raise SystemExit(0 if ok == 'ok' else 1)
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
 
-  # ===========================================================================
-  # Ollama LLM Server
-  # ===========================================================================
+  research-runner:
+    <<: *research-runtime
+    profiles: ["runner"]
+    entrypoint: ["python", "-m", "news_bot.research.cli"]
+    command: ["--help"]
+    restart: "no"
+    depends_on:
+      ollama:
+        condition: service_healthy
+      ollama-init:
+        condition: service_completed_successfully
+
   ollama:
     image: ollama/ollama:latest
-    container_name: newsletter-ollama
+    environment:
+      OLLAMA_HOST: 0.0.0.0:11434
     ports:
-      - "11434:11434"
+      - "127.0.0.1:11434:11434"
     volumes:
-      # Persist downloaded models
       - ollama-models:/root/.ollama
     restart: unless-stopped
     networks:
-      - newsletter-net
-    # Uncomment for GPU support (NVIDIA):
-    # deploy:
-    #   resources:
-    #     reservations:
-    #       devices:
-    #         - driver: nvidia
-    #           count: 1
-    #           capabilities: [gpu]
+      - research-net
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
 
-  # ===========================================================================
-  # Test Runner (development)
-  # ===========================================================================
+  ollama-init:
+    image: ollama/ollama:latest
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+      OLLAMA_RESEARCH_MODEL: ${OLLAMA_RESEARCH_MODEL:-llama3.1:8b}
+      OLLAMA_HEALTH_TIMEOUT_SECONDS: ${OLLAMA_HEALTH_TIMEOUT_SECONDS:-60}
+    entrypoint: ["/bin/sh", "/scripts/ollama-init.sh"]
+    volumes:
+      - ./scripts/ollama-init.sh:/scripts/ollama-init.sh:ro
+      - ollama-models:/root/.ollama
+    depends_on:
+      ollama:
+        condition: service_healthy
+    restart: "no"
+    networks:
+      - research-net
+
   test:
     build:
       context: .
       target: development
-    container_name: newsletter-test
-    command: python -m pytest tests/ -v
-    volumes:
-      - .:/app
-    profiles:
-      - test
+    user: "10001:10001"
+    profiles: ["test"]
+    environment:
+      RESEARCH_ENABLED: "false"
+    command: ["python", "-m", "pytest", "-q"]
     networks:
-      - newsletter-net
+      - research-net
+
+  # The original newsletter remains available explicitly without joining the
+  # default long-running research topology.
+  bot:
+    build:
+      context: .
+      target: production
+    user: "10001:10001"
+    profiles: ["newsletter"]
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      OLLAMA_BASE_URL: http://ollama:11434
+    command: ["python", "-m", "news_bot.main"]
+    volumes:
+      - research-logs:/app/logs
+      - research-audio:/app/audio_output
+    depends_on:
+      ollama:
+        condition: service_healthy
+    restart: "no"
+    networks:
+      - research-net
 
 networks:
-  newsletter-net:
+  research-net:
     driver: bridge
 
 volumes:
+  research-data:
+  research-reports:
+  research-backups:
+  research-cache:
+  research-logs:
+  research-audio:
   ollama-models:
-    driver: local

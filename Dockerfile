@@ -1,73 +1,79 @@
-# =============================================================================
-# Newsletter Bot with Coqui TTS
-# =============================================================================
-# Multi-stage build for optimal image size
-# Requires Python 3.11 for Coqui TTS compatibility
+# syntax=docker/dockerfile:1
 
-FROM python:3.11-slim as base
+FROM python:3.11-slim AS base
 
-# Prevent Python from buffering stdout/stderr
-ENV PYTHONUNBUFFERED=1
-ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
 
-# Install system dependencies
+# Newsletter audio dependencies plus the native libraries required by
+# WeasyPrint's Cairo/Pango rendering path.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ffmpeg \
-    libsndfile1 \
     espeak-ng \
+    ffmpeg \
+    fonts-dejavu-core \
     git \
+    libcairo2 \
+    libffi-dev \
+    libgdk-pixbuf-2.0-0 \
+    libpango-1.0-0 \
+    libpangocairo-1.0-0 \
+    libpangoft2-1.0-0 \
+    libsndfile1 \
+    shared-mime-info \
     && rm -rf /var/lib/apt/lists/*
 
-# Set work directory
+RUN groupadd --gid 10001 appuser \
+    && useradd --uid 10001 --gid 10001 --create-home --shell /bin/bash appuser
+
 WORKDIR /app
 
-# =============================================================================
-# Dependencies stage
-# =============================================================================
-FROM base as dependencies
+FROM base AS dependencies
 
-# Install Python dependencies
-COPY requirements.txt .
-
-# Install PyTorch CPU-only for smaller image (remove --index-url for GPU)
+COPY requirements.txt ./
 RUN pip install --no-cache-dir \
     torch==2.5.1 \
     torchaudio==2.5.1 \
-    --index-url https://download.pytorch.org/whl/cpu
+    --index-url https://download.pytorch.org/whl/cpu \
+    && pip install --no-cache-dir -r requirements.txt
 
-# Install remaining dependencies
-RUN pip install --no-cache-dir -r requirements.txt
+FROM dependencies AS production
 
-# =============================================================================
-# Production stage
-# =============================================================================
-FROM dependencies as production
+COPY --chown=appuser:appuser news_bot/ ./news_bot/
+COPY --chown=appuser:appuser scripts/ ./scripts/
+COPY --chown=appuser:appuser pyproject.toml ./
 
-# Copy application code
-COPY news_bot/ ./news_bot/
-COPY pyproject.toml .
-
-# Create directories for outputs and logs
-RUN mkdir -p /app/audio_output /app/logs
-
-# Create non-root user for security
-RUN useradd --create-home --shell /bin/bash appuser \
+# Keep both the explicit operational mount points and the paths derived from
+# RESEARCH_DATA_DIR available to the fixed unprivileged runtime identity.
+RUN mkdir -p \
+    /app/data/cache \
+    /app/data/source_cache \
+    /app/data/reports \
+    /app/data/backups \
+    /app/reports \
+    /app/cache \
+    /app/backups \
+    /app/logs \
+    /app/audio_output \
     && chown -R appuser:appuser /app
+
 USER appuser
+CMD ["python", "-m", "news_bot.research.scheduler"]
 
-# Default command
-CMD ["python", "-m", "news_bot.main"]
+FROM dependencies AS development
 
-# =============================================================================
-# Development stage (includes tests)
-# =============================================================================
-FROM dependencies as development
+COPY --chown=appuser:appuser . .
+RUN mkdir -p \
+    /app/data/cache \
+    /app/data/source_cache \
+    /app/data/reports \
+    /app/data/backups \
+    /app/reports \
+    /app/cache \
+    /app/backups \
+    /app/logs \
+    /app/audio_output \
+    && chown -R appuser:appuser /app
 
-# Copy everything including tests
-COPY . .
-
-# Create directories
-RUN mkdir -p /app/audio_output /app/logs
-
-# Default command for dev runs tests
-CMD ["python", "-m", "pytest", "tests/", "-v"]
+USER appuser
+CMD ["python", "-m", "pytest", "-q"]

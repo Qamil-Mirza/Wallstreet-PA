@@ -37,6 +37,7 @@ audio_output/
 .env
 .env.*
 !env.example
+secrets/
 
 # Build artifacts
 dist/
@@ -50,3 +51,4 @@ Thumbs.db
 # Documentation
 *.md
 !README.md
+!news_bot/research/prompts/*.md
