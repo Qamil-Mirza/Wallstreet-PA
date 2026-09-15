@@ -11,6 +11,7 @@ x-research-runtime: &research-runtime
   environment:
     RESEARCH_ENABLED: "true"
     RESEARCH_DATA_DIR: /app/data
+    RESEARCH_MONTHLY_INDUSTRY: robotic-actuators
     OLLAMA_BASE_URL: http://ollama:11434
   volumes:
     - research-data:/app/data
@@ -109,6 +110,12 @@ services:
     environment:
       RESEARCH_ENABLED: "false"
     command: ["python", "-m", "pytest", "-q"]
+    volumes:
+      - ./.dockerignore:/app/.dockerignore:ro
+      - ./.gitignore:/app/.gitignore:ro
+      - ./Dockerfile:/app/Dockerfile:ro
+      - ./docker-compose.yml:/app/docker-compose.yml:ro
+      - ./env.example:/app/env.example:ro
     networks:
       - research-net
 
@@ -117,7 +124,7 @@ services:
   bot:
     build:
       context: .
-      target: production
+      target: newsletter-production
     user: "10001:10001"
     profiles: ["newsletter"]
     env_file:

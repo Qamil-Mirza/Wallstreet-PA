@@ -114,6 +114,41 @@ def test_scheduler_and_runner_have_separate_safe_entrypoints(compose_config):
     assert services["research-runner"]["command"] == ["--help"]
     assert services["test"]["profiles"] == ["test"]
     assert services["test"]["build"]["target"] == "development"
+    assert services["bot"]["build"]["target"] == "newsletter-production"
+
+
+def test_research_images_do_not_inherit_legacy_tts_dependencies():
+    dockerfile = DOCKERFILE_PATH.read_text(encoding="utf-8")
+    assert "FROM base AS research-dependencies" in dockerfile
+    assert "FROM research-dependencies AS production" in dockerfile
+    assert "FROM production AS development" in dockerfile
+    assert "FROM base AS newsletter-dependencies" in dockerfile
+    assert "FROM newsletter-dependencies AS newsletter-production" in dockerfile
+    research_path = dockerfile.split("FROM base AS research-dependencies", 1)[1]
+    research_path = research_path.split("FROM base AS newsletter-dependencies", 1)[0]
+    lowered = research_path.lower()
+    assert "requirements.txt" not in lowered
+    assert "torch==" not in lowered
+    assert "tts>=" not in lowered
+    assert "pip install --no-cache-dir ." in research_path
+    assert "pip install --no-cache-dir '.[dev]' 'PyYAML>=6,<7'" in research_path
+
+
+def test_test_profile_mounts_only_static_project_metadata_read_only(compose_config):
+    mounts = _volume_targets(compose_config["services"]["test"])
+    assert mounts == {
+        "/app/.dockerignore": ("./.dockerignore", True),
+        "/app/.gitignore": ("./.gitignore", True),
+        "/app/Dockerfile": ("./Dockerfile", True),
+        "/app/docker-compose.yml": ("./docker-compose.yml", True),
+        "/app/env.example": ("./env.example", True),
+    }
+    assert "/run/secrets" not in mounts
+
+
+def test_default_scheduler_has_a_safe_monthly_industry(compose_config):
+    environment = _environment(compose_config["services"]["research-bot"])
+    assert environment["RESEARCH_MONTHLY_INDUSTRY"] == "robotic-actuators"
 
 
 def test_healthcheck_is_local_and_migrates_then_checks_sqlite(compose_config):
@@ -154,7 +189,16 @@ def test_ollama_init_validates_model_waits_and_is_idempotent():
 
 @pytest.mark.parametrize(
     "unsafe_model",
-    ("-leading", "trailing/", "double//slash", "two:tags:bad", "../escape"),
+    (
+        "-leading",
+        "trailing/",
+        "double//slash",
+        "two:tags:bad",
+        "../escape",
+        "bad\nmodel",
+        "bad\tmodel",
+        "bad\rmodel",
+    ),
 )
 def test_ollama_init_rejects_unsafe_models_before_cli_use(
     tmp_path: Path, unsafe_model: str
@@ -284,6 +328,11 @@ def test_secret_material_and_runtime_state_are_excluded_from_context_and_git():
     assert "OPENAI_API_KEY_FILE=/run/secrets/openai_api_key" in env_example
     assert "IBKR_FLEX_TOKEN=" not in env_example
     assert "OPENAI_API_KEY=" not in env_example
+    assert "RESEARCH_MONTHLY_INDUSTRY=robotic-actuators" in env_example
+    assert "# IBKR_FLEX_TOKEN_FILE=/run/secrets/ibkr_flex_token" in env_example
+    assert "# IBKR_FLEX_QUERY_ID_FILE=/run/secrets/ibkr_flex_query_id" in env_example
+    assert "# IBKR_FLEX_ACCOUNT_SALT_FILE=/run/secrets/ibkr_flex_account_salt" in env_example
+    assert "# OPENAI_API_KEY_FILE=/run/secrets/openai_api_key" in env_example
 
 
 def test_compose_renders_when_docker_compose_is_available():
