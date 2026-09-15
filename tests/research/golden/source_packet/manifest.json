@@ -1,0 +1,12 @@
+{
+  "fixture_id": "public-semiconductor-value-chain-v1",
+  "created_for_test": true,
+  "created_on": "2026-09-14",
+  "redistribution_license": "CC0-1.0",
+  "provenance": "Test-author paraphrases of raw facts in public issuer filings and releases; no source prose is copied.",
+  "documents": [
+    "nvidia_2025_10k.json",
+    "tsmc_2024_annual_report.json",
+    "nvidia_2025_q3_future_release.json"
+  ]
+}

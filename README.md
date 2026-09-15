@@ -248,6 +248,47 @@ automation, and no sizing that assumes an immediate exit. Thinly traded names
 and unavailable cash should be flagged for human review, not converted into an
 action.
 
+### Verification evidence (2026-09-14)
+
+The deterministic golden packet is test-authored, CC0-licensed fixture content
+that paraphrases raw facts from public issuer filings and releases. It does not
+include the supplied Morgan Stanley PDF or copied proprietary research prose.
+The acceptance harness scores factual accuracy, citation coverage, causal
+links, counterarguments, rating consistency, inference disclosure, and cost;
+it also tests historical cutoffs, unknown publication dates, exact claim-to-
+passage lineage, the low-liquidity posture, and external-effect isolation.
+
+Evidence captured from the project Python 3.11 environment:
+
+```text
+/Users/qamilmirza/Code/newsletter/venv/bin/python -m pytest tests/research/test_golden_reports.py tests/research/test_historical_replay.py tests/research/test_claim_trace.py tests/research/test_end_to_end.py -q
+9 passed in 5.21s
+
+DYLD_FALLBACK_LIBRARY_PATH=/opt/homebrew/lib /Users/qamilmirza/Code/newsletter/venv/bin/python -m pytest -q
+1698 passed, 3 skipped, 1 warning in 334.20s
+
+docker compose config --quiet
+exit 0
+```
+
+The three skips are APScheduler parity checks because APScheduler is absent
+from this host virtualenv. The one expected warning is pydub importing Python's
+deprecated `audioop` module; it is unrelated to portfolio research. A Docker
+image was not rebuilt in this Task 16 host checkpoint, so no new image build
+date is claimed here; the final Docker matrix remains a separate verification
+step.
+
+The synthetic dry run generated artifacts only under
+`/private/tmp/newsletter-task16-inspection.T1aCm7/reports/`: one 4,860-byte
+HTML report and one 59-byte deterministic PDF-signature test artifact. Manual
+inspection confirmed the thesis-first structure, citation and disclosure
+sections, local/offline inference metadata, explicit dry-run publication
+omission, and absence of exact account identifiers or NAV. The PDF backend is
+replaced only at the native rendering seam in this offline acceptance test;
+the production `RuntimeWorkflowService`, SQLite workflow, privacy renderer,
+and artifact paths remain real. No HTTP, IBKR Flex, order/trade, SMTP, or email
+call was made.
+
 ## Deployment
 
 ### Option 1: Docker (Recommended)

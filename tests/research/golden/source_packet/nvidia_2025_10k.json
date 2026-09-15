@@ -1,0 +1,17 @@
+{
+  "document_id": "doc-nvda-2025-10k",
+  "source_type": "sec_filing",
+  "publisher": "NVIDIA Corporation",
+  "canonical_url": "https://www.sec.gov/Archives/edgar/data/1045810/000104581025000023/nvda-20250126.htm",
+  "published_at": "2025-02-26T00:00:00+00:00",
+  "retrieved_at": "2025-10-01T12:00:00+00:00",
+  "created_for_test": true,
+  "redistribution_license": "CC0-1.0",
+  "provenance": "Original test-author paraphrase of public filing facts; not copied filing language.",
+  "passages": [
+    {
+      "passage_id": "passage-nvda-supply",
+      "text": "NVIDIA uses third parties to manufacture, assemble, test, and package its products, so external capacity and execution affect product supply."
+    }
+  ]
+}

@@ -1,0 +1,21 @@
+{
+  "document_id": "doc-tsmc-2024-annual",
+  "source_type": "issuer_filing",
+  "publisher": "Taiwan Semiconductor Manufacturing Company Limited",
+  "canonical_url": "https://investor.tsmc.com/english/annual-reports/2024",
+  "published_at": "2025-04-16T00:00:00+00:00",
+  "retrieved_at": "2025-10-01T12:00:00+00:00",
+  "created_for_test": true,
+  "redistribution_license": "CC0-1.0",
+  "provenance": "Original test-author paraphrase of public annual-report facts; not copied issuer language.",
+  "passages": [
+    {
+      "passage_id": "passage-tsmc-foundry",
+      "text": "TSMC manufactures semiconductors for customers as a dedicated foundry, placing it upstream of fabless chip designers in the value chain."
+    },
+    {
+      "passage_id": "passage-tsmc-capacity",
+      "text": "TSMC describes continued investment in advanced process and manufacturing capacity, which can expand available supply over time."
+    }
+  ]
+}

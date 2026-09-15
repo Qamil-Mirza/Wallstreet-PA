@@ -1,0 +1,17 @@
+{
+  "document_id": "doc-nvda-2025-q3-future",
+  "source_type": "issuer_release",
+  "publisher": "NVIDIA Corporation",
+  "canonical_url": "https://nvidianews.nvidia.com/news/nvidia-announces-financial-results-for-third-quarter-fiscal-2026",
+  "published_at": "2025-11-19T00:00:00+00:00",
+  "retrieved_at": "2025-11-19T23:00:00+00:00",
+  "created_for_test": true,
+  "redistribution_license": "CC0-1.0",
+  "provenance": "Original test-author statement of publication timing; issuer prose is not copied.",
+  "passages": [
+    {
+      "passage_id": "passage-nvda-future-results",
+      "text": "NVIDIA published its fiscal third-quarter 2026 results after the historical replay cutoff."
+    }
+  ]
+}
