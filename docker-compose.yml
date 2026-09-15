@@ -11,7 +11,7 @@ x-research-runtime: &research-runtime
   environment:
     RESEARCH_ENABLED: "true"
     RESEARCH_DATA_DIR: /app/data
-    RESEARCH_MONTHLY_INDUSTRY: robotic-actuators
+    RESEARCH_MONTHLY_INDUSTRY: ${RESEARCH_MONTHLY_INDUSTRY:-robotic-actuators}
     OLLAMA_BASE_URL: http://ollama:11434
   volumes:
     - research-data:/app/data

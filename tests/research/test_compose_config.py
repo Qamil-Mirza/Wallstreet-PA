@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -47,6 +48,23 @@ def _environment(service: dict[str, object]) -> dict[str, str]:
         key, _, value = str(item).partition("=")
         result[key] = value
     return result
+
+
+def _render_compose(environment: dict[str, str]) -> dict[str, object]:
+    if shutil.which("docker") is None:
+        pytest.skip("Docker CLI is not installed")
+    result = subprocess.run(
+        ["docker", "compose", "config", "--format", "json"],
+        cwd=ROOT,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    rendered = json.loads(result.stdout)
+    assert isinstance(rendered, dict)
+    return rendered
 
 
 def test_compose_has_required_services(compose_config):
@@ -148,7 +166,24 @@ def test_test_profile_mounts_only_static_project_metadata_read_only(compose_conf
 
 def test_default_scheduler_has_a_safe_monthly_industry(compose_config):
     environment = _environment(compose_config["services"]["research-bot"])
-    assert environment["RESEARCH_MONTHLY_INDUSTRY"] == "robotic-actuators"
+    assert environment["RESEARCH_MONTHLY_INDUSTRY"] == (
+        "${RESEARCH_MONTHLY_INDUSTRY:-robotic-actuators}"
+    )
+
+
+def test_rendered_compose_defaults_monthly_industry_but_preserves_override():
+    environment = os.environ.copy()
+    environment.pop("RESEARCH_MONTHLY_INDUSTRY", None)
+    default = _render_compose(environment)
+    assert _environment(default["services"]["research-bot"])[
+        "RESEARCH_MONTHLY_INDUSTRY"
+    ] == "robotic-actuators"
+
+    environment["RESEARCH_MONTHLY_INDUSTRY"] = "semiconductors"
+    overridden = _render_compose(environment)
+    assert _environment(overridden["services"]["research-bot"])[
+        "RESEARCH_MONTHLY_INDUSTRY"
+    ] == "semiconductors"
 
 
 def test_healthcheck_is_local_and_migrates_then_checks_sqlite(compose_config):
