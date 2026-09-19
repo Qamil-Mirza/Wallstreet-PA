@@ -5,6 +5,12 @@ from tests.research.golden_harness import build_golden_run
 
 def test_every_material_report_claim_resolves_to_passage(tmp_path):
     golden_run = build_golden_run(tmp_path)
+    editor_claim_ids = {
+        claim_id
+        for section in golden_run.editor.sections
+        for claim_id in section.approved_claim_ids
+    }
+    assert {claim.claim_id for claim in golden_run.material_claims} == editor_claim_ids
     for claim in golden_run.material_claims:
         lineage = golden_run.store.list_claim_lineage(claim.claim_id)
         assert lineage
@@ -12,6 +18,8 @@ def test_every_material_report_claim_resolves_to_passage(tmp_path):
             claim.evidence_ids
         )
         assert all(item.stance == "supports" for item in lineage)
+
+    assert all(claim.text in str(golden_run.report) for claim in golden_run.material_claims)
 
 
 def test_inferences_disclose_kind_and_retain_claim_dependencies(tmp_path):

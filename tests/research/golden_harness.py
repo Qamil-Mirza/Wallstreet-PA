@@ -10,13 +10,31 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+from math import ceil
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
-from decimal import Decimal
+from decimal import ROUND_UP, Decimal
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
+
+from news_bot.research.agents.analysts import EvidenceAnalyst, FundamentalAnalyst
+from news_bot.research.agents.contracts import (
+    AgentTask,
+    EditorInput,
+    EvidenceAnalystInput,
+    EvidenceAnalystOutput,
+    FundamentalAnalystInput,
+    FundamentalAnalystOutput,
+    ResearchEditorOutput,
+    ReviewerInput,
+    ReviewerOutput,
+    SecurityEligibility,
+)
+from news_bot.research.agents.editor import ResearchEditor
+from news_bot.research.agents.reviewer import SkepticalReviewer
 
 from news_bot.research.budget import (
     BudgetExceeded,
@@ -32,15 +50,28 @@ from news_bot.research.models import (
     RecommendationRating,
     SourceDocument,
 )
+from news_bot.research.providers.base import ModelRequest, ModelResponse
+from news_bot.research.providers.router import ProviderRouter
 from news_bot.research.reports import (
     Citation,
     EventUpdate,
+    PublicationPrivacyContext,
     ReportMetadata,
     ReportRenderer,
     ReportSection,
+    RenderedReportArtifact,
+)
+from news_bot.research.reports.exhibits import (
+    StoredExposureRow,
+    build_exposure_exhibit,
 )
 from news_bot.research.runtime import RuntimeFactories, RuntimeWorkflowService
-from news_bot.research.store import DocumentPassageRecord, ResearchStore
+from news_bot.research.quality import CalculatedExhibit, CalculatedRow
+from news_bot.research.store import (
+    AgentRunAudit,
+    DocumentPassageRecord,
+    ResearchStore,
+)
 
 
 GOLDEN_ROOT = Path(__file__).parent / "golden"
@@ -73,6 +104,11 @@ class GoldenRun:
     documents: tuple[SourceDocument, ...]
     rating: RecommendationRating
     paid_cost: Decimal
+    fundamental: FundamentalAnalystOutput
+    reviewer: ReviewerOutput
+    editor: ResearchEditorOutput
+    agent_audits: tuple[AgentRunAudit, ...]
+    artifact: RenderedReportArtifact | None = None
 
 
 @dataclass(frozen=True)
@@ -106,6 +142,271 @@ class SyntheticEndToEndResult:
     external_calls: tuple[str, ...]
     order_or_trade_requests: tuple[str, ...]
     email_attempts: int
+
+
+class DeterministicGoldenProvider:
+    """Offline structured provider that still exercises routing and accounting."""
+
+    name = "deterministic-golden-provider"
+    model = "deterministic-golden-v2"
+    input_per_million = Decimal("0.20")
+    output_per_million = Decimal("0.60")
+    microdollar = Decimal("0.000001")
+
+    def __init__(
+        self,
+        ledger: BudgetLedger,
+        *,
+        as_of: datetime,
+    ) -> None:
+        self.ledger = ledger
+        self.as_of = as_of
+        self.roles: list[AgentRole] = []
+
+    def _payload(self, request: ModelRequest) -> dict[str, object]:
+        evidence = json.loads(request.canonical_evidence)
+        passage_text = " ".join(
+            passage["text"] for passage in evidence["passages"]
+        )
+        required_facts = (
+            "NVIDIA uses third parties to manufacture",
+            "TSMC manufactures semiconductors for customers",
+            "continued investment in advanced process",
+        )
+        if not all(fact in passage_text for fact in required_facts):
+            raise AssertionError("agent request omitted canonical fixture evidence")
+        task_input = evidence["task_input"]
+        common: dict[str, object] = {
+            "schema_version": "1",
+            "evidence_ids": task_input["evidence_ids"],
+            "as_of": task_input["as_of"],
+            "confidence": 0.8,
+            "inference_mode": "local_only",
+        }
+        if request.role is AgentRole.EVIDENCE_ANALYST:
+            if not task_input["claim_ids"]:
+                common["claims"] = [
+                    {
+                        "claim_id": "provider-placeholder-supply",
+                        "text": (
+                            "NVIDIA depends on third-party manufacturing and "
+                            "packaging capacity."
+                        ),
+                        "kind": "fact",
+                        "evidence_ids": ["passage-nvda-supply"],
+                        "supporting_claim_ids": [],
+                    },
+                    {
+                        "claim_id": "provider-placeholder-foundry",
+                        "text": (
+                            "TSMC is an upstream dedicated foundry for fabless "
+                            "designers."
+                        ),
+                        "kind": "fact",
+                        "evidence_ids": ["passage-tsmc-foundry"],
+                        "supporting_claim_ids": [],
+                    },
+                ]
+            else:
+                facts_by_text = {
+                    claim["text"]: claim["claim_id"]
+                    for claim in evidence["claims"]
+                }
+                fact_ids = sorted(
+                    (
+                        facts_by_text[
+                            "NVIDIA depends on third-party manufacturing and "
+                            "packaging capacity."
+                        ],
+                        facts_by_text[
+                            "TSMC is an upstream dedicated foundry for fabless "
+                            "designers."
+                        ],
+                    )
+                )
+                common["claims"] = [
+                    {
+                        "claim_id": "provider-placeholder-chain",
+                        "text": (
+                            "Advanced packaging capacity can constrain NVIDIA "
+                            "product availability."
+                        ),
+                        "kind": "inference",
+                        "evidence_ids": [
+                            "passage-nvda-supply",
+                            "passage-tsmc-foundry",
+                        ],
+                        "supporting_claim_ids": fact_ids,
+                    },
+                    {
+                        "claim_id": "provider-placeholder-counter",
+                        "text": (
+                            "Additional foundry and packaging capacity may ease "
+                            "constraints."
+                        ),
+                        "kind": "inference",
+                        "evidence_ids": ["passage-tsmc-capacity"],
+                        "supporting_claim_ids": fact_ids,
+                    },
+                    {
+                        "claim_id": "provider-placeholder-rating",
+                        "text": (
+                            "A low-liquidity account warrants HOLD, no margin, no "
+                            "forced liquidation, and human review."
+                        ),
+                        "kind": "inference",
+                        "evidence_ids": [
+                            "passage-nvda-supply",
+                            "passage-tsmc-foundry",
+                            "passage-tsmc-capacity",
+                        ],
+                        "supporting_claim_ids": fact_ids,
+                    },
+                ]
+        elif request.role is AgentRole.FUNDAMENTAL_ANALYST:
+            security = task_input["security"]
+            common.update(
+                {
+                    "security_id": security["security_id"],
+                    "thesis": (
+                        "Hold while upstream supply evidence lacks a current "
+                        "valuation basis."
+                    ),
+                    "horizon_months": task_input["horizon_months"],
+                    "valuation": {
+                        "low": "0",
+                        "high": "0",
+                        "currency": "USD",
+                        "as_of": task_input["as_of"],
+                    },
+                    "assumptions": ["No margin or forced sale is available."],
+                    "catalysts": ["Verified expansion in packaging capacity."],
+                    "counter_thesis": (
+                        "Capacity expansion may remove the observed bottleneck."
+                    ),
+                    "risks": ["Valuation evidence is intentionally unavailable."],
+                    "invalidation_conditions": [
+                        "Fresh valuation evidence changes the risk-reward balance."
+                    ],
+                    "rating": "hold",
+                    "eligible": True,
+                }
+            )
+        elif request.role is AgentRole.SKEPTICAL_REVIEWER:
+            common.update({"verdict": "pass", "issues": []})
+        elif request.role is AgentRole.RESEARCH_EDITOR:
+            approved = set(task_input["approved_claim_ids"])
+            claims_by_text = {
+                claim["text"]: claim["claim_id"]
+                for claim in evidence["claims"]
+                if claim["claim_id"] in approved
+            }
+
+            def selected(fragment: str) -> list[str]:
+                matches = [
+                    claim_id
+                    for text, claim_id in claims_by_text.items()
+                    if fragment in text
+                ]
+                if not matches:
+                    raise AssertionError("editor fixture claim was not persisted")
+                return matches
+
+            common.update(
+                {
+                    "title": "Semiconductor value-chain research replay",
+                    "sections": [
+                        {
+                            "heading": "Thesis and rating",
+                            "approved_claim_ids": selected("low-liquidity"),
+                        },
+                        {
+                            "heading": "Documented evidence",
+                            "approved_claim_ids": [
+                                *selected("third-party manufacturing"),
+                                *selected("upstream dedicated foundry"),
+                            ],
+                        },
+                        {
+                            "heading": "Causal chain",
+                            "approved_claim_ids": selected("can constrain"),
+                        },
+                        {
+                            "heading": "Counter-thesis",
+                            "approved_claim_ids": selected("may ease constraints"),
+                        },
+                    ],
+                }
+            )
+        else:
+            raise AssertionError(f"unexpected golden role: {request.role.value}")
+        return common
+
+    def generate(self, request: ModelRequest) -> ModelResponse:
+        expected_schema = {
+            AgentRole.EVIDENCE_ANALYST: EvidenceAnalystOutput,
+            AgentRole.FUNDAMENTAL_ANALYST: FundamentalAnalystOutput,
+            AgentRole.SKEPTICAL_REVIEWER: ReviewerOutput,
+            AgentRole.RESEARCH_EDITOR: ResearchEditorOutput,
+        }[request.role]
+        if request.output_schema is not expected_schema:
+            raise AssertionError("role was routed to the wrong output contract")
+        payload = self._payload(request)
+        output = request.output_schema.model_validate(payload)
+        canonical = json.dumps(
+            output.model_dump(mode="json"),
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        input_tokens = ceil(
+            len(
+                (
+                    request.system_prompt
+                    + request.provider_input
+                    + request.canonical_schema
+                ).encode("utf-8")
+            )
+            / 4
+        )
+        output_tokens = ceil(len(canonical.encode("utf-8")) / 4)
+        reasoning_tokens = max(1, output_tokens // 10)
+
+        def cost(input_count: int, output_count: int) -> Decimal:
+            amount = (
+                Decimal(input_count) * self.input_per_million
+                + Decimal(output_count) * self.output_per_million
+            ) / Decimal("1000000")
+            return amount.quantize(self.microdollar, rounding=ROUND_UP)
+
+        estimated_cost = cost(input_tokens, request.max_output_tokens)
+        actual_cost = cost(input_tokens, output_tokens + reasoning_tokens)
+        reservation = self.ledger.reserve(
+            f"{request.run_id}:{request.role.value}",
+            estimated_cost,
+            now=self.as_of,
+            role=request.role,
+        )
+        reconciled = self.ledger.reconcile(
+            reservation.id,
+            actual_cost,
+            now=self.as_of,
+        )
+        self.roles.append(request.role)
+        return ModelResponse(
+            data=output,
+            raw_response_hash=hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            reasoning_tokens=reasoning_tokens,
+            model=self.model,
+            latency_ms=1,
+            provider=self.name,
+            inference_mode=InferenceMode.LOCAL_ONLY,
+            run_id=request.run_id,
+            reservation_id=reconciled.id,
+            reservation_state=reconciled.state,
+            reserved_cost_usd=reconciled.amount,
+        )
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -209,107 +510,201 @@ def run_historical_replay(
     store.migrate()
     store.insert_documents_with_passages(_packet_records(packet_root))
     cutoff = datetime.combine(as_of, datetime.max.time(), tzinfo=timezone.utc)
-    with store.connect() as connection:
-        rows = connection.execute(
-            "SELECT document_id, source_type, canonical_url, publisher, "
-            "published_at, retrieved_at, content_hash, raw_content_path, "
-            "extraction_status FROM source_documents "
-            "WHERE published_at <= ? ORDER BY published_at, document_id",
-            (cutoff.isoformat(timespec="microseconds"),),
-        ).fetchall()
-    documents = tuple(
-        SourceDocument(
-            document_id=row[0],
-            source_type=row[1],
-            canonical_url=row[2],
-            publisher=row[3],
-            published_at=_parse_publication_date(row[4], document_id=row[0]),
-            retrieved_at=_parse_publication_date(row[5], document_id=row[0]),
-            content_hash=row[6],
-            raw_content_path=row[7],
-            extraction_status=row[8],
-        )
-        for row in rows
-    )
+    documents = store.list_documents_as_of(cutoff)
     return ReplayResult(as_of=as_of, documents=documents)
 
 
-def _seed_material_claims(
-    store: ResearchStore, *, as_of: datetime
-) -> tuple[MaterialClaim, ...]:
-    definitions = (
-        (
-            "claim-nvda-supply",
-            ClaimKind.FACT,
-            "NVIDIA depends on third-party manufacturing and packaging capacity.",
-            ("passage-nvda-supply",),
-            (),
-        ),
-        (
-            "claim-tsmc-foundry",
-            ClaimKind.FACT,
-            "TSMC is an upstream dedicated foundry for fabless designers.",
-            ("passage-tsmc-foundry",),
-            (),
-        ),
-        (
-            "claim-capacity-bottleneck",
-            ClaimKind.INFERENCE,
-            "Advanced packaging capacity can constrain NVIDIA product availability.",
-            ("passage-nvda-supply", "passage-tsmc-foundry"),
-            ("claim-nvda-supply", "claim-tsmc-foundry"),
-        ),
-        (
-            "claim-capacity-counterargument",
-            ClaimKind.INFERENCE,
-            "Additional foundry and packaging capacity may ease constraints.",
-            ("passage-tsmc-capacity",),
-            ("claim-capacity-bottleneck",),
-        ),
-        (
-            "claim-conservative-rating",
-            ClaimKind.INFERENCE,
-            (
-                "A low-liquidity account warrants HOLD, no margin, no forced "
-                "liquidation, and human review."
-            ),
-            (
-                "passage-nvda-supply",
-                "passage-tsmc-foundry",
-                "passage-tsmc-capacity",
-            ),
-            ("claim-capacity-bottleneck", "claim-capacity-counterargument"),
-        ),
+def _research_config(data_dir: Path) -> ResearchConfig:
+    return ResearchConfig(
+        enabled=True,
+        data_dir=data_dir,
+        openai_api_key=None,
+        inference_mode=InferenceMode.LOCAL_ONLY,
+        ollama_base_url="http://localhost:11434",
+        ollama_model="deterministic-golden-v2",
+        budget_soft_usd=Decimal("4.00"),
+        budget_hard_usd=Decimal("5.00"),
     )
-    material = []
-    for claim_id, kind, text, passage_ids, supporting_ids in definitions:
-        claim = EvidenceClaim(
-            claim_id=claim_id,
-            entity_id=None,
-            kind=kind,
-            text=text,
-            as_of=as_of,
-            confidence=Decimal("0.90") if kind is ClaimKind.FACT else Decimal("0.70"),
-            status="active",
-        )
+
+
+def _persist_analyst_claims(
+    store: ResearchStore,
+    output: EvidenceAnalystOutput,
+) -> tuple[MaterialClaim, ...]:
+    material: list[MaterialClaim] = []
+    for draft in output.claims:
         store.insert_claim_with_lineage(
-            claim,
-            passage_links=tuple((item, "supports") for item in passage_ids),
-            supporting_claim_ids=supporting_ids,
+            EvidenceClaim(
+                claim_id=draft.claim_id,
+                entity_id=None,
+                kind=draft.kind,
+                text=draft.text,
+                as_of=output.as_of,
+                confidence=Decimal(str(output.confidence)),
+                status="active",
+            ),
+            passage_links=tuple(
+                (evidence_id, "supports")
+                for evidence_id in draft.evidence_ids
+            ),
+            supporting_claim_ids=draft.supporting_claim_ids,
         )
         material.append(
             MaterialClaim(
-                claim_id=claim_id,
-                text=text,
-                kind=kind,
-                evidence_ids=passage_ids,
+                claim_id=draft.claim_id,
+                text=draft.text,
+                kind=draft.kind,
+                evidence_ids=draft.evidence_ids,
             )
         )
     return tuple(material)
 
 
+def _run_specialists(
+    store: ResearchStore,
+    *,
+    as_of: datetime,
+    data_dir: Path,
+) -> tuple[
+    tuple[MaterialClaim, ...],
+    FundamentalAnalystOutput,
+    ReviewerOutput,
+    ResearchEditorOutput,
+    tuple[AgentRunAudit, ...],
+    Decimal,
+]:
+    reservation_ids = iter(f"golden-reservation-{index}" for index in range(1, 9))
+    ledger = BudgetLedger(
+        store=store,
+        soft_limit=Decimal("4.00"),
+        hard_limit=Decimal("5.00"),
+        id_factory=lambda: next(reservation_ids),
+    )
+    provider = DeterministicGoldenProvider(ledger, as_of=as_of)
+    router = ProviderRouter(
+        _research_config(data_dir),
+        external=None,
+        ollama=provider,
+        clock=lambda: as_of,
+        monotonic=lambda: 1.0,
+    )
+    evidence_ids = (
+        "passage-nvda-supply",
+        "passage-tsmc-capacity",
+        "passage-tsmc-foundry",
+    )
+    workflow_id = "golden-specialist-workflow"
+
+    fact_output = EvidenceAnalyst(
+        router, store, clock=lambda: as_of
+    ).run(
+        AgentTask[EvidenceAnalystInput](
+            task_id="01-evidence-facts",
+            run_id=workflow_id,
+            input=EvidenceAnalystInput(
+                evidence_ids=evidence_ids,
+                as_of=as_of,
+                question=(
+                    "How do upstream manufacturing constraints affect the "
+                    "holding and its conservative research posture?"
+                ),
+            ),
+        )
+    )
+    fact_claims = _persist_analyst_claims(store, fact_output)
+    fact_claim_ids = tuple(claim.claim_id for claim in fact_claims)
+    inference_output = EvidenceAnalyst(
+        router, store, clock=lambda: as_of
+    ).run(
+        AgentTask[EvidenceAnalystInput](
+            task_id="02-evidence-inferences",
+            run_id=workflow_id,
+            input=EvidenceAnalystInput(
+                evidence_ids=evidence_ids,
+                claim_ids=fact_claim_ids,
+                as_of=as_of,
+                question=(
+                    "What causal, counter-thesis, and portfolio-posture "
+                    "inferences follow from the documented facts?"
+                ),
+            ),
+        )
+    )
+    inference_claims = _persist_analyst_claims(store, inference_output)
+    material_claims = (*fact_claims, *inference_claims)
+    claim_ids = tuple(claim.claim_id for claim in material_claims)
+
+    fundamental = FundamentalAnalyst(
+        router, store, clock=lambda: as_of
+    ).run(
+        AgentTask[FundamentalAnalystInput](
+            task_id="03-fundamental-analyst",
+            run_id=workflow_id,
+            input=FundamentalAnalystInput(
+                evidence_ids=evidence_ids,
+                claim_ids=claim_ids,
+                as_of=as_of,
+                security=SecurityEligibility(
+                    entity_id="entity-nvidia",
+                    security_id="security-nvda",
+                    symbol="NVDA",
+                    asset_kind="equity",
+                    resolved=True,
+                    public=True,
+                    tradable=True,
+                ),
+                horizon_months=12,
+            ),
+        )
+    )
+    reviewer = SkepticalReviewer(router, store, clock=lambda: as_of).run(
+        AgentTask[ReviewerInput](
+            task_id="04-skeptical-reviewer",
+            run_id=workflow_id,
+            input=ReviewerInput(
+                evidence_ids=evidence_ids,
+                claim_ids=claim_ids,
+                target_claim_ids=claim_ids,
+                as_of=as_of,
+            ),
+        )
+    )
+    editor = ResearchEditor(router, store, clock=lambda: as_of).run(
+        AgentTask[EditorInput](
+            task_id="05-research-editor",
+            run_id=workflow_id,
+            input=EditorInput(
+                evidence_ids=evidence_ids,
+                claim_ids=claim_ids,
+                approved_claim_ids=claim_ids,
+                as_of=as_of,
+            ),
+        )
+    )
+    selected_ids = {
+        claim_id
+        for section in editor.sections
+        for claim_id in section.approved_claim_ids
+    }
+    selected_claims = tuple(
+        claim for claim in material_claims if claim.claim_id in selected_ids
+    )
+    return (
+        selected_claims,
+        fundamental,
+        reviewer,
+        editor,
+        store.list_agent_executions(workflow_id),
+        ledger.month_total(as_of.year, as_of.month),
+    )
+
+
 def _golden_report(
-    documents: tuple[SourceDocument, ...], as_of: datetime
+    store: ResearchStore,
+    documents: tuple[SourceDocument, ...],
+    editor: ResearchEditorOutput,
+    fundamental: FundamentalAnalystOutput,
+    as_of: datetime,
 ) -> EventUpdate:
     by_id = {document.document_id: document for document in documents}
     evidence_to_document = {
@@ -329,10 +724,51 @@ def _golden_report(
         for evidence_id, document in evidence_to_document.items()
     )
 
-    def section(title: str, body: str, *evidence_ids: str) -> ReportSection:
-        return ReportSection(title=title, body=body, evidence_ids=evidence_ids)
+    editor_sections = {section.heading: section for section in editor.sections}
 
-    all_evidence = tuple(evidence_to_document)
+    def section(heading: str) -> ReportSection:
+        selected = editor_sections[heading]
+        claims = []
+        evidence_ids: set[str] = set()
+        for claim_id in selected.approved_claim_ids:
+            claim = store.get_claim(claim_id)
+            lineage = store.list_claim_lineage(claim_id)
+            if claim is None or not lineage:
+                raise AssertionError("editor selected a claim without stored lineage")
+            claims.append(claim.text)
+            evidence_ids.update(item.passage.passage_id for item in lineage)
+        return ReportSection(
+            title=heading,
+            body=" ".join(claims),
+            evidence_ids=tuple(sorted(evidence_ids)),
+        )
+
+    thesis = section("Thesis and rating")
+    documented = section("Documented evidence")
+    causal = section("Causal chain")
+    counter = section("Counter-thesis")
+    exposure_row = StoredExposureRow(
+        row_id="NVDA",
+        symbol="NVDA",
+        label="Synthetic NVIDIA exposure",
+        weight=Decimal("1.0"),
+        currency="USD",
+        source_note="Synthetic acceptance portfolio; cited supply evidence",
+        source_date=as_of.date(),
+    )
+    calculated_row = CalculatedRow(
+        row_id=exposure_row.row_id,
+        values={"weight": exposure_row.weight},
+    )
+    exhibit = build_exposure_exhibit(
+        (exposure_row,),
+        calculation=CalculatedExhibit(
+            exhibit_id="exposure",
+            normalized_rows=(calculated_row,),
+            rendered_rows=(calculated_row,),
+        ),
+        evidence_ids=("passage-nvda-supply",),
+    )
     return EventUpdate(
         metadata=ReportMetadata(
             report_id="golden-semiconductor-value-chain",
@@ -354,102 +790,120 @@ def _golden_report(
             disclosure=(
                 "HOLD is research for a low-liquidity account, not an order: no "
                 "margin, no forced liquidation, and thin-liquidity ideas require "
-                "human review."
+                "human review. Fundamental review: " + fundamental.thesis
             ),
         ),
-        thesis=section(
-            "Thesis",
-            (
-                "HOLD: supply-chain evidence is relevant, but it does not establish "
-                "valuation upside."
-            ),
-            *all_evidence,
-        ),
-        event_decomposition=(
-            section(
-                "Documented structure",
-                (
-                    "NVIDIA depends on third-party manufacturing; TSMC sits "
-                    "upstream as a foundry."
-                ),
-                "passage-nvda-supply",
-                "passage-tsmc-foundry",
-            ),
-        ),
-        causal_decomposition=(
-            section(
-                "Causal chain",
-                (
-                    "Third-party manufacturing and advanced packaging capacity "
-                    "can limit product availability."
-                ),
-                "passage-nvda-supply",
-                "passage-tsmc-foundry",
-            ),
-        ),
-        read_through=(
-            section(
-                "One layer deeper",
-                (
-                    "Foundry and packaging capacity are upstream variables to "
-                    "monitor for a fabless chip holding."
-                ),
-                "passage-tsmc-foundry",
-                "passage-tsmc-capacity",
-            ),
-        ),
-        thesis_changes=(
-            section(
-                "Rating discipline",
-                (
-                    "The rating remains HOLD until valuation and demand evidence "
-                    "justify a change."
-                ),
-                *all_evidence,
-            ),
-        ),
-        unchanged_assumptions=(
-            section(
-                "Counter-thesis",
-                "Additional foundry and packaging capacity may ease constraints.",
-                "passage-tsmc-capacity",
-            ),
-        ),
-        questions=(
-            section(
-                "Open question",
-                "Will capacity additions arrive before demand or product mix changes?",
-                "passage-tsmc-capacity",
-            ),
-        ),
-        signposts=(
-            section(
-                "Signposts",
-                (
-                    "Track foundry investment, packaging availability, and issuer "
-                    "dependency disclosures."
-                ),
-                *all_evidence,
-            ),
-        ),
+        thesis=thesis,
+        event_decomposition=(documented,),
+        causal_decomposition=(causal,),
+        read_through=(causal,),
+        exhibits=(exhibit,),
+        thesis_changes=(thesis,),
+        unchanged_assumptions=(counter,),
+        questions=(counter,),
+        signposts=(documented,),
     )
 
 
-def build_golden_run(tmp_path: Path) -> GoldenRun:
+def assert_report_claim_binding(
+    report: EventUpdate,
+    store: ResearchStore,
+    editor: ResearchEditorOutput,
+) -> None:
+    """Prove every material section is exact prose from editor-approved claims."""
+    editor_sections = {section.heading: section for section in editor.sections}
+    if len(editor_sections) != len(editor.sections):
+        raise AssertionError("editor section headings must be unique")
+    report_sections = (
+        report.thesis,
+        *report.event_decomposition,
+        *report.causal_decomposition,
+        *report.read_through,
+        *report.thesis_changes,
+        *report.unchanged_assumptions,
+        *report.questions,
+        *report.signposts,
+    )
+    observed_headings: set[str] = set()
+    for section in report_sections:
+        selected = editor_sections.get(section.title)
+        if selected is None:
+            raise AssertionError("report section is not backed by approved claims")
+        claims = tuple(
+            store.get_claim(claim_id)
+            for claim_id in selected.approved_claim_ids
+        )
+        if any(claim is None for claim in claims):
+            raise AssertionError("report section references an unknown approved claim")
+        expected_body = " ".join(claim.text for claim in claims if claim is not None)
+        expected_evidence = {
+            lineage.passage.passage_id
+            for claim_id in selected.approved_claim_ids
+            for lineage in store.list_claim_lineage(claim_id)
+        }
+        if (
+            section.body != expected_body
+            or set(section.evidence_ids) != expected_evidence
+        ):
+            raise AssertionError("report section differs from its approved claims")
+        observed_headings.add(section.title)
+    if observed_headings != set(editor_sections):
+        raise AssertionError("report omits editor-approved claims")
+
+
+def build_golden_run(tmp_path: Path, *, render: bool = False) -> GoldenRun:
     expected = load_expected_characteristics()
     replay = run_historical_replay(
         tmp_path, as_of=date.fromisoformat(expected["as_of"])
     )
     store = ResearchStore(tmp_path / "replay.db")
-    as_of = datetime.combine(replay.as_of, datetime.min.time(), tzinfo=timezone.utc)
-    material_claims = _seed_material_claims(store, as_of=as_of)
+    as_of = datetime.combine(replay.as_of, datetime.max.time(), tzinfo=timezone.utc)
+    (
+        material_claims,
+        fundamental,
+        reviewer,
+        editor,
+        agent_audits,
+        paid_cost,
+    ) = _run_specialists(store, as_of=as_of, data_dir=tmp_path)
+    report = _golden_report(
+        store,
+        replay.documents,
+        editor,
+        fundamental,
+        as_of,
+    )
+    assert_report_claim_binding(report, store, editor)
+    artifact = None
+    if render:
+        homebrew_lib = Path("/opt/homebrew/lib")
+        if homebrew_lib.is_dir():
+            os.environ.setdefault("DYLD_FALLBACK_LIBRARY_PATH", str(homebrew_lib))
+        artifact = ReportRenderer(
+            tmp_path / "golden-reports",
+            privacy_context=PublicationPrivacyContext(
+                mode="no_sensitive_data",
+                sensitive_literals=(),
+                account_identifiers=(),
+                portfolio_values=(),
+            ),
+        ).render_event_update(report)
+        if artifact.pdf_path is None:
+            raise AssertionError(
+                f"native PDF rendering failed: {artifact.pdf_error}"
+            )
     return GoldenRun(
         store=store,
-        report=_golden_report(replay.documents, as_of),
+        report=report,
         material_claims=material_claims,
         documents=replay.documents,
-        rating=RecommendationRating.HOLD,
-        paid_cost=Decimal("0.00"),
+        rating=fundamental.rating,
+        paid_cost=paid_cost,
+        fundamental=fundamental,
+        reviewer=reviewer,
+        editor=editor,
+        agent_audits=agent_audits,
+        artifact=artifact,
     )
 
 
@@ -462,6 +916,8 @@ def run_golden_evaluation(tmp_path: Path) -> GoldenEvaluation:
     ).casefold()
     actual_claim_ids = {claim.claim_id for claim in run.material_claims}
     expected_claim_ids = set(expected["expected_claim_ids"])
+    actual_claim_texts = {claim.text for claim in run.material_claims}
+    expected_claim_texts = set(expected["expected_claim_texts"])
     actual_facts = {
         claim.text for claim in run.material_claims if claim.kind is ClaimKind.FACT
     }
@@ -478,6 +934,7 @@ def run_golden_evaluation(tmp_path: Path) -> GoldenEvaluation:
             Decimal("1")
             if (
                 actual_claim_ids == expected_claim_ids
+                and actual_claim_texts == expected_claim_texts
                 and actual_facts == expected_facts
             )
             else Decimal("0")
@@ -609,11 +1066,6 @@ def run_synthetic_end_to_end(tmp_path: Path) -> SyntheticEndToEndResult:
         calls.append("email")
         raise AssertionError("synthetic dry run attempted email")
 
-    def deterministic_pdf(destination: Path, _html: str) -> None:
-        destination.write_bytes(
-            b"%PDF-1.4\n% deterministic offline acceptance artifact\n%%EOF\n"
-        )
-
     service = RuntimeWorkflowService(
         config,
         store,
@@ -622,13 +1074,13 @@ def run_synthetic_end_to_end(tmp_path: Path) -> SyntheticEndToEndResult:
             owner_id_factory=lambda: "golden-e2e-owner",
         ),
     )
+    homebrew_lib = Path("/opt/homebrew/lib")
+    if homebrew_lib.is_dir():
+        os.environ.setdefault("DYLD_FALLBACK_LIBRARY_PATH", str(homebrew_lib))
     with (
         patch("requests.sessions.Session.request", forbidden_http),
         patch("news_bot.email_client.send_email", forbidden_email),
         patch("smtplib.SMTP", forbidden_email),
-        patch.object(
-            ReportRenderer, "_atomic_pdf", staticmethod(deterministic_pdf)
-        ),
     ):
         result = service.run_daily(
             as_of=datetime(2026, 8, 24, tzinfo=timezone.utc),

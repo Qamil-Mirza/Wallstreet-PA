@@ -1,11 +1,18 @@
 {
   "as_of": "2025-10-01",
+  "expected_claim_texts": [
+    "NVIDIA depends on third-party manufacturing and packaging capacity.",
+    "TSMC is an upstream dedicated foundry for fabless designers.",
+    "Advanced packaging capacity can constrain NVIDIA product availability.",
+    "Additional foundry and packaging capacity may ease constraints.",
+    "A low-liquidity account warrants HOLD, no margin, no forced liquidation, and human review."
+  ],
   "expected_claim_ids": [
-    "claim-nvda-supply",
-    "claim-tsmc-foundry",
-    "claim-capacity-bottleneck",
-    "claim-capacity-counterargument",
-    "claim-conservative-rating"
+    "claim_130dbfc4c31987ad2211ec2ba0f17caddd5d11e4c0d9c3a7d72504b317ae2be3",
+    "claim_211ee8f79355afecf95a21bea99571935c762cf9613c99a142e34c401c8a7254",
+    "claim_51b5c7a1efb3a9694eb58c3bba42cb7f06561025ff12be7fd27d39d710bd5d9c",
+    "claim_51e03d8586d6a20713faffbd004860430fbf1eafc61c7d58037dc4fb309cd901",
+    "claim_f2753d8757a2f38ff6f12f6b851f7d8dd9df6ac8e43005add1d8ac31a3a273fa"
   ],
   "expected_facts": [
     "NVIDIA depends on third-party manufacturing and packaging capacity.",

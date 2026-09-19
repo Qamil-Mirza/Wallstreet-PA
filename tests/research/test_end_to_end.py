@@ -1,4 +1,6 @@
 from decimal import Decimal
+import shutil
+import subprocess
 
 from tests.research.golden_harness import (
     run_cost_simulation,
@@ -13,7 +15,18 @@ def test_synthetic_portfolio_dry_run_is_offline_and_outputs_html_and_pdf(tmp_pat
     assert result.email_attempts == 0
     assert result.html_path.is_file()
     assert result.pdf_path.is_file()
-    assert result.pdf_path.read_bytes().startswith(b"%PDF-")
+    payload = result.pdf_path.read_bytes()
+    assert len(payload) > 10_000
+    assert payload.startswith(b"%PDF-")
+    assert payload.rstrip().endswith(b"%%EOF")
+    if shutil.which("pdfinfo"):
+        parsed = subprocess.run(
+            ["pdfinfo", str(result.pdf_path)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        assert "Pages:" in parsed.stdout
     assert "Institutional research" in result.html
     assert "Validation thesis" in result.html
     assert "Deterministic offline fixture" in result.html

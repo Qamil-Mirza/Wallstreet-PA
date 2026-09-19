@@ -1264,6 +1264,86 @@ class ResearchStore:
             extraction_status=row[8],
         )
 
+    def list_documents_as_of(
+        self, as_of: datetime
+    ) -> tuple[SourceDocument, ...]:
+        """Return only documents published and retrieved by an exact UTC cutoff.
+
+        Historical replay treats malformed or timezone-unknown persisted dates as
+        an integrity failure.  It never silently drops an unclassifiable source.
+        """
+        if (
+            not isinstance(as_of, datetime)
+            or as_of.tzinfo is None
+            or as_of.utcoffset() != timezone.utc.utcoffset(as_of)
+        ):
+            raise ValueError("document as_of must be an aware UTC datetime")
+        cutoff = as_of.astimezone(timezone.utc)
+        cutoff_text = _utc_text(cutoff, "document as_of")
+        connection = self.connect()
+        try:
+            persisted_timestamps = connection.execute(
+                "SELECT published_at, retrieved_at FROM source_documents"
+            ).fetchall()
+            for published_text, retrieved_text in persisted_timestamps:
+                try:
+                    published_at = datetime.fromisoformat(
+                        published_text.replace("Z", "+00:00")
+                    )
+                    retrieved_at = datetime.fromisoformat(
+                        retrieved_text.replace("Z", "+00:00")
+                    )
+                    canonical = (
+                        _utc_text(published_at),
+                        _utc_text(retrieved_at),
+                    )
+                except (AttributeError, TypeError, ValueError):
+                    raise ValueError(
+                        "stored document publication date is invalid or unknown; "
+                        "timestamps must use canonical UTC"
+                    ) from None
+                if canonical != (published_text, retrieved_text):
+                    raise ValueError(
+                        "stored document publication date is invalid or unknown; "
+                        "timestamps must use canonical UTC"
+                    )
+            rows = connection.execute(
+                "SELECT document_id, source_type, canonical_url, publisher, "
+                "published_at, retrieved_at, content_hash, raw_content_path, "
+                "extraction_status FROM source_documents "
+                "WHERE published_at <= ? AND retrieved_at <= ? "
+                "ORDER BY published_at, document_id",
+                (cutoff_text, cutoff_text),
+            ).fetchall()
+        finally:
+            connection.close()
+
+        documents: list[SourceDocument] = []
+        for row in rows:
+            try:
+                published_at = _parse_utc(row[4])
+                retrieved_at = _parse_utc(row[5])
+            except (AttributeError, TypeError, ValueError):
+                raise ValueError(
+                    "stored document publication date is invalid or unknown"
+                ) from None
+            if published_at > cutoff or retrieved_at > cutoff:
+                raise ValueError("document replay query exceeded its UTC cutoff")
+            documents.append(
+                SourceDocument(
+                    document_id=row[0],
+                    source_type=row[1],
+                    canonical_url=row[2],
+                    publisher=row[3],
+                    published_at=published_at,
+                    retrieved_at=retrieved_at,
+                    content_hash=row[6],
+                    raw_content_path=row[7],
+                    extraction_status=row[8],
+                )
+            )
+        return tuple(documents)
+
     def list_document_passages(
         self, document_id: str
     ) -> tuple[DocumentPassageRecord, ...]:
