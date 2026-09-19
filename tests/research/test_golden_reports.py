@@ -47,6 +47,16 @@ def test_golden_pipeline_runs_specialists_with_audited_usage(tmp_path):
     assert len({audit.input_tokens for audit in golden_run.agent_audits}) > 1
 
 
+def test_golden_report_metadata_matches_audited_provider_and_model(tmp_path):
+    golden_run = build_golden_run(tmp_path)
+    assert {audit.provider for audit in golden_run.agent_audits} == {
+        golden_run.report.metadata.provider
+    }
+    assert {audit.model for audit in golden_run.agent_audits} == {
+        golden_run.report.metadata.model
+    }
+
+
 def test_golden_report_renders_real_reconciled_exhibit_and_pdf(tmp_path):
     artifact = build_golden_run(tmp_path, render=True).artifact
     assert artifact is not None
@@ -121,6 +131,21 @@ def test_report_claim_binding_rejects_unsupported_section_prose(tmp_path):
     )
     report = golden_run.report.model_copy(update={"thesis": unsupported})
     with pytest.raises(AssertionError, match="approved claims"):
+        golden_harness.assert_report_claim_binding(
+            report, golden_run.store, golden_run.editor
+        )
+
+
+def test_report_claim_binding_rejects_analytical_metadata_disclosure(tmp_path):
+    golden_run = build_golden_run(tmp_path)
+    metadata = golden_run.report.metadata.model_copy(
+        update={
+            "disclosure": golden_run.report.metadata.disclosure
+            + " BUY is warranted by an uncited conclusion."
+        }
+    )
+    report = golden_run.report.model_copy(update={"metadata": metadata})
+    with pytest.raises(AssertionError, match="disclosure"):
         golden_harness.assert_report_claim_binding(
             report, golden_run.store, golden_run.editor
         )

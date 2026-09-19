@@ -76,6 +76,10 @@ from news_bot.research.store import (
 
 GOLDEN_ROOT = Path(__file__).parent / "golden"
 SOURCE_PACKET = GOLDEN_ROOT / "source_packet"
+_ADMINISTRATIVE_DISCLOSURE = (
+    "This report is research, not an order: no margin, no forced liquidation, "
+    "and human review is required for thin-liquidity ideas."
+)
 
 
 class ReplayDateError(ValueError):
@@ -703,9 +707,17 @@ def _golden_report(
     store: ResearchStore,
     documents: tuple[SourceDocument, ...],
     editor: ResearchEditorOutput,
-    fundamental: FundamentalAnalystOutput,
+    agent_audits: tuple[AgentRunAudit, ...],
     as_of: datetime,
 ) -> EventUpdate:
+    provenance = {(audit.provider, audit.model) for audit in agent_audits}
+    if (
+        not provenance
+        or len(provenance) != 1
+        or any(provider is None or model is None for provider, model in provenance)
+    ):
+        raise AssertionError("golden agent audits must share one provider and model")
+    provider, model = provenance.pop()
     by_id = {document.document_id: document for document in documents}
     evidence_to_document = {
         "passage-nvda-supply": by_id["doc-nvda-2025-10k"],
@@ -776,8 +788,8 @@ def _golden_report(
             title="Semiconductor value-chain research replay",
             as_of=as_of,
             inference_mode=InferenceMode.LOCAL_ONLY,
-            provider="offline",
-            model="deterministic-golden-v1",
+            provider=provider,
+            model=model,
             freshness=(
                 "Only sources published on or before the replay date are eligible."
             ),
@@ -787,11 +799,7 @@ def _golden_report(
                 "to cited passages; no future documents are available to analysis."
             ),
             omissions=("Live prices and valuation inputs are intentionally omitted.",),
-            disclosure=(
-                "HOLD is research for a low-liquidity account, not an order: no "
-                "margin, no forced liquidation, and thin-liquidity ideas require "
-                "human review. Fundamental review: " + fundamental.thesis
-            ),
+            disclosure=_ADMINISTRATIVE_DISCLOSURE,
         ),
         thesis=thesis,
         event_decomposition=(documented,),
@@ -811,6 +819,8 @@ def assert_report_claim_binding(
     editor: ResearchEditorOutput,
 ) -> None:
     """Prove every material section is exact prose from editor-approved claims."""
+    if report.metadata.disclosure != _ADMINISTRATIVE_DISCLOSURE:
+        raise AssertionError("report disclosure must remain administrative only")
     editor_sections = {section.heading: section for section in editor.sections}
     if len(editor_sections) != len(editor.sections):
         raise AssertionError("editor section headings must be unique")
@@ -870,7 +880,7 @@ def build_golden_run(tmp_path: Path, *, render: bool = False) -> GoldenRun:
         store,
         replay.documents,
         editor,
-        fundamental,
+        agent_audits,
         as_of,
     )
     assert_report_claim_binding(report, store, editor)
