@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 from math import ceil
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -48,6 +47,7 @@ from news_bot.research.models import (
     EvidenceClaim,
     InferenceMode,
     RecommendationRating,
+    ReviewVerdict,
     SourceDocument,
 )
 from news_bot.research.providers.base import ModelRequest, ModelResponse
@@ -76,6 +76,17 @@ from news_bot.research.store import (
 
 GOLDEN_ROOT = Path(__file__).parent / "golden"
 SOURCE_PACKET = GOLDEN_ROOT / "source_packet"
+_GOLDEN_REPORT_TITLE = "Semiconductor value-chain research replay"
+_GOLDEN_REPORT_FRESHNESS = (
+    "Only sources published on or before the replay date are eligible."
+)
+_GOLDEN_REPORT_METHODOLOGY = (
+    "Facts are fixture-backed. Inference is explicitly labeled and traced "
+    "to cited passages; no future documents are available to analysis."
+)
+_GOLDEN_REPORT_OMISSIONS = (
+    "Live prices and valuation inputs are intentionally omitted.",
+)
 _ADMINISTRATIVE_DISCLOSURE = (
     "This report is research, not an order: no margin, no forced liquidation, "
     "and human review is required for thin-liquidity ideas."
@@ -673,6 +684,8 @@ def _run_specialists(
             ),
         )
     )
+    if reviewer.verdict is not ReviewVerdict.PASS or reviewer.issues:
+        raise AssertionError("golden reviewer must pass without issues before editing")
     editor = ResearchEditor(router, store, clock=lambda: as_of).run(
         AgentTask[EditorInput](
             task_id="05-research-editor",
@@ -785,20 +798,15 @@ def _golden_report(
         metadata=ReportMetadata(
             report_id="golden-semiconductor-value-chain",
             report_type="event_update",
-            title="Semiconductor value-chain research replay",
+            title=_GOLDEN_REPORT_TITLE,
             as_of=as_of,
             inference_mode=InferenceMode.LOCAL_ONLY,
             provider=provider,
             model=model,
-            freshness=(
-                "Only sources published on or before the replay date are eligible."
-            ),
+            freshness=_GOLDEN_REPORT_FRESHNESS,
             citations=citations,
-            methodology=(
-                "Facts are fixture-backed. Inference is explicitly labeled and traced "
-                "to cited passages; no future documents are available to analysis."
-            ),
-            omissions=("Live prices and valuation inputs are intentionally omitted.",),
+            methodology=_GOLDEN_REPORT_METHODOLOGY,
+            omissions=_GOLDEN_REPORT_OMISSIONS,
             disclosure=_ADMINISTRATIVE_DISCLOSURE,
         ),
         thesis=thesis,
@@ -819,8 +827,15 @@ def assert_report_claim_binding(
     editor: ResearchEditorOutput,
 ) -> None:
     """Prove every material section is exact prose from editor-approved claims."""
-    if report.metadata.disclosure != _ADMINISTRATIVE_DISCLOSURE:
-        raise AssertionError("report disclosure must remain administrative only")
+    metadata = report.metadata
+    if (
+        metadata.title != _GOLDEN_REPORT_TITLE
+        or metadata.freshness != _GOLDEN_REPORT_FRESHNESS
+        or metadata.methodology != _GOLDEN_REPORT_METHODOLOGY
+        or metadata.omissions != _GOLDEN_REPORT_OMISSIONS
+        or metadata.disclosure != _ADMINISTRATIVE_DISCLOSURE
+    ):
+        raise AssertionError("report metadata must remain administrative only")
     editor_sections = {section.heading: section for section in editor.sections}
     if len(editor_sections) != len(editor.sections):
         raise AssertionError("editor section headings must be unique")
@@ -886,9 +901,6 @@ def build_golden_run(tmp_path: Path, *, render: bool = False) -> GoldenRun:
     assert_report_claim_binding(report, store, editor)
     artifact = None
     if render:
-        homebrew_lib = Path("/opt/homebrew/lib")
-        if homebrew_lib.is_dir():
-            os.environ.setdefault("DYLD_FALLBACK_LIBRARY_PATH", str(homebrew_lib))
         artifact = ReportRenderer(
             tmp_path / "golden-reports",
             privacy_context=PublicationPrivacyContext(
@@ -1084,9 +1096,6 @@ def run_synthetic_end_to_end(tmp_path: Path) -> SyntheticEndToEndResult:
             owner_id_factory=lambda: "golden-e2e-owner",
         ),
     )
-    homebrew_lib = Path("/opt/homebrew/lib")
-    if homebrew_lib.is_dir():
-        os.environ.setdefault("DYLD_FALLBACK_LIBRARY_PATH", str(homebrew_lib))
     with (
         patch("requests.sessions.Session.request", forbidden_http),
         patch("news_bot.email_client.send_email", forbidden_email),

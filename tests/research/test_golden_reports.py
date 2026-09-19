@@ -1,10 +1,12 @@
 import json
+import os
 import shutil
 import subprocess
 
 import pytest
 
 from news_bot.research.agents.contracts import AgentContractError
+from news_bot.research.agents.editor import ResearchEditor
 from news_bot.research.models import AgentRole, RecommendationRating, ReviewVerdict
 from tests.research import golden_harness
 
@@ -124,6 +126,44 @@ def test_editor_rejects_provider_output_with_unapproved_claim(tmp_path, monkeypa
         build_golden_run(tmp_path)
 
 
+@pytest.mark.parametrize("verdict", ("block", "revise"))
+def test_non_passing_reviewer_never_invokes_editor(tmp_path, monkeypatch, verdict):
+    original_payload = DeterministicGoldenProvider._payload
+    editor_called = False
+
+    def reviewer_requires_change(self, request):
+        payload = original_payload(self, request)
+        if request.role is AgentRole.SKEPTICAL_REVIEWER:
+            task_input = json.loads(request.canonical_evidence)["task_input"]
+            payload.update(
+                {
+                    "verdict": verdict,
+                    "issues": [
+                        {
+                            "code": "fixture.review",
+                            "message": "Fixture review requires a change.",
+                            "evidence_ids": ["passage-nvda-supply"],
+                            "target_claim_ids": [task_input["claim_ids"][0]],
+                        }
+                    ],
+                }
+            )
+        return payload
+
+    def editor_must_not_run(self, task):
+        nonlocal editor_called
+        editor_called = True
+        raise AssertionError("editor must not run after a failed review")
+
+    monkeypatch.setattr(
+        DeterministicGoldenProvider, "_payload", reviewer_requires_change
+    )
+    monkeypatch.setattr(ResearchEditor, "run", editor_must_not_run)
+    with pytest.raises(AssertionError, match="reviewer must pass without issues"):
+        run_golden_evaluation(tmp_path)
+    assert editor_called is False
+
+
 def test_report_claim_binding_rejects_unsupported_section_prose(tmp_path):
     golden_run = build_golden_run(tmp_path)
     unsupported = golden_run.report.thesis.model_copy(
@@ -136,19 +176,42 @@ def test_report_claim_binding_rejects_unsupported_section_prose(tmp_path):
         )
 
 
-def test_report_claim_binding_rejects_analytical_metadata_disclosure(tmp_path):
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("title", "BUY 500% upside is warranted."),
+        ("freshness", "BUY 500% upside is warranted."),
+        ("methodology", "BUY 500% upside is warranted."),
+        ("omissions", ("BUY 500% upside is warranted.",)),
+        ("disclosure", "BUY 500% upside is warranted."),
+    ),
+)
+def test_report_claim_binding_rejects_analytical_metadata(
+    tmp_path, field, value
+):
     golden_run = build_golden_run(tmp_path)
     metadata = golden_run.report.metadata.model_copy(
-        update={
-            "disclosure": golden_run.report.metadata.disclosure
-            + " BUY is warranted by an uncited conclusion."
-        }
+        update={field: value}
     )
     report = golden_run.report.model_copy(update={"metadata": metadata})
-    with pytest.raises(AssertionError, match="disclosure"):
+    with pytest.raises(AssertionError, match="metadata"):
         golden_harness.assert_report_claim_binding(
             report, golden_run.store, golden_run.editor
         )
+
+
+def test_golden_harness_does_not_mutate_pdf_library_environment(tmp_path, monkeypatch):
+    monkeypatch.delenv("DYLD_FALLBACK_LIBRARY_PATH", raising=False)
+
+    def unavailable_pdf(*_args, **_kwargs):
+        raise ImportError("test PDF backend unavailable")
+
+    monkeypatch.setattr(
+        golden_harness.ReportRenderer, "_atomic_pdf", unavailable_pdf
+    )
+    with pytest.raises(AssertionError, match="native PDF rendering failed"):
+        build_golden_run(tmp_path, render=True)
+    assert "DYLD_FALLBACK_LIBRARY_PATH" not in os.environ
 
 
 def test_golden_packet_is_explicitly_redistributable_and_test_authored():
