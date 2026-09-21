@@ -2,11 +2,16 @@
 
 import os
 import re
+import math
 from dataclasses import dataclass, field
+from datetime import date
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
+from collections.abc import Mapping
+from types import MappingProxyType
+from urllib.parse import urlsplit
 
-from .models import InferenceMode
+from .models import AgentRole, InferenceMode
 
 
 class ResearchConfigError(ValueError):
@@ -15,6 +20,23 @@ class ResearchConfigError(ValueError):
 
 _CRON_ATOM = re.compile(r"[A-Za-z0-9*/?,\-]+")
 _INDUSTRY_KEY = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
+_EMAIL = re.compile(r"[^\s@]+@[^\s@]+\.[^\s@]+")
+_DEFAULT_FLEX_BASE_URL = (
+    "https://ndcdyn.interactivebrokers.com/AccountManagement/FlexWebService"
+)
+_DEFAULT_MODEL_ROUTES = MappingProxyType(
+    {
+        AgentRole.RESEARCH_DIRECTOR: "gpt-5.6-sol",
+        AgentRole.PORTFOLIO_MAPPER: "gpt-5.6-terra",
+        AgentRole.EVENT_SCOUT: "gpt-5.6-luna",
+        AgentRole.EMERGING_COMPANY_SCOUT: "gpt-5.6-terra",
+        AgentRole.EVIDENCE_ANALYST: "gpt-5.6-terra",
+        AgentRole.INDUSTRY_STRATEGIST: "gpt-5.6-sol",
+        AgentRole.FUNDAMENTAL_ANALYST: "gpt-5.6-sol",
+        AgentRole.SKEPTICAL_REVIEWER: "gpt-5.6-sol",
+        AgentRole.RESEARCH_EDITOR: "gpt-5.6-sol",
+    }
+)
 
 
 def _validate_cron_part(
@@ -214,6 +236,37 @@ def _get_optional_text(name: str) -> str | None:
     return value.strip() or None
 
 
+def _get_positive_float(name: str, default: str) -> float:
+    value = os.getenv(name, default)
+    try:
+        parsed = float(value.strip())
+    except (AttributeError, ValueError):
+        raise ResearchConfigError(f"{name} must be a positive number") from None
+    if not math.isfinite(parsed) or parsed <= 0:
+        raise ResearchConfigError(f"{name} must be a positive finite number")
+    return parsed
+
+
+def _get_date(name: str, default: str) -> date:
+    value = os.getenv(name, default)
+    try:
+        return date.fromisoformat(value.strip())
+    except (AttributeError, ValueError):
+        raise ResearchConfigError(f"{name} must be an ISO date") from None
+
+
+def _model_routes_from_env() -> Mapping[AgentRole, str]:
+    return MappingProxyType(
+        {
+            role: _get_text(
+                f"MODEL_ROUTE_{role.value.upper()}",
+                _DEFAULT_MODEL_ROUTES[role],
+            )
+            for role in AgentRole
+        }
+    )
+
+
 @dataclass(frozen=True)
 class ResearchConfig:
     """Typed settings required by research foundation components."""
@@ -226,6 +279,13 @@ class ResearchConfig:
     ollama_model: str
     budget_soft_usd: Decimal
     budget_hard_usd: Decimal
+    ollama_health_timeout_seconds: float = 60.0
+    model_routes: Mapping[AgentRole, str] = field(
+        default_factory=lambda: _DEFAULT_MODEL_ROUTES
+    )
+    model_price_effective_until: date = date(2026, 12, 31)
+    source_max_staleness_hours: float = 168.0
+    sec_user_agent: str = "PortfolioResearchBot/1.0 research@example.com"
     daily_schedule: CronSchedule = CronSchedule.from_crontab("0 7 * * mon-fri")
     weekly_schedule: CronSchedule = CronSchedule.from_crontab("0 8 * * mon")
     monthly_schedule: CronSchedule = CronSchedule.from_crontab("0 9 1 * *")
@@ -233,6 +293,9 @@ class ResearchConfig:
     ibkr_flex_token: str | None = field(default=None, repr=False)
     ibkr_flex_query_id: str | None = field(default=None, repr=False)
     ibkr_flex_account_salt: str | None = field(default=None, repr=False)
+    ibkr_flex_base_url: str = _DEFAULT_FLEX_BASE_URL
+    ibkr_flex_poll_timeout_seconds: float = 120.0
+    portfolio_max_staleness_hours: float = 24.0
 
     def __post_init__(self) -> None:
         self.validate()
@@ -279,6 +342,20 @@ class ResearchConfig:
                 "OLLAMA_BASE_URL", "http://localhost:11434"
             ),
             ollama_model=_get_text("OLLAMA_RESEARCH_MODEL", "llama3.1:8b"),
+            ollama_health_timeout_seconds=_get_positive_float(
+                "OLLAMA_HEALTH_TIMEOUT_SECONDS", "60"
+            ),
+            model_routes=_model_routes_from_env(),
+            model_price_effective_until=_get_date(
+                "MODEL_PRICE_EFFECTIVE_UNTIL", "2026-12-31"
+            ),
+            source_max_staleness_hours=_get_positive_float(
+                "SOURCE_MAX_STALENESS_HOURS", "168"
+            ),
+            sec_user_agent=_get_text(
+                "SEC_USER_AGENT",
+                "PortfolioResearchBot/1.0 research@example.com",
+            ),
             budget_soft_usd=_get_decimal("MODEL_BUDGET_SOFT_USD", "4.00"),
             budget_hard_usd=_get_decimal("MODEL_BUDGET_HARD_USD", "5.00"),
             daily_schedule=CronSchedule.from_crontab(
@@ -302,6 +379,15 @@ class ResearchConfig:
             ),
             ibkr_flex_account_salt=(
                 _read_secret("IBKR_FLEX_ACCOUNT_SALT") if include_flex else None
+            ),
+            ibkr_flex_base_url=_get_text(
+                "IBKR_FLEX_BASE_URL", _DEFAULT_FLEX_BASE_URL
+            ),
+            ibkr_flex_poll_timeout_seconds=_get_positive_float(
+                "IBKR_FLEX_POLL_TIMEOUT_SECONDS", "120"
+            ),
+            portfolio_max_staleness_hours=_get_positive_float(
+                "PORTFOLIO_MAX_STALENESS_HOURS", "24"
             ),
         )
 
@@ -353,9 +439,72 @@ class ResearchConfig:
         for field_name, value in (
             ("ollama_base_url", self.ollama_base_url),
             ("ollama_model", self.ollama_model),
+            ("sec_user_agent", self.sec_user_agent),
         ):
             if not isinstance(value, str) or not value.strip():
                 raise ResearchConfigError(f"{field_name} must be non-empty")
+
+        for field_name, value in (
+            ("ollama_health_timeout_seconds", self.ollama_health_timeout_seconds),
+            ("source_max_staleness_hours", self.source_max_staleness_hours),
+            (
+                "ibkr_flex_poll_timeout_seconds",
+                self.ibkr_flex_poll_timeout_seconds,
+            ),
+            ("portfolio_max_staleness_hours", self.portfolio_max_staleness_hours),
+        ):
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                or value <= 0
+            ):
+                raise ResearchConfigError(f"{field_name} must be positive and finite")
+
+        if type(self.model_price_effective_until) is not date:
+            raise ResearchConfigError("model_price_effective_until must be date")
+        if not isinstance(self.model_routes, Mapping) or set(self.model_routes) != set(
+            AgentRole
+        ):
+            raise ResearchConfigError("model_routes must configure every agent role")
+        routes = dict(self.model_routes)
+        if any(
+            not isinstance(role, AgentRole)
+            or not isinstance(model, str)
+            or not model.strip()
+            or "\n" in model
+            or "\r" in model
+            for role, model in routes.items()
+        ):
+            raise ResearchConfigError("model_routes contain an invalid model")
+        object.__setattr__(self, "model_routes", MappingProxyType(routes))
+
+        try:
+            flex_url = urlsplit(self.ibkr_flex_base_url)
+        except (TypeError, ValueError):
+            flex_url = None
+        if (
+            flex_url is None
+            or flex_url.scheme != "https"
+            or flex_url.hostname not in {
+                "ndcdyn.interactivebrokers.com",
+                "gdcdyn.interactivebrokers.com",
+            }
+            or flex_url.port not in (None, 443)
+            or flex_url.username is not None
+            or flex_url.password is not None
+            or flex_url.query
+            or flex_url.fragment
+            or flex_url.path.rstrip("/")
+            != "/AccountManagement/FlexWebService"
+        ):
+            raise ResearchConfigError("ibkr_flex_base_url is not an approved endpoint")
+        if (
+            "\n" in self.sec_user_agent
+            or "\r" in self.sec_user_agent
+            or _EMAIL.search(self.sec_user_agent) is None
+        ):
+            raise ResearchConfigError("sec_user_agent must include an email address")
 
         for field_name, value in (
             ("budget_soft_usd", self.budget_soft_usd),

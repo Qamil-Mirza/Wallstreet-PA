@@ -125,6 +125,7 @@ class FlexConfig:
     send_url: str = DEFAULT_SEND_URL
     statement_url: str = DEFAULT_STATEMENT_URL
     max_polls: int = 5
+    poll_timeout_seconds: float = 120.0
     request_timeout_seconds: float = 30.0
     max_response_bytes: int = 5 * 1024 * 1024
     user_agent: str = "Java"
@@ -142,6 +143,8 @@ class FlexConfig:
                 raise ValueError("account_salt must be at least 16 UTF-8 bytes")
         if not isinstance(self.max_polls, int) or isinstance(self.max_polls, bool) or self.max_polls <= 0:
             raise ValueError("max_polls must be a positive integer")
+        if not _positive_finite(self.poll_timeout_seconds):
+            raise ValueError("poll_timeout_seconds must be positive and finite")
         if not _positive_finite(self.request_timeout_seconds):
             raise ValueError("request_timeout_seconds must be positive and finite")
         if not isinstance(self.max_response_bytes, int) or isinstance(self.max_response_bytes, bool) or self.max_response_bytes <= 0:
@@ -724,6 +727,7 @@ class FlexClient:
         session: requests.Session | None = None,
         sleeper: Callable[[float], None] = time.sleep,
         clock: Callable[[], datetime] = _utc_now,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self.config = config
         self._owns_session = session is None
@@ -732,6 +736,8 @@ class FlexClient:
             self.session.trust_env = False
         self.sleeper = sleeper
         self.clock = clock
+        self.monotonic = monotonic
+        self._poll_deadline: float | None = None
         _install_http_log_redaction()
 
     def close(self) -> None:
@@ -748,11 +754,19 @@ class FlexClient:
     def _get(self, url: str, params: dict[str, str]) -> bytes:
         response: requests.Response | None = None
         try:
+            timeout = self.config.request_timeout_seconds
+            if self._poll_deadline is not None:
+                remaining = self._poll_deadline - self.monotonic()
+                if remaining <= 0:
+                    raise FlexPollingExhaustedError(
+                        "IBKR Flex polling timeout was exhausted"
+                    )
+                timeout = min(timeout, remaining)
             response = self.session.get(
                 url,
                 params=params,
                 headers={"User-Agent": self.config.user_agent},
-                timeout=self.config.request_timeout_seconds,
+                timeout=timeout,
                 allow_redirects=False,
                 stream=True,
             )
@@ -820,33 +834,42 @@ class FlexClient:
         statement_url = _validate_url(statement_url, self.config)
 
         statement_body: bytes | None = None
-        for attempt in range(self.config.max_polls):
-            candidate = self._get(
-                statement_url,
-                {"t": self.config.token, "q": reference_code, "v": "3"},
-            )
-            root = _safe_xml_root(candidate, self.config.max_response_bytes)
-            root_name = _local_name(root.tag)
-            if root_name == "FlexQueryResponse":
-                statement_body = candidate
-                break
-            if root_name != "FlexStatementResponse":
-                raise FlexMalformedStatementError("Unexpected GetStatement response type")
-            error_code = _direct_text(root, "ErrorCode")
-            if not error_code:
-                raise FlexMalformedStatementError("GetStatement error response is incomplete")
-            try:
-                error = FlexError.from_code(int(error_code))
-            except ValueError:
-                raise FlexMalformedStatementError("Invalid Flex error code") from None
-            if not isinstance(error, FlexNotReadyError):
-                raise error
-            if attempt + 1 == self.config.max_polls:
-                raise FlexPollingExhaustedError(
-                    f"IBKR Flex statement was not ready after {self.config.max_polls} polls",
-                    code=1019,
+        self._poll_deadline = self.monotonic() + self.config.poll_timeout_seconds
+        try:
+            for attempt in range(self.config.max_polls):
+                candidate = self._get(
+                    statement_url,
+                    {"t": self.config.token, "q": reference_code, "v": "3"},
                 )
-            self.sleeper(min(2**attempt, 16))
+                root = _safe_xml_root(candidate, self.config.max_response_bytes)
+                root_name = _local_name(root.tag)
+                if root_name == "FlexQueryResponse":
+                    statement_body = candidate
+                    break
+                if root_name != "FlexStatementResponse":
+                    raise FlexMalformedStatementError("Unexpected GetStatement response type")
+                error_code = _direct_text(root, "ErrorCode")
+                if not error_code:
+                    raise FlexMalformedStatementError("GetStatement error response is incomplete")
+                try:
+                    error = FlexError.from_code(int(error_code))
+                except ValueError:
+                    raise FlexMalformedStatementError("Invalid Flex error code") from None
+                if not isinstance(error, FlexNotReadyError):
+                    raise error
+                if attempt + 1 == self.config.max_polls:
+                    raise FlexPollingExhaustedError(
+                        f"IBKR Flex statement was not ready after {self.config.max_polls} polls",
+                        code=1019,
+                    )
+                remaining = self._poll_deadline - self.monotonic()
+                if remaining <= 0:
+                    raise FlexPollingExhaustedError(
+                        "IBKR Flex polling timeout was exhausted", code=1019
+                    )
+                self.sleeper(min(2**attempt, 16, remaining))
+        finally:
+            self._poll_deadline = None
 
         if statement_body is None:  # Defensive; the loop exits by return/error above.
             raise FlexPollingExhaustedError("IBKR Flex polling ended without a statement")

@@ -34,6 +34,7 @@ from news_bot.research.models import (
     Position,
     RecommendationRating,
     ReviewVerdict,
+    SourceDocument,
 )
 from news_bot.research.orchestrator import (
     DurableTaskView,
@@ -47,7 +48,11 @@ from news_bot.research.orchestrator import (
 )
 from news_bot.research.quality import PublicationVerdict, QualityGateResult
 from news_bot.research.reports import ReportRenderer
-from news_bot.research.runtime import RuntimeFactories, RuntimeStageRunner
+from news_bot.research.runtime import (
+    RuntimeFactories,
+    RuntimeStageRunner,
+    RuntimeWorkflowService,
+)
 from news_bot.research.scheduler import (
     RunAlreadyActive,
     RunLease,
@@ -948,13 +953,6 @@ def test_default_composition_persists_fail_closed_source_outcome(
     "result,persist",
     [
         (SimpleNamespace(snapshot=portfolio_sync_result().snapshot), True),
-        (portfolio_sync_result(stale=True), True),
-        (
-            portfolio_sync_result(
-                as_of=datetime(2026, 8, 23, tzinfo=timezone.utc)
-            ),
-            True,
-        ),
         (
             portfolio_sync_result(
                 as_of=datetime(2026, 8, 25, tzinfo=timezone.utc)
@@ -991,6 +989,132 @@ def test_portfolio_stage_rejects_untrusted_or_inconsistent_sync_results(
         assert connection.execute(
             "SELECT stage, state FROM workflow_tasks ORDER BY ordinal LIMIT 1"
         ).fetchone() == ("portfolio", "failed")
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        portfolio_sync_result(stale=True),
+        portfolio_sync_result(
+            as_of=datetime(2026, 8, 23, tzinfo=timezone.utc),
+            stale=True,
+        ),
+    ],
+)
+def test_portfolio_stage_continues_with_stale_snapshot_and_suppresses_sizing(
+    tmp_path: Path, result: PortfolioSyncResult
+) -> None:
+    config = replace(
+        research_config(tmp_path),
+        ibkr_flex_token="read-only-token",
+        ibkr_flex_query_id="query-id",
+        ibkr_flex_account_salt="0123456789abcdef",
+    )
+    services = default_services(
+        config_loader=lambda: config,
+        runtime_factories=RuntimeFactories(
+            flex_client_factory=lambda _config: PersistingFlexClient(result),
+            owner_id_factory=lambda: "stale-flex-owner",
+        ),
+    )
+
+    assert main(["daily", "--as-of", "2026-08-24"], services=services) == ExitCode.BLOCKED
+
+    with ResearchStore(config.database_path).connect() as connection:
+        state, outcome_json = connection.execute(
+            "SELECT state, outcome_json FROM workflow_tasks "
+            "WHERE stage = 'portfolio'"
+        ).fetchone()
+    outcome = StageOutcome.model_validate_json(outcome_json)
+    assert state == "completed"
+    assert outcome.result_ref == result.snapshot.snapshot_id
+    assert outcome.omissions == ("portfolio_stale",)
+
+
+def test_flex_failure_reuses_last_successful_snapshot_as_stale(
+    tmp_path: Path,
+) -> None:
+    config = replace(
+        research_config(tmp_path),
+        ibkr_flex_token="read-only-token",
+        ibkr_flex_query_id="query-id",
+        ibkr_flex_account_salt="0123456789abcdef",
+    )
+    store = ResearchStore(config.database_path)
+    store.migrate()
+    prior = portfolio_sync_result(
+        as_of=datetime(2026, 8, 23, tzinfo=timezone.utc)
+    )
+    store.insert_portfolio_snapshot(
+        prior.snapshot, prior.positions, prior.account_ref
+    )
+
+    class FailingFlexClient:
+        def sync(self, _store):
+            raise FlexTransportError("transport unavailable")
+
+        def close(self):
+            return None
+
+    services = default_services(
+        config_loader=lambda: config,
+        store_factory=lambda _config: store,
+        runtime_factories=RuntimeFactories(
+            flex_client_factory=lambda _config: FailingFlexClient(),
+            owner_id_factory=lambda: "fallback-flex-owner",
+        ),
+    )
+
+    assert main(["daily", "--as-of", "2026-08-24"], services=services) == ExitCode.BLOCKED
+
+    with store.connect() as connection:
+        state, outcome_json = connection.execute(
+            "SELECT state, outcome_json FROM workflow_tasks "
+            "WHERE stage = 'portfolio'"
+        ).fetchone()
+    outcome = StageOutcome.model_validate_json(outcome_json)
+    assert state == "completed"
+    assert outcome.result_ref == prior.snapshot.snapshot_id
+    assert outcome.omissions == ("portfolio_stale",)
+
+
+def test_runtime_passes_historical_source_hashes_into_workflow_identity(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config = research_config(tmp_path)
+    store = ResearchStore(config.database_path)
+    store.migrate()
+    digest = "a" * 64
+    store.insert_source_document(
+        SourceDocument(
+            document_id="document-runtime-source",
+            source_type="sec_filing_metadata",
+            canonical_url="https://example.com/source",
+            publisher="Example",
+            published_at=datetime(2026, 8, 23, tzinfo=timezone.utc),
+            retrieved_at=datetime(2026, 8, 23, tzinfo=timezone.utc),
+            content_hash=digest,
+            raw_content_path=None,
+            extraction_status="complete",
+        )
+    )
+    captured: dict[str, object] = {}
+
+    class RecordingOrchestrator:
+        def run_daily(self, **kwargs):
+            captured.update(kwargs)
+            return FakeResult()
+
+    service = RuntimeWorkflowService(config, store)
+    monkeypatch.setattr(
+        service,
+        "_orchestrator",
+        lambda **_kwargs: RecordingOrchestrator(),
+    )
+
+    service.run_daily(as_of=datetime(2026, 8, 24, tzinfo=timezone.utc))
+
+    assert captured["source_hashes"] == (digest,)
 
 
 def test_portfolio_stage_accepts_real_flex_nullable_snapshot_freshness(

@@ -1,7 +1,7 @@
 """Tests for research configuration and foundational domain types."""
 
 from dataclasses import FrozenInstanceError, replace
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 
@@ -33,6 +33,13 @@ def clear_research_environment(monkeypatch):
         "RESEARCH_DATA_DIR",
         "OLLAMA_BASE_URL",
         "OLLAMA_RESEARCH_MODEL",
+        "OLLAMA_HEALTH_TIMEOUT_SECONDS",
+        "IBKR_FLEX_BASE_URL",
+        "IBKR_FLEX_POLL_TIMEOUT_SECONDS",
+        "PORTFOLIO_MAX_STALENESS_HOURS",
+        "SOURCE_MAX_STALENESS_HOURS",
+        "SEC_USER_AGENT",
+        "MODEL_PRICE_EFFECTIVE_UNTIL",
         "MODEL_BUDGET_SOFT_USD",
         "MODEL_BUDGET_HARD_USD",
         "RESEARCH_DAILY_SCHEDULE",
@@ -45,6 +52,7 @@ def clear_research_environment(monkeypatch):
         "IBKR_FLEX_QUERY_ID_FILE",
         "IBKR_FLEX_ACCOUNT_SALT",
         "IBKR_FLEX_ACCOUNT_SALT_FILE",
+        *(f"MODEL_ROUTE_{role.value.upper()}" for role in AgentRole),
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -70,6 +78,50 @@ def test_missing_openai_key_selects_local_only(monkeypatch, tmp_path):
     config = ResearchConfig.from_env()
     assert config.inference_mode is InferenceMode.LOCAL_ONLY
     assert config.ollama_base_url == "http://localhost:11434"
+
+
+def test_advertised_runtime_policy_is_typed_from_environment(monkeypatch):
+    monkeypatch.setenv(
+        "IBKR_FLEX_BASE_URL",
+        "https://ndcdyn.interactivebrokers.com/AccountManagement/FlexWebService",
+    )
+    monkeypatch.setenv("IBKR_FLEX_POLL_TIMEOUT_SECONDS", "75")
+    monkeypatch.setenv("PORTFOLIO_MAX_STALENESS_HOURS", "36")
+    monkeypatch.setenv("SOURCE_MAX_STALENESS_HOURS", "96")
+    monkeypatch.setenv("OLLAMA_HEALTH_TIMEOUT_SECONDS", "45")
+    monkeypatch.setenv("SEC_USER_AGENT", "Research Bot research@example.com")
+    monkeypatch.setenv("MODEL_PRICE_EFFECTIVE_UNTIL", "2027-01-31")
+    monkeypatch.setenv("MODEL_ROUTE_EVENT_SCOUT", "gpt-route-scout")
+
+    config = ResearchConfig.from_env()
+
+    assert config.ibkr_flex_base_url.endswith("/FlexWebService")
+    assert config.ibkr_flex_poll_timeout_seconds == 75.0
+    assert config.portfolio_max_staleness_hours == 36.0
+    assert config.source_max_staleness_hours == 96.0
+    assert config.ollama_health_timeout_seconds == 45.0
+    assert config.sec_user_agent == "Research Bot research@example.com"
+    assert config.model_price_effective_until == date(2027, 1, 31)
+    assert config.model_routes[AgentRole.EVENT_SCOUT] == "gpt-route-scout"
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("IBKR_FLEX_POLL_TIMEOUT_SECONDS", "zero"),
+        ("PORTFOLIO_MAX_STALENESS_HOURS", "0"),
+        ("SOURCE_MAX_STALENESS_HOURS", "NaN"),
+        ("OLLAMA_HEALTH_TIMEOUT_SECONDS", "-1"),
+        ("MODEL_PRICE_EFFECTIVE_UNTIL", "not-a-date"),
+    ],
+)
+def test_advertised_runtime_policy_rejects_invalid_environment(
+    monkeypatch, name, value
+):
+    monkeypatch.setenv(name, value)
+
+    with pytest.raises(ResearchConfigError, match=name):
+        ResearchConfig.from_env()
 
 
 def test_scheduler_cron_settings_are_typed_from_environment(monkeypatch):

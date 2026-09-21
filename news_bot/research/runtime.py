@@ -229,15 +229,12 @@ class RuntimeStageRunner:
         snapshot = result.snapshot
         if (
             freshness is None
-            or freshness.is_stale
-            or snapshot.is_stale is True
-            or snapshot.as_of.astimezone(timezone.utc).date()
-            != requested_as_of.astimezone(timezone.utc).date()
+            or snapshot.as_of > requested_as_of
             or snapshot.as_of > result.generated_at
             or result.generated_at > freshness.evaluated_at
         ):
             raise RequiredStageUnavailable(
-                "portfolio source is stale or inconsistent"
+                "portfolio source is inconsistent"
             )
         with self.store.connect() as connection:
             row = connection.execute(
@@ -334,6 +331,16 @@ class RuntimeStageRunner:
             )
         return result
 
+    def _last_snapshot_ref(self, requested_as_of: datetime) -> str | None:
+        """Return the latest durable snapshot available at the research cutoff."""
+        with self.store.connect() as connection:
+            row = connection.execute(
+                "SELECT snapshot_id FROM portfolio_snapshots "
+                "WHERE as_of <= ? ORDER BY as_of DESC, snapshot_id DESC LIMIT 1",
+                (_utc_text(requested_as_of),),
+            ).fetchone()
+        return None if row is None else row[0]
+
     def _portfolio(
         self, context: StageContext, control: StageExecutionControl
     ) -> StageOutcome:
@@ -345,6 +352,12 @@ class RuntimeStageRunner:
             token=self.config.ibkr_flex_token or "",
             query_id=self.config.ibkr_flex_query_id or "",
             account_salt=self.config.ibkr_flex_account_salt or "",
+            send_url=f"{self.config.ibkr_flex_base_url.rstrip('/')}/SendRequest",
+            statement_url=(
+                f"{self.config.ibkr_flex_base_url.rstrip('/')}/GetStatement"
+            ),
+            poll_timeout_seconds=self.config.ibkr_flex_poll_timeout_seconds,
+            max_staleness_hours=self.config.portfolio_max_staleness_hours,
         )
         client: FlexSyncClient | None = None
         try:
@@ -353,16 +366,29 @@ class RuntimeStageRunner:
             sync_result = client.sync(self.store)
             control.checkpoint()
         except FlexError:
-            raise RequiredStageUnavailable(
-                "required portfolio source is unavailable"
-            ) from None
+            fallback_ref = self._last_snapshot_ref(context.as_of)
+            if fallback_ref is None:
+                raise RequiredStageUnavailable(
+                    "required portfolio source is unavailable"
+                ) from None
+            return StageOutcome(
+                result_ref=fallback_ref,
+                omissions=("portfolio_stale",),
+            )
         finally:
             if client is not None:
                 client.close()
         validated = self._validated_portfolio_result(
             sync_result, context.as_of
         )
-        return StageOutcome(result_ref=validated.snapshot.snapshot_id)
+        is_stale = bool(
+            validated.freshness.is_stale
+            or validated.snapshot.is_stale is True
+        )
+        return StageOutcome(
+            result_ref=validated.snapshot.snapshot_id,
+            omissions=("portfolio_stale",) if is_stale else (),
+        )
 
     @staticmethod
     def _synthetic_ref(context: StageContext) -> str:
@@ -693,6 +719,16 @@ class RuntimeWorkflowService:
             owner_id=self.factories.owner_id_factory(),
         )
 
+    def _source_hashes(self, as_of: datetime) -> tuple[str, ...]:
+        return tuple(
+            sorted(
+                {
+                    document.content_hash
+                    for document in self.store.list_documents_as_of(as_of)
+                }
+            )
+        )
+
     def run_daily(
         self,
         *,
@@ -702,16 +738,24 @@ class RuntimeWorkflowService:
     ) -> WorkflowRunResult:
         return self._orchestrator(
             synthetic_portfolio=synthetic_portfolio
-        ).run_daily(as_of=as_of, dry_run=dry_run)
+        ).run_daily(
+            as_of=as_of,
+            source_hashes=self._source_hashes(as_of),
+            dry_run=dry_run,
+        )
 
     def run_weekly(self, *, as_of: datetime) -> WorkflowRunResult:
-        return self._orchestrator().run_weekly(as_of=as_of)
+        return self._orchestrator().run_weekly(
+            as_of=as_of, source_hashes=self._source_hashes(as_of)
+        )
 
     def run_monthly(
         self, *, as_of: datetime, industry_key: str
     ) -> WorkflowRunResult:
         return self._orchestrator().run_monthly(
-            as_of=as_of, industry_key=industry_key
+            as_of=as_of,
+            industry_key=industry_key,
+            source_hashes=self._source_hashes(as_of),
         )
 
     def run_backfill(
@@ -724,6 +768,7 @@ class RuntimeWorkflowService:
         return self._orchestrator().run_backfill(
             as_of=as_of,
             max_documents=max_documents,
+            source_hashes=self._source_hashes(as_of),
             authorize_analysis=authorize_analysis,
         )
 

@@ -326,6 +326,8 @@ def test_flex_config_hides_sensitive_fields_and_validates_limits(flex_config):
     assert ACCOUNT_SALT not in rendered
     with pytest.raises(ValueError, match="max_polls"):
         replace(flex_config, max_polls=0)
+    with pytest.raises(ValueError, match="poll_timeout_seconds"):
+        replace(flex_config, poll_timeout_seconds=0)
     with pytest.raises(ValueError, match="HTTPS"):
         replace(flex_config, send_url="http://ndcdyn.interactivebrokers.com/send")
 
@@ -661,6 +663,26 @@ def test_1019_exhaustion_uses_exact_poll_limit(requests_mock, flex_config):
 
     with pytest.raises(FlexPollingExhaustedError, match="2 polls"):
         FlexClient(config, sleeper=lambda _: None).sync()
+
+    assert len(requests_mock.request_history) == 3
+
+
+def test_1019_polling_honors_total_timeout(requests_mock, flex_config):
+    config = replace(flex_config, max_polls=5, poll_timeout_seconds=2)
+    requests_mock.get(config.send_url, text=fixture("ibkr_send_success.xml"))
+    requests_mock.get(config.statement_url, text=_error_xml(1019))
+    requests_mock.get(config.statement_url, text=_error_xml(1019))
+    clock = [0.0]
+
+    def sleep(seconds: float) -> None:
+        clock[0] += seconds
+
+    with pytest.raises(FlexPollingExhaustedError, match="timeout"):
+        FlexClient(
+            config,
+            sleeper=sleep,
+            monotonic=lambda: clock[0],
+        ).sync()
 
     assert len(requests_mock.request_history) == 3
 
