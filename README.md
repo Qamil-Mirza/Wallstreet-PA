@@ -248,7 +248,7 @@ automation, and no sizing that assumes an immediate exit. Thinly traded names
 and unavailable cash should be flagged for human review, not converted into an
 action.
 
-### Verification evidence (2026-09-14)
+### Verification evidence (2026-09-21)
 
 The deterministic golden packet is test-authored, CC0-licensed fixture content
 that paraphrases raw facts from public issuer filings and releases. It does not
@@ -262,32 +262,68 @@ Evidence captured from the project Python 3.11 environment:
 
 ```text
 /Users/qamilmirza/Code/newsletter/venv/bin/python -m pytest tests/research/test_golden_reports.py tests/research/test_historical_replay.py tests/research/test_claim_trace.py tests/research/test_end_to_end.py -q
-9 passed in 5.21s
+30 passed in 13.13s
 
 DYLD_FALLBACK_LIBRARY_PATH=/opt/homebrew/lib /Users/qamilmirza/Code/newsletter/venv/bin/python -m pytest -q
-1698 passed, 3 skipped, 1 warning in 334.20s
+1719 passed, 3 skipped, 1 warning in 212.40s
+
+DYLD_FALLBACK_LIBRARY_PATH=/opt/homebrew/lib /Users/qamilmirza/Code/newsletter/venv/bin/python -m pytest --cov=news_bot --cov-report=term-missing -q
+1719 passed, 3 skipped, 1 warning in 228.32s; 88% overall coverage
+
+python -m coverage report --include='news_bot/research/budget.py,...'
+90% coverage across the critical research slice
 
 docker compose config --quiet
 exit 0
+
+docker compose --profile runner --profile test --profile newsletter config --quiet
+exit 0
+
+docker compose --profile test build test
+ARM64/Linux development image built successfully (2026-09-19)
+
+docker compose --profile test run --rm test python -m pytest -q
+1720 passed, 2 skipped, 2 warnings in 162.54s
+
+docker compose --profile runner build research-runner
+ARM64/Linux production image built successfully (2026-09-19)
+
+OLLAMA_RESEARCH_MODEL=smollm2:135m docker compose --profile runner run --rm research-runner dry-run --synthetic-portfolio --as-of 2026-08-24
+research command=dry-run status=partial reports=1 omissions=1
 ```
 
-The three skips are APScheduler parity checks because APScheduler is absent
-from this host virtualenv. The one expected warning is pydub importing Python's
-deprecated `audioop` module; it is unrelated to portfolio research. A Docker
-image was not rebuilt in this Task 16 host checkpoint, so no new image build
-date is claimed here; the final Docker matrix remains a separate verification
-step.
+The three host skips are optional APScheduler parity checks because APScheduler
+is absent from the host virtualenv. The host warning is pydub importing
+Python's deprecated `audioop` module. In Docker, APScheduler is installed; the
+two skips are Docker self-inspection checks whose host-only files are not copied
+into the image. Docker also reports the pydub warning and the expected absence
+of ffmpeg from the lightweight research-test image. None affects the research
+runtime.
 
-The synthetic dry run generated artifacts only under
-`/private/tmp/newsletter-task16-inspection.T1aCm7/reports/`: one 4,860-byte
-HTML report and one 59-byte deterministic PDF-signature test artifact. Manual
-inspection confirmed the thesis-first structure, citation and disclosure
-sections, local/offline inference metadata, explicit dry-run publication
-omission, and absence of exact account identifiers or NAV. The PDF backend is
-replaced only at the native rendering seam in this offline acceptance test;
-the production `RuntimeWorkflowService`, SQLite workflow, privacy renderer,
-and artifact paths remain real. No HTTP, IBKR Flex, order/trade, SMTP, or email
-call was made.
+The production synthetic dry run wrote a 4,863-byte HTML report and a
+20,641-byte, two-page PDF produced by WeasyPrint 69.0 to the named report
+volume. Their SHA-256 digests are
+`5b316aadc365049961eda31ecf03f70b208eb19cc376a3c9d6178969f7a8ba4f`
+and `ccb916ae78b72e6d5048768f74c514ed70a809cf58f8ba8d9ef0460164de2069`,
+respectively. Manual visual and text inspection confirmed the thesis-first
+structure, citations, methodology, omissions, disclosure, local-only inference
+metadata, explicit dry-run publication omission, and absence of exact account
+identifiers or NAV.
+
+The richer offline golden run produced a 6,366-byte HTML report and a
+25,852-byte, two-page WeasyPrint PDF. It passed skeptical review, cost
+`$0.001845`, and visibly reconciled its rounded exposure exhibit to `100.0%`.
+The report also includes the HOLD conclusion for the low-liquidity posture,
+counter-thesis, claim-to-passage provenance, historical cutoff disclosure, and
+the no-order/no-margin warning.
+
+SQLite inspection after the Docker dry run showed seven completed workflow
+stages and one deferred publication stage, a reviewed but unpublished report,
+and `publication_dry_run` as the sole omission. There were zero model-usage
+rows, budget reservations, provider attempts, or publication effects, so the
+production synthetic run incurred `$0.00`. The isolated acceptance harness
+also recorded zero emails and zero order/trade requests; no external effect was
+created.
 
 ## Deployment
 
