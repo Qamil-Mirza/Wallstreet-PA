@@ -342,6 +342,7 @@ class StageContext(FrozenWorkflowContract):
     dry_run: StrictBool = False
     recommendation_triggers: tuple[RecommendationTrigger, ...] = ()
     publication_effect_key: str | None = None
+    assigned_role: AgentRole | None = None
     task_lease_token: str
 
     _workflow_id = field_validator("workflow_id")(_identifier)
@@ -1683,6 +1684,9 @@ class ResearchOrchestrator:
                 publication_effect_key=(
                     None if publication_effect is None
                     else publication_effect.effect_key
+                ),
+                assigned_role=(
+                    None if next_row[6] is None else AgentRole(next_row[6])
                 ),
                 task_lease_token=claim.lease_token,
             )

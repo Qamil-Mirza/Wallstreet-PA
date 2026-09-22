@@ -761,7 +761,8 @@ class FlexClient:
                     raise FlexPollingExhaustedError(
                         "IBKR Flex polling timeout was exhausted"
                     )
-                timeout = min(timeout, remaining)
+                bounded = min(timeout, remaining)
+                timeout = (bounded, min(bounded, 1.0))
             response = self.session.get(
                 url,
                 params=params,

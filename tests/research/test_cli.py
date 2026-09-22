@@ -1111,6 +1111,28 @@ def test_stale_portfolio_cannot_authorize_rating_or_sizing(
     assert gate.publication_verdict is PublicationVerdict.PARTIAL
 
 
+def test_non_portfolio_review_does_not_require_a_portfolio_task(
+    tmp_path: Path,
+) -> None:
+    config = research_config(tmp_path)
+    store = ResearchStore(config.database_path)
+    store.migrate()
+    runner = RuntimeStageRunner(config, store, RuntimeFactories())
+    context = SimpleNamespace(
+        stage="review",
+        workflow_id="monthly-workflow",
+        workflow_kind=WorkflowKind.MONTHLY,
+    )
+    outcome = StageOutcome(
+        result_ref="monthly-review",
+        reviewer_verdict=ReviewVerdict.PASS,
+        quality_gate=_passing_quality_gate(),
+        published_claim_ids=("synthetic-claim",),
+    )
+
+    assert runner._enforce_stale_portfolio_gate(context, outcome) is outcome
+
+
 def test_flex_failure_reuses_last_successful_snapshot_as_stale(
     tmp_path: Path,
 ) -> None:
@@ -1299,6 +1321,38 @@ def test_runtime_includes_current_ingestion_preview_in_workflow_identity(
     service.run_daily(as_of=datetime(2026, 8, 24, tzinfo=timezone.utc))
 
     assert captured["source_hashes"] == (historical, current)
+
+
+def test_non_daily_workflows_never_preview_daily_ingestion_sources(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config = research_config(tmp_path)
+    store = ResearchStore(config.database_path)
+    store.migrate()
+    captured: dict[str, object] = {}
+
+    class IngestionAdapter:
+        def preview_source_hashes(self, _as_of):
+            raise AssertionError("weekly workflow must not preview daily ingestion")
+
+        def run(self, context, control):
+            raise AssertionError("the recording orchestrator does not run stages")
+
+    class RecordingOrchestrator:
+        def run_weekly(self, **kwargs):
+            captured.update(kwargs)
+            return FakeResult(workflow_kind=WorkflowKind.WEEKLY)
+
+    service = RuntimeWorkflowService(
+        config,
+        store,
+        RuntimeFactories(stage_adapters={"ingestion": IngestionAdapter()}),
+    )
+    monkeypatch.setattr(service, "_orchestrator", lambda **_kwargs: RecordingOrchestrator())
+
+    service.run_weekly(as_of=datetime(2026, 8, 24, tzinfo=timezone.utc))
+
+    assert captured["source_hashes"] == ()
 
 
 def test_portfolio_stage_accepts_real_flex_nullable_snapshot_freshness(

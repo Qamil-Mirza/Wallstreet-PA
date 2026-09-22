@@ -83,18 +83,26 @@ def _config(tmp_path: Path) -> ResearchConfig:
     )
 
 
-def _context(stage: str, *, dependency_refs: tuple[str, ...] = ()) -> StageContext:
+def _context(
+    stage: str,
+    *,
+    dependency_refs: tuple[str, ...] = (),
+    source_hashes: tuple[str, ...] = (),
+    workflow_kind: WorkflowKind = WorkflowKind.DAILY,
+    assigned_role: AgentRole | None = None,
+) -> StageContext:
     return StageContext(
         workflow_id="workflow-production-test",
-        workflow_kind=WorkflowKind.DAILY,
+        workflow_kind=workflow_kind,
         task_id=f"task-{stage}",
         stage=stage,
         as_of=NOW,
         period_key="2026-08-24",
-        source_hashes=(),
+        source_hashes=source_hashes,
         dependency_result_refs=dependency_refs,
         task_lease_token="a" * 64,
         publication_effect_key="b" * 64 if stage == "publish" else None,
+        assigned_role=assigned_role,
     )
 
 
@@ -329,8 +337,11 @@ def test_ingestion_adapter_uses_connector_and_evidence_store_before_checkpoint(
         checkpoints=checkpoints,
     )
 
-    outcome = build_production_stage_adapters(components)["ingestion"].run(
-        _context("ingestion"), StageExecutionControl(task_id="task-ingestion")
+    adapter = build_production_stage_adapters(components)["ingestion"]
+    hashes = adapter.preview_source_hashes(NOW)
+    outcome = adapter.run(
+        _context("ingestion", source_hashes=hashes),
+        StageExecutionControl(task_id="task-ingestion"),
     )
 
     assert outcome.result_ref.startswith("ingestion-")
@@ -373,12 +384,89 @@ def test_ingestion_preview_hashes_current_sources_without_advancing_checkpoint(
         assert connection.execute("SELECT COUNT(*) FROM source_documents").fetchone() == (0,)
 
     adapter.run(
-        _context("ingestion"), StageExecutionControl(task_id="task-ingestion")
+        _context("ingestion", source_hashes=hashes),
+        StageExecutionControl(task_id="task-ingestion"),
     )
 
     assert checkpoints.values["fixture_news"].cursor == "cursor-1"
     with store.connect() as connection:
         assert connection.execute("SELECT COUNT(*) FROM source_documents").fetchone() == (1,)
+
+
+def test_ingestion_accepts_sources_retrieved_later_on_the_selected_calendar_day(
+    tmp_path: Path,
+):
+    midnight = NOW.replace(hour=0)
+    checkpoints = _CheckpointStore()
+    source = DocumentInput(
+        source_type="issuer_release",
+        url="https://example.com/current-day-release",
+        publisher="Example Issuer",
+        published_at=NOW,
+        retrieved_at=NOW,
+        content="A release fetched after midnight still belongs to this research date.",
+    )
+    components, _ = _components(
+        tmp_path,
+        document_connectors=(_DocumentConnector(source),),
+        checkpoints=checkpoints,
+    )
+    adapter = build_production_stage_adapters(components)["ingestion"]
+
+    hashes = adapter.preview_source_hashes(midnight)
+    outcome = adapter.run(
+        _context("ingestion", source_hashes=hashes).model_copy(
+            update={"as_of": midnight}
+        ),
+        StageExecutionControl(task_id="task-ingestion"),
+    )
+
+    assert outcome.result_ref.startswith("ingestion-")
+
+
+def test_ingestion_retry_rejects_content_not_bound_to_workflow_identity(
+    tmp_path: Path,
+):
+    checkpoints = _CheckpointStore()
+    first = DocumentInput(
+        source_type="issuer_release",
+        url="https://example.com/changing-release",
+        publisher="Example Issuer",
+        published_at=NOW,
+        retrieved_at=NOW,
+        content="Version A was bound into the workflow identity.",
+    )
+    components, _ = _components(
+        tmp_path,
+        document_connectors=(_DocumentConnector(first),),
+        checkpoints=checkpoints,
+    )
+    first_adapter = build_production_stage_adapters(components)["ingestion"]
+    bound_hashes = first_adapter.preview_source_hashes(NOW)
+    changed = replace(first, content="Version B arrived before the durable retry.")
+    restarted_components = replace(
+        components,
+        document_connectors=(_DocumentConnector(changed),),
+    )
+    restarted_adapter = build_production_stage_adapters(restarted_components)[
+        "ingestion"
+    ]
+
+    with pytest.raises(RequiredStageUnavailable, match="workflow identity"):
+        restarted_adapter.run(
+            _context("ingestion", source_hashes=bound_hashes),
+            StageExecutionControl(task_id="task-ingestion"),
+        )
+
+
+def test_analysis_is_a_report_producing_stage_and_revision_is_durably_routed(
+    tmp_path: Path,
+):
+    components, _ = _components(tmp_path)
+    adapters = build_production_stage_adapters(components)
+
+    assert adapters["analysis"].stage == "analysis"
+    assert adapters["revision"].__class__.__name__ == "_RevisionAdapter"
 
 
 def test_ingestion_rejects_stale_upstream_without_advancing_checkpoint(tmp_path: Path):

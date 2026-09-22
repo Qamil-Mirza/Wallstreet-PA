@@ -120,7 +120,9 @@ def test_advertised_runtime_policy_is_typed_from_environment(monkeypatch):
         ("OLLAMA_HEALTH_TIMEOUT_SECONDS", "-1"),
         ("MODEL_PRICE_EFFECTIVE_UNTIL", "not-a-date"),
         ("MODEL_INPUT_PRICE_PER_MILLION_USD", "-1"),
+        ("MODEL_INPUT_PRICE_PER_MILLION_USD", "0"),
         ("MODEL_OUTPUT_PRICE_PER_MILLION_USD", "NaN"),
+        ("MODEL_OUTPUT_PRICE_PER_MILLION_USD", "0"),
     ],
 )
 def test_advertised_runtime_policy_rejects_invalid_environment(

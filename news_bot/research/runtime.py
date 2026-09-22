@@ -34,6 +34,7 @@ from .orchestrator import (
     StageExecutionControl,
     StageOutcome,
     WorkflowConflict,
+    WorkflowKind,
     WorkflowRunResult,
 )
 from .quality import GateReasonCode, PublicationVerdict, QualityGateResult
@@ -471,6 +472,8 @@ class RuntimeStageRunner:
         if (
             context.stage != "review"
             or gate is None
+            or context.workflow_kind
+            not in {WorkflowKind.DAILY, WorkflowKind.WEEKLY}
             or not self._workflow_portfolio_stale(context.workflow_id)
         ):
             return outcome
@@ -788,14 +791,16 @@ class RuntimeWorkflowService:
             owner_id=self.factories.owner_id_factory(),
         )
 
-    def _source_hashes(self, as_of: datetime) -> tuple[str, ...]:
+    def _source_hashes(
+        self, as_of: datetime, *, preview_ingestion: bool = False
+    ) -> tuple[str, ...]:
         hashes = {
             document.content_hash
             for document in self.store.list_documents_as_of(as_of)
         }
         ingestion = self.factories.stage_adapters.get("ingestion")
         preview = getattr(ingestion, "preview_source_hashes", None)
-        if callable(preview):
+        if preview_ingestion and callable(preview):
             current = preview(as_of)
             if not isinstance(current, tuple) or any(
                 not isinstance(digest, str)
@@ -819,7 +824,9 @@ class RuntimeWorkflowService:
             synthetic_portfolio=synthetic_portfolio
         ).run_daily(
             as_of=as_of,
-            source_hashes=self._source_hashes(as_of),
+            source_hashes=self._source_hashes(
+                as_of, preview_ingestion=not synthetic_portfolio
+            ),
             dry_run=dry_run,
         )
 

@@ -1639,6 +1639,22 @@ def test_weekly_selection_exposes_only_explicit_safe_triggers(store: ResearchSto
         )
 
 
+def test_stage_context_carries_the_durable_assigned_role(
+    store: ResearchStore,
+) -> None:
+    runner = RecordingRunner()
+    orchestrator = ResearchOrchestrator(store, runner, owner_id="scheduler-a")
+
+    result = orchestrator.run_weekly(as_of=utc(), source_hashes=("a" * 64,))
+
+    tasks = {task.stage: task for task in orchestrator.list_tasks(result.workflow_id)}
+    assert runner.calls
+    assert all(
+        context.assigned_role is tasks[context.stage].assigned_role
+        for context in runner.calls
+    )
+
+
 def test_reviewer_cannot_redirect_revision_away_from_originating_role(
     store: ResearchStore,
 ) -> None:

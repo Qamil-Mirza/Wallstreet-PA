@@ -222,10 +222,10 @@ def _get_decimal(name: str, default: str) -> Decimal:
     return parsed
 
 
-def _get_nonnegative_decimal(name: str, default: str) -> Decimal:
+def _get_positive_decimal(name: str, default: str) -> Decimal:
     parsed = _get_decimal(name, default)
-    if parsed < 0:
-        raise ResearchConfigError(f"{name} must be non-negative; got {parsed!r}")
+    if parsed <= 0:
+        raise ResearchConfigError(f"{name} must be positive; got {parsed!r}")
     return parsed
 
 
@@ -358,10 +358,10 @@ class ResearchConfig:
             model_price_effective_until=_get_date(
                 "MODEL_PRICE_EFFECTIVE_UNTIL", "2026-12-31"
             ),
-            model_input_price_per_million_usd=_get_nonnegative_decimal(
+            model_input_price_per_million_usd=_get_positive_decimal(
                 "MODEL_INPUT_PRICE_PER_MILLION_USD", "20.00"
             ),
-            model_output_price_per_million_usd=_get_nonnegative_decimal(
+            model_output_price_per_million_usd=_get_positive_decimal(
                 "MODEL_OUTPUT_PRICE_PER_MILLION_USD", "100.00"
             ),
             source_max_staleness_hours=_get_positive_float(
@@ -543,10 +543,10 @@ class ResearchConfig:
         if self.budget_soft_usd < 0 or self.budget_hard_usd < 0:
             raise ResearchConfigError("Model budget limits must be non-negative")
         if (
-            self.model_input_price_per_million_usd < 0
-            or self.model_output_price_per_million_usd < 0
+            self.model_input_price_per_million_usd <= 0
+            or self.model_output_price_per_million_usd <= 0
         ):
-            raise ResearchConfigError("Model prices must be non-negative")
+            raise ResearchConfigError("Model prices must be positive")
         if self.budget_soft_usd >= self.budget_hard_usd:
             raise ResearchConfigError(
                 "MODEL_BUDGET_SOFT_USD must be less than MODEL_BUDGET_HARD_USD"

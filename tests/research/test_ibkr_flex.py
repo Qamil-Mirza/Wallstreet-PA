@@ -45,7 +45,7 @@ class _Request:
     url: str
     params: dict[str, object]
     headers: dict[str, str]
-    timeout: float
+    timeout: float | tuple[float, float]
     allow_redirects: bool
     stream: bool
 
@@ -374,7 +374,10 @@ def test_send_and_poll_use_get_params_headers_and_timeout(requests_mock, flex_co
     assert statement.params == {"t": TOKEN, "q": "REF-20260824-001", "v": "3"}
     assert send.headers["User-Agent"] == flex_config.user_agent
     assert statement.headers["User-Agent"] == flex_config.user_agent
-    assert send.timeout == statement.timeout == flex_config.request_timeout_seconds
+    assert send.timeout == flex_config.request_timeout_seconds
+    assert isinstance(statement.timeout, tuple)
+    assert statement.timeout[0] <= flex_config.request_timeout_seconds
+    assert 0 < statement.timeout[1] <= 1.0
     assert send.allow_redirects is False
     assert statement.allow_redirects is False
     assert send.stream is True
@@ -699,6 +702,7 @@ def test_successful_statement_returned_after_poll_deadline_is_rejected(
         FlexClient(config, monotonic=lambda: next(ticks)).sync()
 
     assert len(requests_mock.request_history) == 2
+    assert requests_mock.request_history[1].timeout == (1, 1)
 
 
 @pytest.mark.parametrize(

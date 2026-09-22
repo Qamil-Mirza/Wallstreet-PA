@@ -13,7 +13,7 @@ import math
 import threading
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, time, timedelta, timezone
 from decimal import Decimal
 from types import MappingProxyType
 from typing import Protocol
@@ -119,6 +119,7 @@ _AGENT_ROLES = MappingProxyType(
 )
 _REPORT_STAGE_TYPES = MappingProxyType(
     {
+        "analysis": PortfolioBrief,
         "event_update": EventUpdate,
         "selected_recommendations": PortfolioBrief,
         "emerging_map": EmergingCompanyMonitor,
@@ -325,6 +326,11 @@ class _DocumentIngestionAdapter:
         checkpoints = self.components.checkpoints
         if not connectors or checkpoints is None:
             _unavailable()
+        source_cutoff = (
+            as_of + timedelta(days=1) - timedelta(microseconds=1)
+            if as_of.timetz().replace(tzinfo=None) == time.min
+            else as_of
+        )
         batches: list[ConnectorBatch] = []
         count = 0
         for connector in connectors:
@@ -335,14 +341,17 @@ class _DocumentIngestionAdapter:
             if not isinstance(batch, ConnectorBatch) or batch.connector != connector.name:
                 _unavailable("required production connector returned an invalid batch")
             for document in batch.documents:
-                age = as_of - document.published_at.astimezone(timezone.utc)
+                age = source_cutoff - document.published_at.astimezone(timezone.utc)
                 if age.total_seconds() < 0 or age.total_seconds() > (
                     self.components.config.source_max_staleness_hours * 3600
                 ):
                     _unavailable(
                         "required production source is outside the freshness window"
                     )
-                if document.evidence.retrieved_at.astimezone(timezone.utc) > as_of:
+                if (
+                    document.evidence.retrieved_at.astimezone(timezone.utc)
+                    > source_cutoff
+                ):
                     _unavailable(
                         "required production source was retrieved after the cutoff"
                     )
@@ -391,6 +400,21 @@ class _DocumentIngestionAdapter:
             batches = self._previewed.pop(key, None)
         if batches is None:
             batches = self._fetch_batches(context.as_of, context.max_documents)
+        actual_hashes = {
+            hashlib.sha256(
+                canonicalize_content(document.evidence.content).encode("utf-8")
+            ).hexdigest()
+            for batch in batches
+            for document in batch.documents
+        }
+        historical_hashes = {
+            document.content_hash
+            for document in self.components.store.list_documents_as_of(context.as_of)
+        }
+        if actual_hashes | historical_hashes != set(context.source_hashes):
+            _unavailable(
+                "required production sources do not match workflow identity"
+            )
         ingested = []
         for batch in batches:
             control.checkpoint()
@@ -610,6 +634,28 @@ class _AgentStageAdapter:
             result_hash=output_hash,
             new_agent_runs=1,
         )
+
+
+class _RevisionAdapter:
+    """Route revision back to the durable task's originating specialist."""
+
+    def __init__(
+        self,
+        components: ProductionComponents,
+        agents: Mapping[AgentRole, BoundedAgent],
+    ) -> None:
+        self.components = components
+        self.agents = agents
+
+    def run(
+        self, context: StageContext, control: StageExecutionControl
+    ) -> StageOutcome:
+        role = context.assigned_role
+        if role is None or role not in self.agents or role is AgentRole.SKEPTICAL_REVIEWER:
+            _unavailable("required production revision role is unavailable")
+        return _AgentStageAdapter(
+            self.components, "revision", role, self.agents[role]
+        ).run(context, control)
 
 
 def _workflow_portfolio_ref(store: ResearchStore, workflow_id: str) -> str | None:
@@ -992,6 +1038,7 @@ def build_production_stage_adapters(
             for stage, role in _AGENT_ROLES.items()
         }
     )
+    adapters["revision"] = _RevisionAdapter(components, agents)
     if set(adapters) != set(PRODUCTION_STAGE_NAMES):
         raise RuntimeError("production stage registry is incomplete")
     return MappingProxyType(adapters)
