@@ -9,7 +9,7 @@ Optionally generates TTS audio broadcast from summaries.
 import logging
 import sys
 from collections.abc import Callable, Sequence
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from .article_extractor import ensure_batch_content
@@ -269,7 +269,7 @@ def main(
         try:
             research_date = (
                 datetime.now(timezone.utc).date() if today is None else today()
-            )
+            ) - timedelta(days=1)
             return int(
                 research_entrypoint(
                     ["daily", "--as-of", research_date.isoformat()]

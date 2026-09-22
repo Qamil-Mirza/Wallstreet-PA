@@ -215,11 +215,15 @@ def test_weekly_revise_returns_task_to_fundamental_analyst(store: ResearchStore)
     result = orchestrator.run_weekly(as_of=utc(), source_hashes=("a" * 64,))
 
     assert result.status is WorkflowRunState.BLOCKED
-    returned = result.pending_tasks[0]
+    returned = next(
+        task for task in orchestrator.list_tasks(result.workflow_id)
+        if task.stage == "revision"
+    )
+    assert returned.state is WorkflowTaskState.COMPLETED
     assert returned.assigned_role is AgentRole.FUNDAMENTAL_ANALYST
     assert returned.originating_role is AgentRole.FUNDAMENTAL_ANALYST
-    assert returned.defer_reason == "review_revise"
     assert returned.dependency_ids
+    assert [call.stage for call in runner.calls][-1] == "revision"
     assert "publish" not in [call.stage for call in runner.calls]
 
 
@@ -1667,7 +1671,13 @@ def test_reviewer_cannot_redirect_revision_away_from_originating_role(
 
     result = orchestrator.run_weekly(as_of=utc(), source_hashes=("a" * 64,))
 
-    assert result.pending_tasks[0].assigned_role is AgentRole.FUNDAMENTAL_ANALYST
+    revision = next(
+        task for task in orchestrator.list_tasks(result.workflow_id)
+        if task.stage == "revision"
+    )
+    assert revision.state is WorkflowTaskState.COMPLETED
+    assert revision.assigned_role is AgentRole.FUNDAMENTAL_ANALYST
+    assert runner.calls[-1].assigned_role is AgentRole.FUNDAMENTAL_ANALYST
 
 
 def test_populated_v7_database_upgrades_without_data_loss(
@@ -1838,9 +1848,13 @@ def test_monthly_revision_returns_to_industry_strategist(store: ResearchStore) -
         as_of=utc(), source_hashes=("a" * 64,), industry_key="robotic-actuators"
     )
 
-    assert result.pending_tasks[0].assigned_role is AgentRole.INDUSTRY_STRATEGIST
-    assert result.pending_tasks[0].originating_role is AgentRole.INDUSTRY_STRATEGIST
-    assert result.pending_tasks[0].defer_reason == "review_revise"
+    returned = next(
+        task for task in orchestrator.list_tasks(result.workflow_id)
+        if task.stage == "revision"
+    )
+    assert returned.state is WorkflowTaskState.COMPLETED
+    assert returned.assigned_role is AgentRole.INDUSTRY_STRATEGIST
+    assert returned.originating_role is AgentRole.INDUSTRY_STRATEGIST
 
 
 def test_untrusted_reason_text_is_never_persisted_or_returned(tmp_path: Path) -> None:
@@ -1864,7 +1878,12 @@ def test_untrusted_reason_text_is_never_persisted_or_returned(tmp_path: Path) ->
 
     assert private not in stored
     assert private not in result.model_dump_json()
-    assert result.pending_tasks[0].defer_reason == "review_block"
+    revision = next(
+        task for task in orchestrator.list_tasks(result.workflow_id)
+        if task.stage == "revision"
+    )
+    assert revision.state is WorkflowTaskState.COMPLETED
+    assert revision.defer_reason is None
     assert result.omissions == ("omission_sanitized",)
 
 
@@ -1966,11 +1985,18 @@ def test_daily_revision_returns_to_event_scout(store: ResearchStore) -> None:
         "materiality": StageOutcome(material_event=True),
         "review": StageOutcome(reviewer_verdict=ReviewVerdict.REVISE),
     })
-    result = ResearchOrchestrator(store, runner, owner_id="owner-a").run_daily(
+    orchestrator = ResearchOrchestrator(store, runner, owner_id="owner-a")
+    result = orchestrator.run_daily(
         as_of=utc(), source_hashes=("a" * 64,)
     )
 
-    assert result.pending_tasks[0].assigned_role is AgentRole.EVENT_SCOUT
+    returned = next(
+        task for task in orchestrator.list_tasks(result.workflow_id)
+        if task.stage == "revision"
+    )
+    assert returned.state is WorkflowTaskState.COMPLETED
+    assert returned.assigned_role is AgentRole.EVENT_SCOUT
+    assert runner.calls[-1].stage == "revision"
 
 
 def test_populated_v8_workflow_upgrades_to_v9_without_data_loss(

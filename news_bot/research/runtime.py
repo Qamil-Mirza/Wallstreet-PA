@@ -86,10 +86,12 @@ _RUNTIME_STAGES = frozenset(
 )
 _REPORT_ORIGIN_STAGES = MappingProxyType(
     {
-        "event_update": "event_update",
-        "portfolio_brief": "selected_recommendations",
-        "industry_landscape": "industry_refresh",
-        "emerging_monitor": "emerging_map",
+        "event_update": frozenset({"event_update"}),
+        "portfolio_brief": frozenset(
+            {"selected_recommendations", "analysis"}
+        ),
+        "industry_landscape": frozenset({"industry_refresh"}),
+        "emerging_monitor": frozenset({"emerging_map"}),
     }
 )
 
@@ -792,12 +794,16 @@ class RuntimeWorkflowService:
         )
 
     def _source_hashes(
-        self, as_of: datetime, *, preview_ingestion: bool = False
+        self,
+        as_of: datetime,
+        *,
+        preview_ingestion: bool = False,
+        max_documents: int | None = None,
     ) -> tuple[str, ...]:
-        hashes = {
-            document.content_hash
-            for document in self.store.list_documents_as_of(as_of)
-        }
+        documents = self.store.list_documents_as_of(as_of)
+        if max_documents is not None:
+            documents = documents[:max_documents]
+        hashes = {document.content_hash for document in documents}
         ingestion = self.factories.stage_adapters.get("ingestion")
         preview = getattr(ingestion, "preview_source_hashes", None)
         if preview_ingestion and callable(preview):
@@ -854,7 +860,9 @@ class RuntimeWorkflowService:
         return self._orchestrator().run_backfill(
             as_of=as_of,
             max_documents=max_documents,
-            source_hashes=self._source_hashes(as_of),
+            source_hashes=self._source_hashes(
+                as_of, max_documents=max_documents
+            ),
             authorize_analysis=authorize_analysis,
         )
 
@@ -1023,7 +1031,7 @@ class RuntimeWorkflowService:
         except Exception:
             raise WorkflowConflict("stored report provenance is invalid") from None
         if (
-            task[0] != _REPORT_ORIGIN_STAGES[provenance.report_type]
+            task[0] not in _REPORT_ORIGIN_STAGES[provenance.report_type]
             or _parse_utc(task[2]) != report.metadata.as_of
             or outcome.report_id != report_id
             or outcome.result_ref != report_id
@@ -1136,11 +1144,65 @@ class RuntimeWorkflowService:
                     )
                     handle.flush()
                     os.fsync(handle.fileno())
+            payload_files = tuple(sorted(staging.iterdir()))
+            manifest_payload = {
+                "version": 1,
+                "files": {
+                    path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+                    for path in payload_files
+                },
+            }
+            manifest_text = json.dumps(
+                manifest_payload,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            )
+            manifest_path = staging / "artifact-manifest.json"
+            with manifest_path.open("wb") as handle:
+                handle.write(manifest_text.encode("utf-8"))
+                handle.flush()
+                os.fsync(handle.fileno())
             self._fsync_directory(staging)
             if destination.exists():
                 html_path = destination / artifact.html_path.name
                 staged_files = tuple(sorted(staging.iterdir()))
                 destination_files = tuple(sorted(destination.iterdir()))
+                destination_manifest = destination / manifest_path.name
+                try:
+                    stored_manifest_text = destination_manifest.read_text(
+                        encoding="utf-8"
+                    )
+                    stored_manifest = json.loads(stored_manifest_text)
+                    if not isinstance(stored_manifest, dict):
+                        raise ValueError("artifact manifest must be an object")
+                    stored_hashes = stored_manifest["files"]
+                    if not isinstance(stored_hashes, dict):
+                        raise ValueError("artifact hashes must be an object")
+                    manifest_is_valid = (
+                        stored_manifest.get("version") == 1
+                        and stored_manifest_text
+                        == json.dumps(
+                            stored_manifest,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                            ensure_ascii=False,
+                        )
+                    )
+                except (
+                    OSError,
+                    UnicodeError,
+                    json.JSONDecodeError,
+                    KeyError,
+                    ValueError,
+                ):
+                    stored_hashes = {}
+                    manifest_is_valid = False
+                destination_payload_files = tuple(
+                    path
+                    for path in destination_files
+                    if path.name != manifest_path.name
+                )
                 if (
                     not destination.is_dir()
                     or destination.is_symlink()
@@ -1150,15 +1212,17 @@ class RuntimeWorkflowService:
                     )
                     or tuple(path.name for path in destination_files)
                     != tuple(path.name for path in staged_files)
+                    or not manifest_is_valid
+                    or set(stored_hashes)
+                    != {path.name for path in destination_payload_files}
+                    or any(
+                        not isinstance(stored_hashes.get(path.name), str)
+                        or hashlib.sha256(path.read_bytes()).hexdigest()
+                        != stored_hashes[path.name]
+                        for path in destination_payload_files
+                    )
                     or not html_path.is_file()
                     or html_path.read_text(encoding="utf-8") != artifact.html
-                    or any(
-                        destination_path.read_bytes()
-                        != staged_path.read_bytes()
-                        for destination_path, staged_path in zip(
-                            destination_files, staged_files, strict=True
-                        )
-                    )
                 ):
                     raise WorkflowConflict("regenerated report output conflicts")
                 return html_path

@@ -413,10 +413,11 @@ def test_ingestion_accepts_sources_retrieved_later_on_the_selected_calendar_day(
     )
     adapter = build_production_stage_adapters(components)["ingestion"]
 
-    hashes = adapter.preview_source_hashes(midnight)
+    end_of_day = midnight + timedelta(days=1) - timedelta(microseconds=1)
+    hashes = adapter.preview_source_hashes(end_of_day)
     outcome = adapter.run(
         _context("ingestion", source_hashes=hashes).model_copy(
-            update={"as_of": midnight}
+            update={"as_of": end_of_day}
         ),
         StageExecutionControl(task_id="task-ingestion"),
     )

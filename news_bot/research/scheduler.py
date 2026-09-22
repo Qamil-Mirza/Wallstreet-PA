@@ -226,9 +226,12 @@ def _scheduled_job(
         or now.utcoffset() != timedelta(0)
     ):
         raise SchedulerClockError("scheduler clock must return an aware UTC datetime")
+    # Date-only workflow cutoffs represent a complete UTC day.  Scheduled
+    # runs therefore process the last completed day instead of projecting the
+    # current morning run forward to timestamps that have not happened yet.
+    completed_day = (now.astimezone(timezone.utc) - timedelta(days=1)).date()
     code = main(
-        [command, "--as-of", now.astimezone(timezone.utc).date().isoformat(),
-         *extra_arguments],
+        [command, "--as-of", completed_day.isoformat(), *extra_arguments],
         services=services,
     )
     if code is not ExitCode.OK and code != int(ExitCode.OK):

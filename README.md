@@ -254,7 +254,7 @@ automation, and no sizing that assumes an immediate exit. Thinly traded names
 and unavailable cash should be flagged for human review, not converted into an
 action.
 
-### Verification evidence (2026-09-21)
+### Verification evidence (2026-09-22)
 
 The deterministic golden packet is test-authored, CC0-licensed fixture content
 that paraphrases raw facts from public issuer filings and releases. It does not
@@ -286,10 +286,10 @@ docker compose --profile runner --profile test --profile newsletter config --qui
 exit 0
 
 docker compose --profile test build test
-ARM64/Linux development image built successfully (2026-09-19)
+ARM64/Linux development image built successfully (2026-09-22)
 
-docker compose --profile test run --rm test python -m pytest -q
-1720 passed, 2 skipped, 2 warnings in 162.54s
+docker compose --profile test run --rm --no-deps test
+1761 passed, 2 skipped, 2 warnings in 259.91s
 
 docker compose --profile runner build research-runner
 ARM64/Linux production image built successfully (2026-09-19)

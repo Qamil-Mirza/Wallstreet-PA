@@ -84,7 +84,10 @@ def _strict_date(value: str) -> datetime:
         parsed = date.fromisoformat(value)
     except ValueError as exc:
         raise CliInputError("as-of must be a valid calendar date") from exc
-    return datetime.combine(parsed, datetime.min.time(), tzinfo=timezone.utc)
+    # A CLI date represents the complete UTC research day.  Keeping this
+    # conversion at the input boundary gives every downstream cutoff (source
+    # identity, evidence loading, and replay) the same exact timestamp.
+    return datetime.combine(parsed, datetime.max.time(), tzinfo=timezone.utc)
 
 
 def _bounded_documents(value: str) -> int:

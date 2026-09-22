@@ -54,6 +54,7 @@ from news_bot.research.quality import (
 )
 from news_bot.research.reports import ReportRenderer
 from news_bot.research.runtime import (
+    _REPORT_ORIGIN_STAGES,
     RuntimeFactories,
     RuntimeStageRunner,
     RuntimeWorkflowService,
@@ -235,7 +236,7 @@ def test_all_commands_dispatch_exactly_one_workflow(
         "validations": [(command, command in {"daily", "weekly", "dry-run"})],
     }
     assert recorder.calls[0][1]["as_of"] == datetime(
-        2026, 8, 24, tzinfo=timezone.utc
+        2026, 8, 24, 23, 59, 59, 999999, tzinfo=timezone.utc
     )
     output = capsys.readouterr().out
     assert f"command={command}" in output
@@ -251,7 +252,9 @@ def test_dry_run_marks_workflow_and_never_calls_external_sender(tmp_path: Path) 
         (
             "daily",
             {
-                "as_of": datetime(2026, 8, 24, tzinfo=timezone.utc),
+                "as_of": datetime(
+                    2026, 8, 24, 23, 59, 59, 999999, tzinfo=timezone.utc
+                ),
                 "dry_run": True,
                 "synthetic_portfolio": False,
             },
@@ -289,7 +292,9 @@ def test_backfill_is_bounded_and_evidence_only_by_default(tmp_path: Path) -> Non
 
     assert code == 0
     assert recorder.calls[0][1] == {
-        "as_of": datetime(2026, 8, 24, tzinfo=timezone.utc),
+        "as_of": datetime(
+            2026, 8, 24, 23, 59, 59, 999999, tzinfo=timezone.utc
+        ),
         "max_documents": 25,
         "authorize_analysis": False,
     }
@@ -1275,6 +1280,45 @@ def test_runtime_passes_historical_source_hashes_into_workflow_identity(
     assert captured["source_hashes"] == (digest,)
 
 
+def test_backfill_identity_only_contains_documents_inside_requested_bound(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config = research_config(tmp_path)
+    store = ResearchStore(config.database_path)
+    store.migrate()
+    for ordinal, digest in enumerate(("a" * 64, "b" * 64), start=1):
+        store.insert_source_document(
+            SourceDocument(
+                document_id=f"document-bounded-{ordinal}",
+                source_type="sec_filing_metadata",
+                canonical_url=f"https://example.com/bounded-{ordinal}",
+                publisher="Example",
+                published_at=datetime(2026, 8, 20 + ordinal, tzinfo=timezone.utc),
+                retrieved_at=datetime(2026, 8, 20 + ordinal, tzinfo=timezone.utc),
+                content_hash=digest,
+                raw_content_path=None,
+                extraction_status="complete",
+            )
+        )
+    captured: dict[str, object] = {}
+
+    class RecordingOrchestrator:
+        def run_backfill(self, **kwargs):
+            captured.update(kwargs)
+            return FakeResult(workflow_kind=WorkflowKind.BACKFILL)
+
+    service = RuntimeWorkflowService(config, store)
+    monkeypatch.setattr(service, "_orchestrator", lambda **_kwargs: RecordingOrchestrator())
+
+    service.run_backfill(
+        as_of=datetime(2026, 8, 24, tzinfo=timezone.utc),
+        max_documents=1,
+        authorize_analysis=False,
+    )
+
+    assert captured["source_hashes"] == ("a" * 64,)
+
+
 def test_runtime_includes_current_ingestion_preview_in_workflow_identity(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -1758,6 +1802,12 @@ def test_regenerate_rebuilds_typed_attested_report_through_renderer(
     )
 
 
+def test_backfill_analysis_is_valid_portfolio_brief_provenance() -> None:
+    assert _REPORT_ORIGIN_STAGES["portfolio_brief"] == frozenset(
+        {"selected_recommendations", "analysis"}
+    )
+
+
 def test_regenerate_rejects_incomplete_existing_artifact_set(
     tmp_path: Path,
 ) -> None:
@@ -2202,7 +2252,7 @@ def test_scheduler_derives_as_of_from_aware_utc_clock(tmp_path: Path) -> None:
     function(*options["args"])
 
     assert recorder.calls[0][1]["as_of"] == datetime(
-        2026, 8, 25, tzinfo=timezone.utc
+        2026, 8, 24, 23, 59, 59, 999999, tzinfo=timezone.utc
     )
 
 
@@ -2242,7 +2292,7 @@ def test_legacy_main_selects_pipeline_only_when_research_enabled(monkeypatch) ->
         legacy_runner=lambda: calls.append("legacy"),
         today=lambda: datetime(2026, 8, 24, tzinfo=timezone.utc).date(),
     ) == 0
-    assert calls == ["daily --as-of 2026-08-24"]
+    assert calls == ["daily --as-of 2026-08-23"]
 
 
 def test_research_main_default_date_uses_aware_utc_clock(
@@ -2266,7 +2316,7 @@ def test_research_main_default_date_uses_aware_utc_clock(
     )
 
     assert code == 0
-    assert calls == ["daily --as-of 2026-08-25"]
+    assert calls == ["daily --as-of 2026-08-24"]
 
 
 def test_disabled_legacy_path_does_not_load_unrelated_research_secrets(

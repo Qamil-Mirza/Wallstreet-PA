@@ -13,7 +13,7 @@ import math
 import threading
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import datetime, time, timedelta, timezone
+from datetime import datetime, timezone
 from decimal import Decimal
 from types import MappingProxyType
 from typing import Protocol
@@ -326,11 +326,7 @@ class _DocumentIngestionAdapter:
         checkpoints = self.components.checkpoints
         if not connectors or checkpoints is None:
             _unavailable()
-        source_cutoff = (
-            as_of + timedelta(days=1) - timedelta(microseconds=1)
-            if as_of.timetz().replace(tzinfo=None) == time.min
-            else as_of
-        )
+        source_cutoff = as_of
         batches: list[ConnectorBatch] = []
         count = 0
         for connector in connectors:

@@ -1732,7 +1732,11 @@ class ResearchOrchestrator:
                     self._return_for_revision(workflow_id, task_id, outcome)
                     omissions.update(outcome.omissions)
                     terminal = WorkflowRunState.BLOCKED
-                    break
+                    # The revision is safe to execute automatically, while the
+                    # original publication remains deferred.  The workflow
+                    # stays blocked until a future reviewed run authorizes a
+                    # publication; it never publishes against the failed gate.
+                    continue
                 if outcome.defer_reason is not None and stage != "review":
                     execution_control.checkpoint()
                     self.finalize_task(claim, outcome=outcome, deferred=True)
