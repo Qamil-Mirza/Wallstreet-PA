@@ -30,6 +30,7 @@ REQUIRED_TABLES = {
     "schema_migrations",
     "portfolio_snapshots",
     "positions",
+    "portfolio_snapshot_sources",
     "entities",
     "securities",
     "relationships",
@@ -70,6 +71,30 @@ def make_document(
         raw_content_path=None,
         extraction_status="complete",
     )
+
+
+def test_portfolio_snapshot_fallback_is_bound_to_one_flex_source(tmp_path):
+    store = make_migrated_store(tmp_path)
+    result = parse_statement(
+        fixture("ibkr_statement.xml"),
+        account_salt="local-test-salt-strong",
+    )
+    store.insert_portfolio_snapshot(
+        result.snapshot, result.positions, result.account_ref
+    )
+    source_a = "a" * 64
+    source_b = "b" * 64
+
+    store.bind_portfolio_snapshot_source(result.snapshot.snapshot_id, source_a)
+
+    assert store.latest_portfolio_snapshot_for_source(
+        source_a, utc(2026, 8, 25)
+    ) == result.snapshot.snapshot_id
+    assert store.latest_portfolio_snapshot_for_source(
+        source_b, utc(2026, 8, 25)
+    ) is None
+    with pytest.raises(sqlite3.IntegrityError, match="source binding"):
+        store.bind_portfolio_snapshot_source(result.snapshot.snapshot_id, source_b)
 
 
 def seed_passage(store: ResearchStore, passage_id: str = "passage-1") -> None:
@@ -283,7 +308,7 @@ def test_migration_is_idempotent_and_recorded_once(tmp_path):
         rows = connection.execute(
             "SELECT version, name, applied_at FROM schema_migrations"
         ).fetchall()
-    assert len(rows) == 17
+    assert len(rows) == 18
     assert rows[0][0:2] == (1, "001_initial.sql")
     assert rows[1][0:2] == (2, "002_nullable_portfolio_freshness.sql")
     assert rows[2][0:2] == (3, "003_claim_dependencies.sql")
@@ -303,6 +328,7 @@ def test_migration_is_idempotent_and_recorded_once(tmp_path):
     assert rows[16][0:2] == (
         17, "017_require_active_publication_confirmation.sql"
     )
+    assert rows[17][0:2] == (18, "018_bind_portfolio_snapshot_sources.sql")
     assert all(row[2].endswith("Z") for row in rows)
 
 
@@ -409,7 +435,7 @@ def test_existing_v1_database_upgrades_nullable_freshness_without_data_loss(
 
     assert versions == [
         (1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,), (10,),
-        (11,), (12,), (13,), (14,), (15,), (16,), (17,),
+        (11,), (12,), (13,), (14,), (15,), (16,), (17,), (18,),
     ]
     assert stored_snapshot == snapshot_row
     assert stored_security == security_row
@@ -482,7 +508,7 @@ def test_existing_v2_claims_upgrade_with_lineage_anchor_without_data_loss(
         foreign_key_errors = connection.execute("PRAGMA foreign_key_check").fetchall()
     assert versions == [
         (1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,), (10,),
-        (11,), (12,), (13,), (14,), (15,), (16,), (17,),
+        (11,), (12,), (13,), (14,), (15,), (16,), (17,), (18,),
     ]
     assert retained_evidence == [("passage-1", stance)]
     if stance == "supports":
@@ -583,7 +609,7 @@ def test_populated_v3_relationship_upgrade_preserves_and_quarantines_legacy_data
 
     assert versions == [
         (1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,), (10,),
-        (11,), (12,), (13,), (14,), (15,), (16,), (17,),
+        (11,), (12,), (13,), (14,), (15,), (16,), (17,), (18,),
     ]
     assert relationship == (
         source_entity_id,
@@ -677,7 +703,7 @@ def test_populated_v4_database_upgrades_agent_audit_without_data_loss(
         ).fetchall()
     assert versions == [
         (1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,), (10,),
-        (11,), (12,), (13,), (14,), (15,), (16,), (17,),
+        (11,), (12,), (13,), (14,), (15,), (16,), (17,), (18,),
     ]
     assert legacy == [("legacy-run", "legacy-task", "completed")]
     assert {"agent_executions", "provider_attempts"} <= upgraded.table_names()
@@ -768,7 +794,7 @@ def test_populated_v5_database_upgrades_replay_lease_without_data_loss(
         ).fetchall()
     assert versions == [
         (1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,), (10,),
-        (11,), (12,), (13,), (14,), (15,), (16,), (17,),
+        (11,), (12,), (13,), (14,), (15,), (16,), (17,), (18,),
     ]
     assert execution == ("succeeded", "e" * 64, None, None, None)
     assert provider_attempt == ("ollama", "legacy", 3, 2, 1, 1)
@@ -906,7 +932,7 @@ def test_populated_v6_database_upgrades_workflow_instances_without_data_loss(
 
     assert versions == [
         (1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,), (10,),
-        (11,), (12,), (13,), (14,), (15,), (16,), (17,),
+        (11,), (12,), (13,), (14,), (15,), (16,), (17,), (18,),
     ]
     assert instances == [
         ("v6-workflow-one", "completed", 1),
@@ -1281,11 +1307,10 @@ def test_built_wheel_contains_and_applies_all_migrations(tmp_path):
         [
             sys.executable,
             "-m",
-            "pip",
-            "wheel",
-            "--no-deps",
-            "--no-build-isolation",
-            "--wheel-dir",
+            "build",
+            "--wheel",
+            "--no-isolation",
+            "--outdir",
             str(wheel_dir),
             str(source_copy),
         ],
@@ -1316,6 +1341,7 @@ def test_built_wheel_contains_and_applies_all_migrations(tmp_path):
         "news_bot/research/migrations/015_bind_publication_authority.sql",
         "news_bot/research/migrations/016_unique_workflow_task_stages.sql",
         "news_bot/research/migrations/017_require_active_publication_confirmation.sql",
+        "news_bot/research/migrations/018_bind_portfolio_snapshot_sources.sql",
     }
     prompt_names = {
         "news_bot/research/prompts/director.md",
@@ -1350,7 +1376,8 @@ def test_built_wheel_contains_and_applies_all_migrations(tmp_path):
         "'014_publication_effect_insert_guards.sql', "
         "'015_bind_publication_authority.sql', "
         "'016_unique_workflow_task_stages.sql', "
-        "'017_require_active_publication_confirmation.sql'}; "
+        "'017_require_active_publication_confirmation.sql', "
+        "'018_bind_portfolio_snapshot_sources.sql'}; "
         "prompt_dir = resources.files('news_bot.research').joinpath('prompts'); "
         "assert {p.name for p in prompt_dir.iterdir()} >= "
         "{'director.md', 'emerging_scout.md', 'event_scout.md', "
@@ -1364,7 +1391,7 @@ def test_built_wheel_contains_and_applies_all_migrations(tmp_path):
         "assert connection.execute('SELECT version FROM schema_migrations "
         "ORDER BY version').fetchall() == "
         "[(1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,), (10,), "
-        "(11,), (12,), (13,), (14,), (15,), (16,), (17,)]; "
+        "(11,), (12,), (13,), (14,), (15,), (16,), (17,), (18,)]; "
         "connection.close()"
     )
     subprocess.run(
@@ -1378,7 +1405,7 @@ def test_built_wheel_contains_and_applies_all_migrations(tmp_path):
 
 def test_failed_multi_statement_migration_is_atomic(tmp_path, monkeypatch):
     store = make_migrated_store(tmp_path)
-    bad_migration = tmp_path / "018_broken.sql"
+    bad_migration = tmp_path / "019_broken.sql"
     bad_migration.write_text(
         "CREATE TABLE should_roll_back (id INTEGER);\n"
         "INSERT INTO missing_table (id) VALUES (1);\n",
@@ -1399,7 +1426,7 @@ def test_failed_multi_statement_migration_is_atomic(tmp_path, monkeypatch):
         ).fetchall()
     assert versions == [
         (1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,), (10,),
-        (11,), (12,), (13,), (14,), (15,), (16,), (17,),
+        (11,), (12,), (13,), (14,), (15,), (16,), (17,), (18,),
     ]
 
 

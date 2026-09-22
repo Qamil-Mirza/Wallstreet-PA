@@ -687,6 +687,20 @@ def test_1019_polling_honors_total_timeout(requests_mock, flex_config):
     assert len(requests_mock.request_history) == 3
 
 
+def test_successful_statement_returned_after_poll_deadline_is_rejected(
+    requests_mock, flex_config
+):
+    config = replace(flex_config, poll_timeout_seconds=1)
+    requests_mock.get(config.send_url, text=fixture("ibkr_send_success.xml"))
+    requests_mock.get(config.statement_url, text=fixture("ibkr_statement.xml"))
+    ticks = iter((0.0, 0.0, 2.0))
+
+    with pytest.raises(FlexPollingExhaustedError, match="timeout"):
+        FlexClient(config, monotonic=lambda: next(ticks)).sync()
+
+    assert len(requests_mock.request_history) == 2
+
+
 @pytest.mark.parametrize(
     ("code", "error_type"),
     [

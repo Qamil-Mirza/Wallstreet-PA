@@ -40,6 +40,8 @@ def clear_research_environment(monkeypatch):
         "SOURCE_MAX_STALENESS_HOURS",
         "SEC_USER_AGENT",
         "MODEL_PRICE_EFFECTIVE_UNTIL",
+        "MODEL_INPUT_PRICE_PER_MILLION_USD",
+        "MODEL_OUTPUT_PRICE_PER_MILLION_USD",
         "MODEL_BUDGET_SOFT_USD",
         "MODEL_BUDGET_HARD_USD",
         "RESEARCH_DAILY_SCHEDULE",
@@ -91,6 +93,8 @@ def test_advertised_runtime_policy_is_typed_from_environment(monkeypatch):
     monkeypatch.setenv("OLLAMA_HEALTH_TIMEOUT_SECONDS", "45")
     monkeypatch.setenv("SEC_USER_AGENT", "Research Bot research@example.com")
     monkeypatch.setenv("MODEL_PRICE_EFFECTIVE_UNTIL", "2027-01-31")
+    monkeypatch.setenv("MODEL_INPUT_PRICE_PER_MILLION_USD", "12.50")
+    monkeypatch.setenv("MODEL_OUTPUT_PRICE_PER_MILLION_USD", "50.00")
     monkeypatch.setenv("MODEL_ROUTE_EVENT_SCOUT", "gpt-route-scout")
 
     config = ResearchConfig.from_env()
@@ -102,6 +106,8 @@ def test_advertised_runtime_policy_is_typed_from_environment(monkeypatch):
     assert config.ollama_health_timeout_seconds == 45.0
     assert config.sec_user_agent == "Research Bot research@example.com"
     assert config.model_price_effective_until == date(2027, 1, 31)
+    assert config.model_input_price_per_million_usd == Decimal("12.50")
+    assert config.model_output_price_per_million_usd == Decimal("50.00")
     assert config.model_routes[AgentRole.EVENT_SCOUT] == "gpt-route-scout"
 
 
@@ -113,6 +119,8 @@ def test_advertised_runtime_policy_is_typed_from_environment(monkeypatch):
         ("SOURCE_MAX_STALENESS_HOURS", "NaN"),
         ("OLLAMA_HEALTH_TIMEOUT_SECONDS", "-1"),
         ("MODEL_PRICE_EFFECTIVE_UNTIL", "not-a-date"),
+        ("MODEL_INPUT_PRICE_PER_MILLION_USD", "-1"),
+        ("MODEL_OUTPUT_PRICE_PER_MILLION_USD", "NaN"),
     ],
 )
 def test_advertised_runtime_policy_rejects_invalid_environment(
@@ -121,6 +129,16 @@ def test_advertised_runtime_policy_rejects_invalid_environment(
     monkeypatch.setenv(name, value)
 
     with pytest.raises(ResearchConfigError, match=name):
+        ResearchConfig.from_env()
+
+
+def test_flex_base_url_with_malformed_port_is_a_configuration_error(monkeypatch):
+    monkeypatch.setenv(
+        "IBKR_FLEX_BASE_URL",
+        "https://ndcdyn.interactivebrokers.com:notaport/AccountManagement/FlexWebService",
+    )
+
+    with pytest.raises(ResearchConfigError, match="ibkr_flex_base_url"):
         ResearchConfig.from_env()
 
 

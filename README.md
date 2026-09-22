@@ -157,10 +157,16 @@ The monthly external-model limits are enforced as a hard safety boundary:
 ```dotenv
 MODEL_BUDGET_SOFT_USD=4.00
 MODEL_BUDGET_HARD_USD=5.00
+MODEL_INPUT_PRICE_PER_MILLION_USD=20.00
+MODEL_OUTPUT_PRICE_PER_MILLION_USD=100.00
+MODEL_PRICE_EFFECTIVE_UNTIL=2026-12-31
 ```
 
 The hard value cannot exceed **$5.00 per UTC calendar month**. Startup and
-health checks do not call paid providers.
+health checks do not call paid providers. The generic price rates are applied
+conservatively to every configured external model route; update them and the
+effective-through date whenever provider pricing changes. An expired price
+table blocks paid calls instead of weakening the ceiling.
 
 ### Workflow commands
 

@@ -1,6 +1,9 @@
 .pytest
 .env
 venv/
+.venv/
+*.egg-info/
+.coverage
 .vscode/
 .idea/
 .worktrees/

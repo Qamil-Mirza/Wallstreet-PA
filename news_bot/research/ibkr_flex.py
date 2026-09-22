@@ -797,6 +797,13 @@ class FlexClient:
                 if not chunk:
                     continue
                 body.extend(chunk)
+                if (
+                    self._poll_deadline is not None
+                    and self.monotonic() >= self._poll_deadline
+                ):
+                    raise FlexPollingExhaustedError(
+                        "IBKR Flex polling timeout was exhausted"
+                    )
                 if len(body) > self.config.max_response_bytes:
                     raise FlexTransportError(
                         "IBKR Flex response exceeded the configured size limit"

@@ -1692,7 +1692,7 @@ def test_populated_v7_database_upgrades_without_data_loss(
 
     assert versions == [
         (1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,), (10,),
-        (11,), (12,), (13,), (14,), (15,), (16,), (17,),
+        (11,), (12,), (13,), (14,), (15,), (16,), (17,), (18,),
     ]
     assert legacy_row == ("evidence", "pending")
     assert fk_errors == []
@@ -1992,7 +1992,7 @@ def test_populated_v8_workflow_upgrades_to_v9_without_data_loss(
         ).fetchall()
 
     assert row == ("daily", "completed")
-    assert versions[-1] == (17,)
+    assert versions[-1] == (18,)
 
 
 def test_migration_009_failure_rolls_back_publication_schema(
@@ -2148,7 +2148,7 @@ def test_populated_v9_unknown_receipt_state_upgrades_to_v10(
         ).fetchone() == ("outcome_unknown",)
         assert connection.execute(
             "SELECT MAX(version) FROM schema_migrations"
-        ).fetchone() == (17,)
+        ).fetchone() == (18,)
 
 
 def test_migration_010_failure_is_atomic(
@@ -2418,7 +2418,7 @@ def test_populated_v10_publication_receipt_upgrades_without_data_loss(
         ).fetchone() == ("confirmed", report_id, "e" * 64)
         assert connection.execute(
             "SELECT MAX(version) FROM schema_migrations"
-        ).fetchone() == (17,)
+        ).fetchone() == (18,)
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
 
 
@@ -2504,7 +2504,7 @@ def test_populated_v11_publication_outcome_upgrades_without_data_loss(
         ).fetchone() == ("confirmed", report_id, "e" * 64)
         assert connection.execute(
             "SELECT MAX(version) FROM schema_migrations"
-        ).fetchone() == (17,)
+        ).fetchone() == (18,)
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
         trigger_sql = connection.execute(
             "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name IN "
@@ -2649,7 +2649,7 @@ def test_populated_v12_effects_backfill_canonical_outcomes(
         ).fetchall()
         assert connection.execute(
             "SELECT MAX(version) FROM schema_migrations"
-        ).fetchone() == (17,)
+        ).fetchone() == (18,)
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
     assert [row[0] for row in rows] == ["confirmed", "reconciled"]
     assert all(row[1] == row[3] and row[2] == row[4] for row in rows)
@@ -2751,7 +2751,7 @@ def test_populated_v13_upgrades_effect_insert_guards_without_data_loss(
         ).fetchone()[0:2] == ("confirmed", result.report_ids[0])
         assert connection.execute(
             "SELECT MAX(version) FROM schema_migrations"
-        ).fetchone() == (17,)
+        ).fetchone() == (18,)
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
         insert_guard = connection.execute(
             "SELECT sql FROM sqlite_master WHERE type = 'trigger' "
@@ -2864,7 +2864,7 @@ def test_populated_v14_upgrades_bound_publication_authority_without_data_loss(
         ).fetchone()
         assert connection.execute(
             "SELECT MAX(version) FROM schema_migrations"
-        ).fetchone() == (17,)
+        ).fetchone() == (18,)
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
         insert_guard = connection.execute(
             "SELECT sql FROM sqlite_master WHERE type = 'trigger' "
@@ -2990,7 +2990,7 @@ def test_populated_v15_upgrades_to_unique_workflow_stages_without_data_loss(
     with upgraded.connect() as connection:
         assert connection.execute(
             "SELECT MAX(version) FROM schema_migrations"
-        ).fetchone() == (17,)
+        ).fetchone() == (18,)
         assert connection.execute(
             "SELECT state FROM workflow_runs WHERE workflow_id = ?",
             (result.workflow_id,),
@@ -3107,7 +3107,7 @@ def test_populated_v16_upgrades_active_confirmation_guard_without_data_loss(
     with upgraded.connect() as connection:
         assert connection.execute(
             "SELECT MAX(version) FROM schema_migrations"
-        ).fetchone() == (17,)
+        ).fetchone() == (18,)
         assert connection.execute(
             "SELECT state, report_id FROM publication_effects "
             "WHERE workflow_id = ?",

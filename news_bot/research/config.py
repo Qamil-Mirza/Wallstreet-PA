@@ -222,6 +222,13 @@ def _get_decimal(name: str, default: str) -> Decimal:
     return parsed
 
 
+def _get_nonnegative_decimal(name: str, default: str) -> Decimal:
+    parsed = _get_decimal(name, default)
+    if parsed < 0:
+        raise ResearchConfigError(f"{name} must be non-negative; got {parsed!r}")
+    return parsed
+
+
 def _get_text(name: str, default: str) -> str:
     value = os.getenv(name)
     if value is None:
@@ -284,6 +291,8 @@ class ResearchConfig:
         default_factory=lambda: _DEFAULT_MODEL_ROUTES
     )
     model_price_effective_until: date = date(2026, 12, 31)
+    model_input_price_per_million_usd: Decimal = Decimal("20.00")
+    model_output_price_per_million_usd: Decimal = Decimal("100.00")
     source_max_staleness_hours: float = 168.0
     sec_user_agent: str = "PortfolioResearchBot/1.0 research@example.com"
     daily_schedule: CronSchedule = CronSchedule.from_crontab("0 7 * * mon-fri")
@@ -348,6 +357,12 @@ class ResearchConfig:
             model_routes=_model_routes_from_env(),
             model_price_effective_until=_get_date(
                 "MODEL_PRICE_EFFECTIVE_UNTIL", "2026-12-31"
+            ),
+            model_input_price_per_million_usd=_get_nonnegative_decimal(
+                "MODEL_INPUT_PRICE_PER_MILLION_USD", "20.00"
+            ),
+            model_output_price_per_million_usd=_get_nonnegative_decimal(
+                "MODEL_OUTPUT_PRICE_PER_MILLION_USD", "100.00"
             ),
             source_max_staleness_hours=_get_positive_float(
                 "SOURCE_MAX_STALENESS_HOURS", "168"
@@ -481,8 +496,10 @@ class ResearchConfig:
 
         try:
             flex_url = urlsplit(self.ibkr_flex_base_url)
+            flex_port = flex_url.port
         except (TypeError, ValueError):
             flex_url = None
+            flex_port = None
         if (
             flex_url is None
             or flex_url.scheme != "https"
@@ -490,7 +507,7 @@ class ResearchConfig:
                 "ndcdyn.interactivebrokers.com",
                 "gdcdyn.interactivebrokers.com",
             }
-            or flex_url.port not in (None, 443)
+            or flex_port not in (None, 443)
             or flex_url.username is not None
             or flex_url.password is not None
             or flex_url.query
@@ -509,6 +526,14 @@ class ResearchConfig:
         for field_name, value in (
             ("budget_soft_usd", self.budget_soft_usd),
             ("budget_hard_usd", self.budget_hard_usd),
+            (
+                "model_input_price_per_million_usd",
+                self.model_input_price_per_million_usd,
+            ),
+            (
+                "model_output_price_per_million_usd",
+                self.model_output_price_per_million_usd,
+            ),
         ):
             if not isinstance(value, Decimal):
                 raise ResearchConfigError(f"{field_name} must be Decimal")
@@ -517,6 +542,11 @@ class ResearchConfig:
 
         if self.budget_soft_usd < 0 or self.budget_hard_usd < 0:
             raise ResearchConfigError("Model budget limits must be non-negative")
+        if (
+            self.model_input_price_per_million_usd < 0
+            or self.model_output_price_per_million_usd < 0
+        ):
+            raise ResearchConfigError("Model prices must be non-negative")
         if self.budget_soft_usd >= self.budget_hard_usd:
             raise ResearchConfigError(
                 "MODEL_BUDGET_SOFT_USD must be less than MODEL_BUDGET_HARD_USD"

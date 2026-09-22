@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -35,7 +36,7 @@ from .orchestrator import (
     WorkflowConflict,
     WorkflowRunResult,
 )
-from .quality import PublicationVerdict, QualityGateResult
+from .quality import GateReasonCode, PublicationVerdict, QualityGateResult
 from .reports import (
     Citation,
     EmergingCompanyMonitor,
@@ -331,15 +332,23 @@ class RuntimeStageRunner:
             )
         return result
 
-    def _last_snapshot_ref(self, requested_as_of: datetime) -> str | None:
-        """Return the latest durable snapshot available at the research cutoff."""
-        with self.store.connect() as connection:
-            row = connection.execute(
-                "SELECT snapshot_id FROM portfolio_snapshots "
-                "WHERE as_of <= ? ORDER BY as_of DESC, snapshot_id DESC LIMIT 1",
-                (_utc_text(requested_as_of),),
-            ).fetchone()
-        return None if row is None else row[0]
+    def _portfolio_source_key(self) -> str:
+        """Derive a non-reversible identity for one configured Flex source."""
+        query_id = self.config.ibkr_flex_query_id or ""
+        account_salt = self.config.ibkr_flex_account_salt or ""
+        return hmac.new(
+            account_salt.encode("utf-8"),
+            f"ibkr-flex-query:{query_id}".encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+
+    def _last_snapshot_ref(
+        self, source_key: str, requested_as_of: datetime
+    ) -> str | None:
+        """Return the latest durable snapshot for exactly one Flex source."""
+        return self.store.latest_portfolio_snapshot_for_source(
+            source_key, requested_as_of
+        )
 
     def _portfolio(
         self, context: StageContext, control: StageExecutionControl
@@ -360,13 +369,14 @@ class RuntimeStageRunner:
             max_staleness_hours=self.config.portfolio_max_staleness_hours,
         )
         client: FlexSyncClient | None = None
+        source_key = self._portfolio_source_key()
         try:
             control.checkpoint()
             client = self.factories.flex_client_factory(flex_config)
             sync_result = client.sync(self.store)
             control.checkpoint()
         except FlexError:
-            fallback_ref = self._last_snapshot_ref(context.as_of)
+            fallback_ref = self._last_snapshot_ref(source_key, context.as_of)
             if fallback_ref is None:
                 raise RequiredStageUnavailable(
                     "required portfolio source is unavailable"
@@ -380,6 +390,9 @@ class RuntimeStageRunner:
                 client.close()
         validated = self._validated_portfolio_result(
             sync_result, context.as_of
+        )
+        self.store.bind_portfolio_snapshot_source(
+            validated.snapshot.snapshot_id, source_key
         )
         is_stale = bool(
             validated.freshness.is_stale
@@ -433,6 +446,52 @@ class RuntimeStageRunner:
                 "required portfolio workflow result is unavailable"
             )
         return outcome.result_ref
+
+    def _workflow_portfolio_stale(self, workflow_id: str) -> bool:
+        """Return whether the durable portfolio stage declared stale inputs."""
+        with self.store.connect() as connection:
+            row = connection.execute(
+                "SELECT outcome_json FROM workflow_tasks "
+                "WHERE workflow_id = ? AND stage = 'portfolio' "
+                "AND state = 'completed'",
+                (workflow_id,),
+            ).fetchone()
+        if row is None or row[0] is None:
+            raise RequiredStageUnavailable(
+                "required portfolio workflow result is unavailable"
+            )
+        outcome = StageOutcome.model_validate_json(row[0])
+        return "portfolio_stale" in outcome.omissions
+
+    def _enforce_stale_portfolio_gate(
+        self, context: StageContext, outcome: StageOutcome
+    ) -> StageOutcome:
+        """Prevent stale holdings from authorizing ratings or position sizing."""
+        gate = outcome.quality_gate
+        if (
+            context.stage != "review"
+            or gate is None
+            or not self._workflow_portfolio_stale(context.workflow_id)
+        ):
+            return outcome
+        verdict = gate.publication_verdict
+        if verdict is PublicationVerdict.FINAL:
+            verdict = PublicationVerdict.PARTIAL
+        safe_gate = QualityGateResult.model_validate(
+            {
+                **gate.model_dump(),
+                "reason_codes": tuple(
+                    sorted(
+                        {*gate.reason_codes, GateReasonCode.PORTFOLIO_STALE},
+                        key=lambda reason: reason.value,
+                    )
+                ),
+                "allow_sizing": False,
+                "publication_verdict": verdict,
+                "effective_rating": RecommendationRating.NO_RATING,
+            }
+        )
+        return outcome.model_copy(update={"quality_gate": safe_gate})
 
     def _synthetic_event_report(self, context: StageContext) -> EventUpdate:
         report_digest = hashlib.sha256(
@@ -671,6 +730,7 @@ class RuntimeStageRunner:
                     raise RequiredStageUnavailable(
                         "required production stage adapter returned an invalid result"
                     )
+            result = self._enforce_stale_portfolio_gate(context, result)
             control.checkpoint()
             return result
         finally:
@@ -691,7 +751,16 @@ class RuntimeWorkflowService:
     ) -> None:
         self.config = config
         self.store = store
-        self.factories = factories or RuntimeFactories()
+        configured = factories or RuntimeFactories()
+        if not configured.stage_adapters:
+            from .production import build_production_stage_adapters
+
+            configured = RuntimeFactories(
+                flex_client_factory=configured.flex_client_factory,
+                owner_id_factory=configured.owner_id_factory,
+                stage_adapters=build_production_stage_adapters(config, store),
+            )
+        self.factories = configured
         self._cancellation_source: RuntimeCancellationSource | None = None
 
     def bind_run_lease(self, source: RuntimeCancellationSource) -> None:
@@ -720,14 +789,24 @@ class RuntimeWorkflowService:
         )
 
     def _source_hashes(self, as_of: datetime) -> tuple[str, ...]:
-        return tuple(
-            sorted(
-                {
-                    document.content_hash
-                    for document in self.store.list_documents_as_of(as_of)
-                }
-            )
-        )
+        hashes = {
+            document.content_hash
+            for document in self.store.list_documents_as_of(as_of)
+        }
+        ingestion = self.factories.stage_adapters.get("ingestion")
+        preview = getattr(ingestion, "preview_source_hashes", None)
+        if callable(preview):
+            current = preview(as_of)
+            if not isinstance(current, tuple) or any(
+                not isinstance(digest, str)
+                or _SHA256.fullmatch(digest) is None
+                for digest in current
+            ):
+                raise RequiredStageUnavailable(
+                    "required production source preview is invalid"
+                )
+            hashes.update(current)
+        return tuple(sorted(hashes))
 
     def run_daily(
         self,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import os
 import sqlite3
@@ -46,7 +47,11 @@ from news_bot.research.orchestrator import (
     WorkflowRunState,
     WorkflowTaskState,
 )
-from news_bot.research.quality import PublicationVerdict, QualityGateResult
+from news_bot.research.quality import (
+    GateReasonCode,
+    PublicationVerdict,
+    QualityGateResult,
+)
 from news_bot.research.reports import ReportRenderer
 from news_bot.research.runtime import (
     RuntimeFactories,
@@ -1031,6 +1036,81 @@ def test_portfolio_stage_continues_with_stale_snapshot_and_suppresses_sizing(
     assert outcome.omissions == ("portfolio_stale",)
 
 
+def test_stale_portfolio_cannot_authorize_rating_or_sizing(
+    tmp_path: Path,
+) -> None:
+    class Adapter:
+        def run(self, context, control) -> StageOutcome:
+            control.checkpoint()
+            if context.stage == "materiality":
+                return StageOutcome(
+                    result_ref="materiality-stale", material_event=True
+                )
+            if context.stage == "event_update":
+                return StageOutcome(
+                    result_ref="report-stale", report_id="report-stale"
+                )
+            if context.stage == "review":
+                unsafe_gate = _passing_quality_gate().model_copy(
+                    update={"allow_sizing": True}
+                )
+                return StageOutcome(
+                    result_ref="review-stale",
+                    reviewer_verdict=ReviewVerdict.PASS,
+                    quality_gate=unsafe_gate,
+                    published_claim_ids=("synthetic-claim",),
+                )
+            if context.stage == "publish":
+                return StageOutcome(
+                    result_ref="report-stale",
+                    report_id="report-stale",
+                    published_claim_ids=context.allowed_claim_ids,
+                    publication_receipt_hash="e" * 64,
+                )
+            return StageOutcome(result_ref=f"{context.stage}-stale")
+
+    config = replace(
+        research_config(tmp_path),
+        ibkr_flex_token="read-only-token",
+        ibkr_flex_query_id="query-id",
+        ibkr_flex_account_salt="0123456789abcdef",
+    )
+    configured = {
+        stage: Adapter()
+        for stage in (
+            "ingestion",
+            "resolve",
+            "materiality",
+            "event_analysis",
+            "event_update",
+            "review",
+            "publish",
+        )
+    }
+    services = default_services(
+        config_loader=lambda: config,
+        runtime_factories=RuntimeFactories(
+            flex_client_factory=lambda _config: PersistingFlexClient(
+                portfolio_sync_result(stale=True)
+            ),
+            owner_id_factory=lambda: "stale-gate-owner",
+            stage_adapters=configured,
+        ),
+    )
+
+    assert main(["daily", "--as-of", "2026-08-24"], services=services) == ExitCode.OK
+    with ResearchStore(config.database_path).connect() as connection:
+        outcome_json = connection.execute(
+            "SELECT outcome_json FROM workflow_tasks WHERE stage = 'review'"
+        ).fetchone()[0]
+    gate = StageOutcome.model_validate_json(outcome_json).quality_gate
+    assert gate is not None
+    assert gate.reason_codes == (GateReasonCode.PORTFOLIO_STALE,)
+    assert gate.effective_rating is RecommendationRating.NO_RATING
+    assert gate.allow_sizing is False
+    assert gate.publication_verdict is PublicationVerdict.PARTIAL
+
+
 def test_flex_failure_reuses_last_successful_snapshot_as_stale(
     tmp_path: Path,
 ) -> None:
@@ -1048,6 +1128,12 @@ def test_flex_failure_reuses_last_successful_snapshot_as_stale(
     store.insert_portfolio_snapshot(
         prior.snapshot, prior.positions, prior.account_ref
     )
+    source_key = hmac.new(
+        config.ibkr_flex_account_salt.encode("utf-8"),
+        f"ibkr-flex-query:{config.ibkr_flex_query_id}".encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    store.bind_portfolio_snapshot_source(prior.snapshot.snapshot_id, source_key)
 
     class FailingFlexClient:
         def sync(self, _store):
@@ -1076,6 +1162,56 @@ def test_flex_failure_reuses_last_successful_snapshot_as_stale(
     assert state == "completed"
     assert outcome.result_ref == prior.snapshot.snapshot_id
     assert outcome.omissions == ("portfolio_stale",)
+
+
+def test_flex_failure_never_reuses_snapshot_from_another_query_source(
+    tmp_path: Path,
+) -> None:
+    config = replace(
+        research_config(tmp_path),
+        ibkr_flex_token="read-only-token",
+        ibkr_flex_query_id="new-query-id",
+        ibkr_flex_account_salt="0123456789abcdef",
+    )
+    store = ResearchStore(config.database_path)
+    store.migrate()
+    prior = portfolio_sync_result(
+        as_of=datetime(2026, 8, 23, tzinfo=timezone.utc)
+    )
+    store.insert_portfolio_snapshot(
+        prior.snapshot, prior.positions, prior.account_ref
+    )
+    old_source_key = hmac.new(
+        config.ibkr_flex_account_salt.encode("utf-8"),
+        b"ibkr-flex-query:old-query-id",
+        hashlib.sha256,
+    ).hexdigest()
+    store.bind_portfolio_snapshot_source(
+        prior.snapshot.snapshot_id, old_source_key
+    )
+
+    class FailingFlexClient:
+        def sync(self, _store):
+            raise FlexTransportError("transport unavailable")
+
+        def close(self):
+            return None
+
+    services = default_services(
+        config_loader=lambda: config,
+        store_factory=lambda _config: store,
+        runtime_factories=RuntimeFactories(
+            flex_client_factory=lambda _config: FailingFlexClient(),
+            owner_id_factory=lambda: "cross-source-fallback-owner",
+        ),
+    )
+
+    assert main(["daily", "--as-of", "2026-08-24"], services=services) == ExitCode.BLOCKED
+    with store.connect() as connection:
+        assert connection.execute(
+            "SELECT state, outcome_json FROM workflow_tasks "
+            "WHERE stage = 'portfolio'"
+        ).fetchone() == ("failed", None)
 
 
 def test_runtime_passes_historical_source_hashes_into_workflow_identity(
@@ -1115,6 +1251,54 @@ def test_runtime_passes_historical_source_hashes_into_workflow_identity(
     service.run_daily(as_of=datetime(2026, 8, 24, tzinfo=timezone.utc))
 
     assert captured["source_hashes"] == (digest,)
+
+
+def test_runtime_includes_current_ingestion_preview_in_workflow_identity(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config = research_config(tmp_path)
+    store = ResearchStore(config.database_path)
+    store.migrate()
+    historical = "a" * 64
+    current = "b" * 64
+    store.insert_source_document(
+        SourceDocument(
+            document_id="document-historical-preview",
+            source_type="sec_filing_metadata",
+            canonical_url="https://example.com/historical-preview",
+            publisher="Example",
+            published_at=datetime(2026, 8, 23, tzinfo=timezone.utc),
+            retrieved_at=datetime(2026, 8, 23, tzinfo=timezone.utc),
+            content_hash=historical,
+            raw_content_path=None,
+            extraction_status="complete",
+        )
+    )
+    captured: dict[str, object] = {}
+
+    class IngestionAdapter:
+        def preview_source_hashes(self, as_of):
+            assert as_of == datetime(2026, 8, 24, tzinfo=timezone.utc)
+            return (current,)
+
+        def run(self, context, control):
+            raise AssertionError("the recording orchestrator does not run stages")
+
+    class RecordingOrchestrator:
+        def run_daily(self, **kwargs):
+            captured.update(kwargs)
+            return FakeResult()
+
+    service = RuntimeWorkflowService(
+        config,
+        store,
+        RuntimeFactories(stage_adapters={"ingestion": IngestionAdapter()}),
+    )
+    monkeypatch.setattr(service, "_orchestrator", lambda **_kwargs: RecordingOrchestrator())
+
+    service.run_daily(as_of=datetime(2026, 8, 24, tzinfo=timezone.utc))
+
+    assert captured["source_hashes"] == (historical, current)
 
 
 def test_portfolio_stage_accepts_real_flex_nullable_snapshot_freshness(

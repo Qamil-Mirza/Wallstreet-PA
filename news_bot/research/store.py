@@ -1090,6 +1090,52 @@ class ResearchStore:
                 expected_positions,
             )
 
+    def bind_portfolio_snapshot_source(
+        self, snapshot_id: str, source_key: str
+    ) -> None:
+        """Immutably bind a persisted snapshot to one hashed Flex source."""
+        if (
+            not isinstance(snapshot_id, str)
+            or _WORKFLOW_IDENTIFIER.fullmatch(snapshot_id) is None
+            or not isinstance(source_key, str)
+            or _SHA256.fullmatch(source_key) is None
+        ):
+            raise ValueError("portfolio snapshot source binding is invalid")
+        with self.transaction() as connection:
+            existing = connection.execute(
+                "SELECT source_key FROM portfolio_snapshot_sources "
+                "WHERE snapshot_id = ?",
+                (snapshot_id,),
+            ).fetchone()
+            if existing is None:
+                connection.execute(
+                    "INSERT INTO portfolio_snapshot_sources "
+                    "(snapshot_id, source_key, bound_at) VALUES (?, ?, ?)",
+                    (snapshot_id, source_key, _utc_text(self.clock())),
+                )
+            elif existing[0] != source_key:
+                raise sqlite3.IntegrityError(
+                    "portfolio snapshot source binding conflicts"
+                )
+
+    def latest_portfolio_snapshot_for_source(
+        self, source_key: str, as_of: datetime
+    ) -> str | None:
+        """Return the newest snapshot for exactly one Flex source and cutoff."""
+        if not isinstance(source_key, str) or _SHA256.fullmatch(source_key) is None:
+            raise ValueError("portfolio snapshot source key is invalid")
+        cutoff = _utc_text(as_of, "portfolio snapshot cutoff")
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT snapshot.snapshot_id FROM portfolio_snapshots AS snapshot "
+                "JOIN portfolio_snapshot_sources AS source "
+                "ON source.snapshot_id = snapshot.snapshot_id "
+                "WHERE source.source_key = ? AND snapshot.as_of <= ? "
+                "ORDER BY snapshot.as_of DESC, snapshot.snapshot_id DESC LIMIT 1",
+                (source_key, cutoff),
+            ).fetchone()
+        return None if row is None else row[0]
+
     def insert_source_document(self, document: SourceDocument) -> None:
         """Insert source metadata needed to seed evidence integration tests."""
         with self.transaction() as connection:
