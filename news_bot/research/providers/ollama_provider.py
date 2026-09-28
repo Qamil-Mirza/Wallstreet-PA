@@ -7,7 +7,7 @@ import ipaddress
 import json
 import math
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -34,6 +34,125 @@ from .base import (
 
 _DEFAULT_TIMEOUT = (3.05, 120.0)
 _DEFAULT_MAX_RESPONSE_BYTES = 4 * 1024 * 1024
+
+
+def _local_output_schema(request: ModelRequest) -> dict[str, Any]:
+    """Bind model-reported provenance to the trusted local route metadata."""
+
+    schema = request.schema_payload()
+    task_input = request.evidence_packet.get("task_input")
+    trusted = task_input if isinstance(task_input, Mapping) else {}
+    as_of = trusted.get("as_of")
+    evidence_ids = trusted.get("evidence_ids")
+    claim_ids = trusted.get("claim_ids")
+    allowed_evidence = (
+        sorted(set(evidence_ids))
+        if isinstance(evidence_ids, Sequence)
+        and not isinstance(evidence_ids, (str, bytes))
+        and all(isinstance(value, str) for value in evidence_ids)
+        else []
+    )
+    allowed_claims = (
+        sorted(set(claim_ids))
+        if isinstance(claim_ids, Sequence)
+        and not isinstance(claim_ids, (str, bytes))
+        and all(isinstance(value, str) for value in claim_ids)
+        else []
+    )
+    security = trusted.get("security")
+    trusted_security = security if isinstance(security, Mapping) else {}
+    scalar_constraints = {
+        "security_id": trusted_security.get("security_id"),
+        "currency": trusted_security.get("currency"),
+        "horizon_months": trusted.get("horizon_months"),
+        "horizon_years": trusted.get("horizon_years"),
+    }
+    event_rows = trusted.get("events")
+    allowed_events = sorted(
+        {
+            item["event_id"]
+            for item in event_rows
+            if isinstance(item, Mapping) and isinstance(item.get("event_id"), str)
+        }
+    ) if isinstance(event_rows, Sequence) and not isinstance(
+        event_rows, (str, bytes)
+    ) else []
+    signal_rows = trusted.get("signals")
+    allowed_signals = sorted(
+        {
+            item["signal_id"]
+            for item in signal_rows
+            if isinstance(item, Mapping) and isinstance(item.get("signal_id"), str)
+        }
+    ) if isinstance(signal_rows, Sequence) and not isinstance(
+        signal_rows, (str, bytes)
+    ) else []
+    target_claim_ids = trusted.get("target_claim_ids")
+    allowed_targets = (
+        sorted(set(target_claim_ids))
+        if isinstance(target_claim_ids, Sequence)
+        and not isinstance(target_claim_ids, (str, bytes))
+        and all(isinstance(value, str) for value in target_claim_ids)
+        else []
+    )
+
+    def bind(node: object) -> None:
+        if isinstance(node, list):
+            for value in node:
+                bind(value)
+            return
+        if not isinstance(node, dict):
+            return
+        properties = node.get("properties")
+        if isinstance(properties, dict):
+            if "inference_mode" in properties:
+                properties["inference_mode"] = {
+                    "const": InferenceMode.LOCAL_ONLY.value,
+                    "enum": [InferenceMode.LOCAL_ONLY.value],
+                    "type": "string",
+                }
+            if "as_of" in properties and isinstance(as_of, str):
+                properties["as_of"] = {
+                    "const": as_of,
+                    "format": "date-time",
+                    "type": "string",
+                }
+            for field_name, value in scalar_constraints.items():
+                if field_name in properties and isinstance(value, (str, int)):
+                    properties[field_name] = {
+                        "const": value,
+                        "enum": [value],
+                        "type": "integer" if isinstance(value, int) else "string",
+                    }
+            for field_name, allowed in (
+                ("event_id", allowed_events),
+                ("signal_id", allowed_signals),
+            ):
+                if field_name in properties and allowed:
+                    properties[field_name] = {
+                        "enum": allowed,
+                        "type": "string",
+                    }
+            for field_name, allowed in (
+                ("evidence_ids", allowed_evidence),
+                ("supporting_claim_ids", allowed_claims),
+                ("target_claim_ids", allowed_targets),
+            ):
+                field_schema = properties.get(field_name)
+                if not isinstance(field_schema, dict):
+                    continue
+                field_schema["items"] = (
+                    {"enum": allowed, "type": "string"}
+                    if allowed
+                    else {"type": "string"}
+                )
+                if not allowed:
+                    field_schema["maxItems"] = 0
+        for value in node.values():
+            bind(value)
+
+    bind(schema)
+    return schema
 
 
 def _safe_private_base_url(base_url: str, allowed_private_hosts: Iterable[str]) -> str:
@@ -140,7 +259,7 @@ class OllamaProvider:
             "system": request.system_prompt,
             "prompt": request.provider_input,
             "stream": False,
-            "format": request.schema_payload(),
+            "format": _local_output_schema(request),
             "options": {"num_predict": request.max_output_tokens},
         }
         result = self._request_json("POST", "/api/generate", json_body=payload)

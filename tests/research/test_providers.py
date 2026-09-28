@@ -1,8 +1,8 @@
 """Contract tests for provider-neutral structured model generation."""
 
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import FrozenInstanceError
-from datetime import date
+from dataclasses import FrozenInstanceError, replace
+from datetime import date, datetime, timezone
 from decimal import Decimal
 import json
 from pathlib import Path
@@ -46,6 +46,13 @@ from .conftest import utc
 class ResearchOutput(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
     answer: str
+
+
+class RoutedResearchOutput(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    inference_mode: InferenceMode
+    as_of: datetime
+    evidence_ids: tuple[str, ...]
 
 
 class MutableResearchOutput(BaseModel):
@@ -429,6 +436,54 @@ def test_ollama_checks_model_then_generates_with_json_schema():
     assert result.raw_response_hash != '{"answer":"supported"}'
     assert result.input_tokens == 9
     assert result.output_tokens == 4
+
+
+def test_ollama_schema_binds_model_reported_inference_mode_to_local_route():
+    session = FakeSession([
+        FakeHttpResponse({"models": [{"name": "research:latest"}]}),
+        FakeHttpResponse({
+            "response": (
+                '{"as_of":"2026-08-24T12:00:00Z",'
+                '"evidence_ids":["passage-1"],'
+                '"inference_mode":"local_only"}'
+            ),
+            "prompt_eval_count": 2,
+            "eval_count": 1,
+        }),
+    ])
+    provider = OllamaProvider(
+        base_url="http://localhost:11434",
+        model="research:latest",
+        session=session,
+    )
+    request = replace(
+        make_request(),
+        output_schema=RoutedResearchOutput,
+        evidence_packet={
+            "passages": [{"id": "passage-1", "text": "Revenue rose."}],
+            "task_input": {
+                "as_of": "2026-08-24T12:00:00Z",
+                "claim_ids": [],
+                "evidence_ids": ["passage-1"],
+            },
+        },
+    )
+
+    result = provider.generate(request)
+
+    inference_schema = session.calls[1][2]["json"]["format"]["properties"][
+        "inference_mode"
+    ]
+    assert inference_schema == {
+        "const": "local_only",
+        "enum": ["local_only"],
+        "type": "string",
+    }
+    output_schema = session.calls[1][2]["json"]["format"]["properties"]
+    assert output_schema["as_of"]["const"] == "2026-08-24T12:00:00Z"
+    assert output_schema["evidence_ids"]["items"]["enum"] == ["passage-1"]
+    assert result.data.inference_mode is InferenceMode.LOCAL_ONLY
+    assert result.data.as_of == datetime(2026, 8, 24, 12, tzinfo=timezone.utc)
 
 
 def test_ollama_rejects_unavailable_model_before_generation():

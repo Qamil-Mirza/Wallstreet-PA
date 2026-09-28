@@ -263,6 +263,56 @@ def test_runtime_default_composition_installs_complete_production_registry(
     assert set(service.factories.stage_adapters) == set(PRODUCTION_STAGE_NAMES)
 
 
+def test_runtime_default_composition_accepts_compose_ollama_hostname(
+    tmp_path: Path,
+):
+    config = replace(
+        _config(tmp_path), ollama_base_url="http://ollama:11434"
+    )
+    store = ResearchStore(config.database_path, clock=lambda: NOW)
+    store.migrate()
+
+    service = RuntimeWorkflowService(
+        config,
+        store,
+        RuntimeFactories(owner_id_factory=lambda: "compose-runtime-owner"),
+    )
+
+    assert set(service.factories.stage_adapters) == set(PRODUCTION_STAGE_NAMES)
+
+
+def test_runtime_default_composition_wires_configured_news_connector(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setenv("NEWS_API_KEY", "test-marketaux-key")
+    monkeypatch.setenv("NEWS_API_BASE_URL", "https://api.marketaux.com/v1")
+    config = _config(tmp_path)
+    store = ResearchStore(config.database_path, clock=lambda: NOW)
+    store.migrate()
+
+    service = RuntimeWorkflowService(
+        config,
+        store,
+        RuntimeFactories(owner_id_factory=lambda: "news-runtime-owner"),
+    )
+    ingestion = service.factories.stage_adapters["ingestion"]
+
+    assert tuple(
+        connector.name for connector in ingestion.components.document_connectors
+    ) == ("marketaux",)
+    assert type(ingestion.components.inputs) is not ProductionInputs
+    checkpoint = ConnectorCheckpoint("marketaux", cursor="2026-08-24T12:00:00+00:00")
+    ingestion.components.checkpoints.save(checkpoint)
+
+    restarted = RuntimeWorkflowService(
+        config,
+        store,
+        RuntimeFactories(owner_id_factory=lambda: "news-runtime-owner-restarted"),
+    )
+    restarted_ingestion = restarted.factories.stage_adapters["ingestion"]
+    assert restarted_ingestion.components.checkpoints.load("marketaux") == checkpoint
+
+
 def test_default_composition_consumes_runtime_routing_budget_and_source_policy(
     tmp_path: Path,
 ):

@@ -10,13 +10,17 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
+import tempfile
 import threading
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal
+from pathlib import Path
 from types import MappingProxyType
 from typing import Protocol
+from urllib.parse import urlparse
 
 from pydantic import BaseModel
 
@@ -31,7 +35,20 @@ from .agents import (
     SkepticalReviewer,
 )
 from .agents.base import BoundedAgent
-from .agents.contracts import AgentTask, AnalyticalOutput, ReviewerOutput
+from .agents.contracts import (
+    AgentTask,
+    AnalyticalOutput,
+    EditorInput,
+    EventCandidate,
+    EventScoutInput,
+    EventScoutOutput,
+    EvidenceAnalystInput,
+    EvidenceAnalystOutput,
+    FundamentalAnalystInput,
+    ReviewerInput,
+    ReviewerOutput,
+    SecurityEligibility,
+)
 from .budget import BudgetLedger, ModelPrice, PriceTable
 from .config import ResearchConfig
 from .connectors import (
@@ -39,6 +56,7 @@ from .connectors import (
     ConnectorCheckpoint,
     ConnectorError,
     EmergingSignal,
+    MarketAuxResearchConnector,
     ResearchConnector,
     SignalConnectorBatch,
     SignalResearchConnector,
@@ -55,7 +73,13 @@ from .entities import (
     SecurityIdentity,
 )
 from .evidence import EvidenceIngestor, canonicalize_content
-from .models import AgentRole, ReviewVerdict
+from .models import (
+    AgentRole,
+    EvidenceClaim,
+    InferenceMode,
+    RecommendationRating,
+    ReviewVerdict,
+)
 from .orchestrator import (
     RequiredStageUnavailable,
     StageContext,
@@ -70,15 +94,26 @@ from .providers import (
     ProviderRouter,
     ReasoningEffort,
 )
-from .quality import QualityGate, QualityGateInput, QualityGatePolicy
+from .quality import (
+    ClaimQualityInput,
+    EvidenceReference,
+    InferenceDisclosure,
+    PublicationKind,
+    QualityGate,
+    QualityGateInput,
+    QualityGatePolicy,
+)
 from .reports import (
+    Citation,
     EmergingCompanyMonitor,
     EventUpdate,
     IndustryLandscape,
     PortfolioBrief,
     PublicationPrivacyContext,
     RenderedReportArtifact,
+    ReportMetadata,
     ReportRenderer,
+    ReportSection,
 )
 from .store import ResearchStore, _canonical_json, _decimal_text, _utc_text
 
@@ -140,6 +175,144 @@ class ConnectorCheckpointStore(Protocol):
     def load(self, connector: str) -> ConnectorCheckpoint: ...
 
     def save(self, checkpoint: ConnectorCheckpoint) -> None: ...
+
+
+class _FileConnectorCheckpointStore:
+    """Atomic, restart-safe connector cursors in the research data volume."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._lock = threading.Lock()
+
+    def _read(self) -> dict[str, ConnectorCheckpoint]:
+        if not self.path.exists():
+            return {}
+        try:
+            raw = json.loads(self.path.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict):
+                raise ValueError
+            return {
+                connector: ConnectorCheckpoint(
+                    connector,
+                    cursor=value.get("cursor"),
+                    etag=value.get("etag"),
+                    last_modified=value.get("last_modified"),
+                )
+                for connector, value in raw.items()
+                if isinstance(connector, str)
+                and isinstance(value, dict)
+                and set(value) == {"cursor", "etag", "last_modified"}
+            }
+        except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise RuntimeError("connector checkpoint store is invalid") from exc
+
+    def load(self, connector: str) -> ConnectorCheckpoint:
+        with self._lock:
+            return self._read().get(connector, ConnectorCheckpoint(connector))
+
+    def save(self, checkpoint: ConnectorCheckpoint) -> None:
+        if not isinstance(checkpoint, ConnectorCheckpoint):
+            raise TypeError("checkpoint must be ConnectorCheckpoint")
+        with self._lock:
+            checkpoints = self._read()
+            checkpoints[checkpoint.connector] = checkpoint
+            payload = {
+                name: {
+                    "cursor": value.cursor,
+                    "etag": value.etag,
+                    "last_modified": value.last_modified,
+                }
+                for name, value in sorted(checkpoints.items())
+            }
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            descriptor, temporary = tempfile.mkstemp(
+                dir=self.path.parent, prefix=f".{self.path.name}.", text=True
+            )
+            temporary_path = Path(temporary)
+            try:
+                with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                    json.dump(
+                        payload,
+                        handle,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                temporary_path.replace(self.path)
+            finally:
+                temporary_path.unlink(missing_ok=True)
+
+
+def _environment_flag(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _configured_news_sources(
+    config: ResearchConfig,
+) -> tuple[tuple[ResearchConnector, ...], ConnectorCheckpointStore | None]:
+    """Compose the existing news adapter only when its key is configured.
+
+    Docker Compose injects ``.env`` into the container environment.  Reading
+    only that environment here keeps library/test construction independent of
+    a repository-local dotenv file.
+    """
+
+    api_key = os.environ.get("NEWS_API_KEY", "").strip()
+    if not api_key:
+        return (), None
+
+    from news_bot.config import Config as NewsletterConfig
+    from news_bot.config import RSSFeedEntry
+
+    rss_feeds = []
+    for raw_url in os.environ.get("RSS_FEEDS", "").split(","):
+        url = raw_url.strip()
+        if not url:
+            continue
+        domain = urlparse(url).netloc.removeprefix("www.")
+        name = domain.split(".", 1)[0].title() or "RSS Feed"
+        rss_feeds.append(RSSFeedEntry(name=name, url=url))
+
+    news_config = NewsletterConfig(
+        news_api_key=api_key,
+        news_api_base_url=os.environ.get(
+            "NEWS_API_BASE_URL", "https://api.marketaux.com/v1"
+        ),
+        smtp_host="",
+        smtp_port=587,
+        smtp_user="",
+        smtp_password="",
+        recipient_email="",
+        ollama_base_url=config.ollama_base_url,
+        ollama_model=config.ollama_model,
+        tts_enabled=False,
+        section_world_enabled=_environment_flag("SECTION_WORLD_ENABLED", True),
+        section_us_tech_enabled=_environment_flag(
+            "SECTION_US_TECH_ENABLED", True
+        ),
+        section_us_industry_enabled=_environment_flag(
+            "SECTION_US_INDUSTRY_ENABLED", True
+        ),
+        section_malaysia_tech_enabled=_environment_flag(
+            "SECTION_MALAYSIA_TECH_ENABLED", True
+        ),
+        section_malaysia_industry_enabled=_environment_flag(
+            "SECTION_MALAYSIA_INDUSTRY_ENABLED", True
+        ),
+        rss_enabled=_environment_flag("RSS_ENABLED", False),
+        rss_feeds=rss_feeds,
+    )
+    return (
+        (MarketAuxResearchConnector(news_config),),
+        _FileConnectorCheckpointStore(
+            config.data_dir / "source_checkpoints.json"
+        ),
+    )
 
 
 class PublicationSink(Protocol):
@@ -273,6 +446,397 @@ class ProductionComponents:
             for item in self.signal_connectors
         ):
             raise TypeError("signal_connectors must implement SignalResearchConnector")
+
+
+class _RuntimeProductionInputs(ProductionInputs):
+    """Concrete daily-research inputs derived only from durable local state."""
+
+    def __init__(self, store: ResearchStore) -> None:
+        self.store = store
+
+    def _documents(self, context: StageContext):
+        documents = self.store.list_documents_as_of(context.as_of)
+        if not documents:
+            _unavailable("required production evidence is unavailable")
+        return documents
+
+    def _passage_ids(self, context: StageContext) -> tuple[str, ...]:
+        identifiers = tuple(
+            passage.passage_id
+            for document in self._documents(context)
+            for passage in self.store.list_document_passages(document.document_id)
+        )
+        if not identifiers:
+            _unavailable("required production passages are unavailable")
+        return tuple(sorted(set(identifiers)))
+
+    def _claims(self, context: StageContext) -> tuple[EvidenceClaim, ...]:
+        with self.store.connect() as connection:
+            row = connection.execute(
+                "SELECT execution.output_json FROM agent_executions AS execution "
+                "JOIN workflow_tasks AS task ON task.task_id = execution.task_id "
+                "WHERE execution.workflow_run_id = ? AND task.stage = 'materiality' "
+                "AND execution.state = 'succeeded'",
+                (context.workflow_id,),
+            ).fetchone()
+        if row is None or row[0] is None:
+            _unavailable("required production claims are unavailable")
+        try:
+            output = EvidenceAnalystOutput.model_validate_json(row[0])
+        except Exception:
+            _unavailable("required production claims are invalid")
+        claims = tuple(
+            claim
+            for draft in output.claims
+            if (claim := self.store.get_claim(draft.claim_id)) is not None
+        )
+        if len(claims) != len(output.claims) or not claims:
+            _unavailable("required production claim lineage is unavailable")
+        return tuple(sorted(claims, key=lambda claim: claim.claim_id))
+
+    def _snapshot(self, context: StageContext):
+        snapshot_id = _workflow_portfolio_ref(self.store, context.workflow_id)
+        if snapshot_id is None:
+            _unavailable("required production portfolio is unavailable")
+        with self.store.connect() as connection:
+            snapshot = connection.execute(
+                "SELECT as_of, base_currency, nav FROM portfolio_snapshots "
+                "WHERE snapshot_id = ?",
+                (snapshot_id,),
+            ).fetchone()
+            positions = connection.execute(
+                "SELECT position.symbol, position.market_value, position.currency, "
+                "security.security_type, position.security_id "
+                "FROM positions AS position LEFT JOIN securities AS security "
+                "ON security.security_id = position.security_id "
+                "WHERE position.snapshot_id = ? ORDER BY position.position_id",
+                (snapshot_id,),
+            ).fetchall()
+        if snapshot is None or not positions:
+            _unavailable("required production portfolio positions are unavailable")
+        return snapshot_id, snapshot, tuple(positions)
+
+    def _security(self, context: StageContext) -> SecurityEligibility:
+        _, _, positions = self._snapshot(context)
+        eligible = tuple(
+            position
+            for position in positions
+            if position[4] is not None
+            and str(position[3] or "").upper() in {"STK", "STOCK", "EQUITY"}
+        )
+        if not eligible:
+            _unavailable("required production equity security is unavailable")
+        symbol, _, currency, _, security_id = max(
+            eligible, key=lambda item: abs(Decimal(item[1]))
+        )
+        entity_digest = hashlib.sha256(
+            f"ibkr-security:{security_id}".encode("utf-8")
+        ).hexdigest()
+        return SecurityEligibility(
+            entity_id=f"entity_{entity_digest}",
+            security_id=security_id,
+            symbol=symbol,
+            currency=currency,
+            asset_kind="equity",
+            resolved=True,
+            public=True,
+            tradable=True,
+        )
+
+    def exposure_plan(self, context: StageContext) -> ExposurePlan:
+        _, snapshot, rows = self._snapshot(context)
+        positions = tuple(
+            ExposurePosition(
+                symbol=row[0],
+                market_value=Decimal(row[1]),
+                currency=row[2],
+                asset_class=row[3] or "UNKNOWN",
+            )
+            for row in rows
+        )
+        return ExposurePlan(
+            positions=positions,
+            nav=Decimal(snapshot[2]),
+            base_currency=snapshot[1],
+            fx_to_base={
+                currency: Decimal("1")
+                for currency in {row[2] for row in rows}
+                if currency == snapshot[1]
+            },
+        )
+
+    def persist_resolution(
+        self,
+        context: StageContext,
+        resolved: tuple[ResolvedEntity, ...],
+        exposures: Mapping[str, PortfolioExposure],
+    ) -> None:
+        del context, resolved
+        if not exposures:
+            _unavailable("required production exposure result is unavailable")
+
+    def _events(self, context: StageContext) -> tuple[EventCandidate, ...]:
+        events = []
+        for document in self._documents(context):
+            passages = self.store.list_document_passages(document.document_id)
+            if not passages:
+                continue
+            headline = " ".join(passages[0].text.split())[:240]
+            events.append(
+                EventCandidate(event_id=document.document_id, headline=headline)
+            )
+        if not events:
+            _unavailable("required production events are unavailable")
+        return tuple(events)
+
+    def agent_task(
+        self, stage: str, context: StageContext, role: AgentRole
+    ) -> AgentTask:
+        evidence_ids = self._passage_ids(context)
+        claim_ids = (
+            ()
+            if stage == "materiality"
+            else tuple(claim.claim_id for claim in self._claims(context))
+        )
+        if role is AgentRole.EVIDENCE_ANALYST:
+            task_input = EvidenceAnalystInput(
+                evidence_ids=evidence_ids,
+                claim_ids=claim_ids,
+                as_of=context.as_of,
+                question=(
+                    "Identify portfolio-relevant developments, their causal "
+                    "implications, and the strongest counter-evidence."
+                ),
+            )
+        elif role is AgentRole.FUNDAMENTAL_ANALYST:
+            task_input = FundamentalAnalystInput(
+                evidence_ids=evidence_ids,
+                claim_ids=claim_ids,
+                as_of=context.as_of,
+                security=self._security(context),
+                horizon_months=12,
+            )
+        elif role is AgentRole.EVENT_SCOUT:
+            task_input = EventScoutInput(
+                evidence_ids=evidence_ids,
+                claim_ids=claim_ids,
+                as_of=context.as_of,
+                events=self._events(context),
+            )
+        elif role is AgentRole.SKEPTICAL_REVIEWER:
+            task_input = ReviewerInput(
+                evidence_ids=evidence_ids,
+                claim_ids=claim_ids,
+                target_claim_ids=claim_ids,
+                as_of=context.as_of,
+            )
+        elif role is AgentRole.RESEARCH_EDITOR:
+            task_input = EditorInput(
+                evidence_ids=evidence_ids,
+                claim_ids=claim_ids,
+                approved_claim_ids=claim_ids,
+                as_of=context.as_of,
+            )
+        else:
+            _unavailable("required production agent role is unavailable")
+        return AgentTask[type(task_input)](
+            task_id=context.task_id,
+            run_id=context.workflow_id,
+            input=task_input,
+        )
+
+    def is_material_event(
+        self, context: StageContext, output: AnalyticalOutput
+    ) -> bool:
+        if not isinstance(output, EvidenceAnalystOutput):
+            _unavailable("required production materiality output is invalid")
+        for draft in output.claims:
+            claim = EvidenceClaim(
+                claim_id=draft.claim_id,
+                entity_id=None,
+                kind=draft.kind,
+                text=draft.text,
+                as_of=output.as_of,
+                confidence=Decimal(str(output.confidence)),
+                status="active",
+            )
+            existing = self.store.get_claim(claim.claim_id)
+            if existing is not None:
+                if existing != claim:
+                    _unavailable("required production claim conflicts with stored evidence")
+                continue
+            self.store.insert_claim_with_lineage(
+                claim,
+                passage_links=tuple(
+                    (evidence_id, "supports") for evidence_id in draft.evidence_ids
+                ),
+                supporting_claim_ids=draft.supporting_claim_ids,
+            )
+        return bool(output.claims)
+
+    def _citations(
+        self, context: StageContext, claims: tuple[EvidenceClaim, ...]
+    ) -> tuple[Citation, ...]:
+        documents = {
+            document.document_id: document for document in self._documents(context)
+        }
+        citations: dict[str, Citation] = {}
+        for claim in claims:
+            for lineage in self.store.list_claim_lineage(claim.claim_id):
+                document = documents.get(lineage.passage.document_id)
+                if document is None:
+                    _unavailable("required production citation source is unavailable")
+                citations[lineage.passage.passage_id] = Citation(
+                    evidence_id=lineage.passage.passage_id,
+                    source=document.publisher,
+                    url=document.canonical_url,
+                    source_date=document.published_at.date(),
+                    data_date=document.published_at.date(),
+                    content_hash=document.content_hash,
+                )
+        if not citations:
+            _unavailable("required production citations are unavailable")
+        return tuple(sorted(citations.values(), key=lambda item: item.evidence_id))
+
+    def report(
+        self, context: StageContext, output: AnalyticalOutput
+    ) -> EventUpdate:
+        if not isinstance(output, EventScoutOutput):
+            _unavailable("required production event report output is invalid")
+        claims = self._claims(context)
+        citations = self._citations(context, claims)
+        evidence_ids = tuple(item.evidence_id for item in citations)
+        body = " ".join(claim.text for claim in claims)
+        security = self._security(context)
+        with self.store.connect() as connection:
+            audit = connection.execute(
+                "SELECT provider, model, inference_mode FROM agent_executions "
+                "WHERE workflow_run_id = ? AND task_id = ? AND state = 'succeeded'",
+                (context.workflow_id, context.task_id),
+            ).fetchone()
+            portfolio_outcome = connection.execute(
+                "SELECT outcome_json FROM workflow_tasks WHERE workflow_id = ? "
+                "AND stage = 'portfolio' AND state = 'completed'",
+                (context.workflow_id,),
+            ).fetchone()
+        if audit is None or any(value is None for value in audit):
+            _unavailable("required production inference provenance is unavailable")
+        omissions = ()
+        if portfolio_outcome is not None and portfolio_outcome[0] is not None:
+            omissions = StageOutcome.model_validate_json(
+                portfolio_outcome[0]
+            ).omissions
+        report_digest = hashlib.sha256(
+            f"{context.workflow_id}:event-update".encode("utf-8")
+        ).hexdigest()
+
+        def section(title: str) -> ReportSection:
+            return ReportSection(title=title, body=body, evidence_ids=evidence_ids)
+
+        return EventUpdate(
+            metadata=ReportMetadata(
+                report_id=f"event-{report_digest[:24]}",
+                report_type="event_update",
+                title=f"Portfolio event update for {security.symbol}",
+                as_of=context.as_of,
+                inference_mode=InferenceMode(audit[2]),
+                provider=audit[0],
+                model=audit[1],
+                freshness="Sources fall within the configured event window.",
+                citations=citations,
+                methodology=(
+                    "Stored source passages were analyzed by bounded specialist "
+                    "agents and checked against durable claim lineage."
+                ),
+                omissions=omissions,
+                disclosure=(
+                    "Research output only; no order execution is available and "
+                    "portfolio sizing is suppressed when inputs are stale."
+                ),
+            ),
+            thesis=section("Thesis"),
+            event_decomposition=(section("Event decomposition"),),
+            causal_decomposition=(section("Causal chain"),),
+            read_through=(section("Portfolio read-through"),),
+            thesis_changes=(section("Thesis changes"),),
+            unchanged_assumptions=(section("Unchanged assumptions"),),
+            questions=(section("Open questions"),),
+            signposts=(section("Signposts"),),
+        )
+
+    def quality_input(
+        self, context: StageContext, review: ReviewerOutput
+    ) -> QualityGateInput:
+        claims = self._claims(context)
+        documents = {
+            document.document_id: document for document in self._documents(context)
+        }
+        quality_claims = []
+        for claim in claims:
+            references = []
+            for lineage in self.store.list_claim_lineage(claim.claim_id):
+                document = documents[lineage.passage.document_id]
+                references.append(
+                    EvidenceReference(
+                        evidence_id=lineage.passage.passage_id,
+                        canonical_source_id=document.document_id,
+                        source_family=document.document_id,
+                        source_type=document.source_type,
+                        stored=True,
+                        primary=False,
+                        published_at=document.published_at,
+                        retrieved_at=document.retrieved_at,
+                    )
+                )
+            quality_claims.append(
+                ClaimQualityInput(
+                    claim_id=claim.claim_id,
+                    section="event",
+                    material=True,
+                    consequential=False,
+                    evidence=tuple(references),
+                )
+            )
+        _, snapshot, _ = self._snapshot(context)
+        latest_document = max(
+            documents.values(), key=lambda document: document.published_at
+        )
+        with self.store.connect() as connection:
+            audit = connection.execute(
+                "SELECT provider, model, inference_mode FROM agent_executions "
+                "WHERE workflow_run_id = ? AND task_id = ? AND state = 'succeeded'",
+                (context.workflow_id, context.task_id),
+            ).fetchone()
+        if audit is None or any(value is None for value in audit):
+            _unavailable("required production review provenance is unavailable")
+        approved = (
+            tuple(claim.claim_id for claim in claims)
+            if review.verdict is ReviewVerdict.PASS
+            else ()
+        )
+        return QualityGateInput(
+            as_of=context.as_of,
+            publication_kind=PublicationKind.EVENT_REPORT,
+            requested_rating=RecommendationRating.NO_RATING,
+            portfolio_snapshot_at=datetime.fromisoformat(
+                snapshot[0].replace("Z", "+00:00")
+            ),
+            price=None,
+            filing=None,
+            security=self._security(context),
+            claims=tuple(quality_claims),
+            reviewer_verdict=review.verdict,
+            reviewer_approved_claim_ids=approved,
+            editor_claim_ids=approved,
+            inference_disclosure=InferenceDisclosure(
+                mode=InferenceMode(audit[2]),
+                provider=audit[0],
+                model=audit[1],
+                confidence=Decimal(str(review.confidence)),
+            ),
+            event_source_type=latest_document.source_type,
+            event_published_at=latest_document.published_at,
+        )
 
 
 def _unavailable(message: str = "required production input is unavailable") -> None:
@@ -928,6 +1492,13 @@ def build_production_stage_adapters(
     else:
         if not isinstance(config, ResearchConfig) or not isinstance(store, ResearchStore):
             raise TypeError("config and store must be ResearchConfig and ResearchStore")
+        configured_document_connectors = tuple(document_connectors)
+        configured_checkpoints = checkpoints
+        if not configured_document_connectors and configured_checkpoints is None:
+            (
+                configured_document_connectors,
+                configured_checkpoints,
+            ) = _configured_news_sources(config)
         ledger = budget or BudgetLedger(
             store, config.budget_soft_usd, config.budget_hard_usd
         )
@@ -936,6 +1507,7 @@ def build_production_stage_adapters(
                 config.ollama_base_url,
                 config.ollama_model,
                 timeout=(3.05, config.ollama_health_timeout_seconds),
+                allowed_private_hosts={"ollama"},
             )
             external = external_provider
             if external is None and config.openai_api_key is not None:
@@ -1010,11 +1582,11 @@ def build_production_stage_adapters(
                 )
             ),
             renderer=renderer,
-            inputs=inputs or ProductionInputs(),
+            inputs=inputs or _RuntimeProductionInputs(store),
             clock=clock,
-            document_connectors=tuple(document_connectors),
+            document_connectors=configured_document_connectors,
             signal_connectors=tuple(signal_connectors),
-            checkpoints=checkpoints,
+            checkpoints=configured_checkpoints,
             publication_sink=publication_sink,
             sec_config=SECConfig(config.sec_user_agent),
         )

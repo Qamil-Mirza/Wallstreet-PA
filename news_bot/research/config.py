@@ -286,7 +286,7 @@ class ResearchConfig:
     ollama_model: str
     budget_soft_usd: Decimal
     budget_hard_usd: Decimal
-    ollama_health_timeout_seconds: float = 60.0
+    ollama_health_timeout_seconds: float = 300.0
     model_routes: Mapping[AgentRole, str] = field(
         default_factory=lambda: _DEFAULT_MODEL_ROUTES
     )
@@ -352,7 +352,7 @@ class ResearchConfig:
             ),
             ollama_model=_get_text("OLLAMA_RESEARCH_MODEL", "llama3.1:8b"),
             ollama_health_timeout_seconds=_get_positive_float(
-                "OLLAMA_HEALTH_TIMEOUT_SECONDS", "60"
+                "OLLAMA_HEALTH_TIMEOUT_SECONDS", "300"
             ),
             model_routes=_model_routes_from_env(),
             model_price_effective_until=_get_date(

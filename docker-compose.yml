@@ -89,7 +89,7 @@ services:
     environment:
       OLLAMA_HOST: http://ollama:11434
       OLLAMA_RESEARCH_MODEL: ${OLLAMA_RESEARCH_MODEL:-llama3.1:8b}
-      OLLAMA_HEALTH_TIMEOUT_SECONDS: ${OLLAMA_HEALTH_TIMEOUT_SECONDS:-60}
+      OLLAMA_HEALTH_TIMEOUT_SECONDS: ${OLLAMA_HEALTH_TIMEOUT_SECONDS:-300}
     entrypoint: ["/bin/sh", "/scripts/ollama-init.sh"]
     volumes:
       - ./scripts/ollama-init.sh:/scripts/ollama-init.sh:ro
