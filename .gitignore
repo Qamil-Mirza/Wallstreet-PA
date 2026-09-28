@@ -17,3 +17,8 @@ secrets/
 
 # MacOS
 .DS_Store
+
+# Agentic Coding Config
+.codex/
+.agents/
+skills-lock.json
